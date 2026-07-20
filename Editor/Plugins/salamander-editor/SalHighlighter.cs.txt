@@ -1,0 +1,72 @@
+using System.Collections.Generic;
+using System.Text;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Палитра подсветки. Значения приходят из SalamanderCode.uss (кастомные --sal-* свойства),
+    // дефолты ниже — только страховка на случай отсутствия USS. Hex-строки предвычислены,
+    // чтобы не гонять ColorUtility на каждый токен каждого нажатия.
+    public struct SalCodePalette
+    {
+        public string[] HexByKind; // индекс = (int)SalTokenKind
+
+        public static SalCodePalette Default()
+        {
+            var p = new SalCodePalette { HexByKind = new string[(int)SalTokenKind.Count] };
+            p.HexByKind[(int)SalTokenKind.Text]    = "D4D4D4";
+            p.HexByKind[(int)SalTokenKind.Comment] = "6A9955";
+            p.HexByKind[(int)SalTokenKind.String]  = "CE9178";
+            p.HexByKind[(int)SalTokenKind.Number]  = "B5CEA8";
+            p.HexByKind[(int)SalTokenKind.Keyword] = "C586C0";
+            p.HexByKind[(int)SalTokenKind.Type]    = "4EC9B0";
+            p.HexByKind[(int)SalTokenKind.Api]     = "DCDCAA";
+            p.HexByKind[(int)SalTokenKind.Enum]    = "4FC1FF";
+            p.HexByKind[(int)SalTokenKind.Member]  = "9CDCFE";
+            p.HexByKind[(int)SalTokenKind.Func]    = "DCDCAA";
+            return p;
+        }
+
+        public void Set(SalTokenKind kind, Color c) =>
+            HexByKind[(int)kind] = ColorUtility.ToHtmlStringRGB(c);
+    }
+
+    // Токены → rich-text строка для Label. Stateless: буферы (StringBuilder) даёт вызывающий.
+    public static class SalHighlighter
+    {
+        public static string Build(string text, List<SalToken> tokens, string[] hexByKind, StringBuilder sb)
+        {
+            sb.Clear();
+            text ??= "";
+            int pos = 0;
+            for (int t = 0; t < tokens.Count; t++)
+            {
+                var tok = tokens[t];
+                AppendEscaped(sb, text, pos, tok.Start - pos);
+                sb.Append("<color=#").Append(hexByKind[(int)tok.Kind]).Append('>');
+                AppendEscaped(sb, text, tok.Start, tok.Length);
+                sb.Append("</color>");
+                pos = tok.Start + tok.Length;
+            }
+            AppendEscaped(sb, text, pos, text.Length - pos);
+
+            // Label не резервирует высоту финальной пустой строки — держим её nbsp,
+            // иначе каретка на последней строке уедет за пределы слоя подсветки.
+            if (text.Length == 0 || text[text.Length - 1] == '\n') sb.Append('\u00A0');
+            return sb.ToString();
+        }
+
+        // '<' в коде (сравнения, шаблоны) сломал бы разбор rich-text — экранируем через noparse,
+        // метрики текста при этом не меняются (в отличие от вставки невидимых символов).
+        private static void AppendEscaped(StringBuilder sb, string text, int start, int length)
+        {
+            int end = start + length;
+            for (int i = start; i < end; i++)
+            {
+                char ch = text[i];
+                if (ch == '<') sb.Append("<noparse><</noparse>");
+                else sb.Append(ch);
+            }
+        }
+    }
+}

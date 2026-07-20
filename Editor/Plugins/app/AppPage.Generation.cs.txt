@@ -1,0 +1,986 @@
+// ============================================================
+//  AppPage.Generation.cs — вкладка «Generation».
+//
+//  Блоки:
+//    • "Generate element names" — по UXML текущих AppPage/AppPopup в сцене берёт
+//      элементы с uss-классом-маркером "generate-link" и пишет их name'ы одним файлом
+//      NavigationName.cs (вложенный класс на страницу/попап).
+//    • "Generate PageUID / PopupUID" — по id из NavigationData полностью перезаписывает
+//      NavTargets.cs (PageUID на страницы, PopupUID на попапы). [Переименовано из
+//      NavigationLink, чтобы не конфликтовать с рантайм-классом роутинга.]
+//    • Page & popup templates — копия Default.uxml в Assets/App/Pages|Popups/<Class>/<id>.uxml.
+//    • App scaffold — НОВОЕ: идемпотентная генерация дефолтного следа проекта
+//      (контейнеры с mainContainer+заливкой и общим AppStyle, AppStyle.uss, AppTheme.tss,
+//      App Settings (PanelSettings), UISoundLibrary, NavigationData, NavigationSetting).
+//      Создаём только отсутствующее — авторские правки никогда не перетираем.
+//
+//  Правила именования (осознанно разные):
+//    • id -> идентификатор типа: '_' и '-' — разделители, отбрасываются: game_over -> GameOver
+//    • имя элемента -> const: '-' отбрасывается, '_' СОХРАНЯЕТСЯ: restart-button_easy -> RestartButton_Easy
+//
+//  Все пути берутся из AppPaths (проектный конфиг). Реестр id — NavigationData (db больше нет).
+//  Хелперы рефлексии сцены (ResolveType/ReadStringField/ReadVisualTree) лежат ЗДЕСЬ и
+//  переиспользуются графом — не дублировать их в AppPage.Graph.cs.
+// ============================================================
+
+using Exerussus.Nexus.Abstractions;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Xml.Linq;
+using App.Core;
+using App.Services.Navigator;
+using App.UIToolkit.Manipulators;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        // uss-класс-маркер: элемент с ним попадает в сгенерированные имена
+        private const string GenerateLinkClass = "generate-link";
+
+        // ----------------------------------------------------- UI поля
+        private TextField  _genLog;
+        private ScrollView _tplList;
+        private Label      _tplStatus;
+        private Button     _tplGenAllBtn;
+
+        private ScrollView _scaffoldList;
+        private Label       _scaffoldStatus;
+        private Button      _scaffoldGenAllBtn;
+
+        private enum TplState { Ok, MissingUxml, MissingFolder }
+
+        // ============================================================ UI
+
+        private void BuildGenerationTab()
+        {
+            var toolbar = new VisualElement();
+            toolbar.AddToClassList("nav-toolbar");
+
+            var title = new Label("Generation");
+            title.AddToClassList("nav-page-title");
+            toolbar.Add(title);
+            _genRoot.Add(toolbar);
+
+            var desc = new Label(
+                "Code generation into " + AppPaths.GenDir + ". " +
+                "UIDs are taken from NavigationData ids; element names — from the UXML of AppPage / AppPopup " +
+                "in the active scene (only elements carrying the \"" + GenerateLinkClass + "\" USS class). " +
+                "Files are fully rewritten; nothing is generated when there is nothing to write.");
+            desc.AddToClassList("nav-gen-desc");
+            _genRoot.Add(desc);
+
+            var actions = new VisualElement();
+            actions.AddToClassList("nav-gen-actions");
+
+            var namesBtn = new Button(GenerateElementNames) { text = "Generate element names" };
+            namesBtn.AddToClassList("nav-btn");
+
+            var uidBtn = new Button(GenerateUids) { text = "Generate PageUID / PopupUID" };
+            uidBtn.AddToClassList("nav-btn");
+
+            var bothBtn = new Button(GenerateAll) { text = "Generate both" };
+            bothBtn.AddToClassList("nav-btn");
+            bothBtn.AddToClassList("nav-btn--apply");
+
+            actions.Add(namesBtn);
+            actions.Add(uidBtn);
+            actions.Add(bothBtn);
+            _genRoot.Add(actions);
+
+            // ---- page / popup templates ----
+            var tplHead = new VisualElement();
+            tplHead.AddToClassList("nav-gen-subhead");
+
+            var tplTitle = new Label("Page & popup templates");
+            tplTitle.AddToClassList("nav-page-title");
+
+            var tplSpacer = new VisualElement();
+            tplSpacer.AddToClassList("nav-spacer");
+
+            var tplRefreshBtn = new Button(RefreshTemplates) { text = "Refresh" };
+            tplRefreshBtn.AddToClassList("nav-btn");
+
+            _tplGenAllBtn = new Button(GenerateAllTemplates) { text = "Generate all missing" };
+            _tplGenAllBtn.AddToClassList("nav-btn");
+            _tplGenAllBtn.AddToClassList("nav-btn--apply");
+
+            tplHead.Add(tplTitle);
+            tplHead.Add(tplSpacer);
+            tplHead.Add(tplRefreshBtn);
+            tplHead.Add(_tplGenAllBtn);
+            _genRoot.Add(tplHead);
+
+            _tplStatus = new Label(string.Empty);
+            _tplStatus.AddToClassList("nav-tpl-status");
+            _genRoot.Add(_tplStatus);
+
+            _tplList = new ScrollView(ScrollViewMode.Vertical);
+            _tplList.AddToClassList("nav-tpl-list");
+            _genRoot.Add(_tplList);
+
+            // ---- app scaffold (default project files) ----
+            BuildScaffoldSection();
+
+            // ---- shared output log ----
+            _genLog = new TextField { multiline = true, isReadOnly = true };
+            _genLog.AddToClassList("nav-gen-log");
+            _genLog.value = "Ready.";
+            _genRoot.Add(_genLog);
+
+            try { RefreshTemplates(); } catch { /* NavigationData may not be ready yet */ }
+            try { RefreshScaffold();  } catch { /* ignore */ }
+        }
+
+        private void SetGenLog(string text, StatusKind kind)
+        {
+            if (_genLog != null) _genLog.value = text;
+            Context.SetStatus(text.Replace("\n", "  "), kind);
+        }
+
+        private void GenerateAll()
+        {
+            var sb = new StringBuilder();
+            bool okNames = GenerateElementNames(sb);
+            sb.AppendLine();
+            bool okUids = GenerateUids(sb);
+
+            AssetDatabase.Refresh();
+            SetGenLog(sb.ToString().TrimEnd(),
+                okNames && okUids ? StatusKind.Ok : StatusKind.Warning);
+        }
+
+        // ============================================================ шаблоны страниц/попапов
+
+        // Пересобирает список: для каждого id из NavigationData проверяем папку и uxml внутри.
+        private void RefreshTemplates()
+        {
+            if (_tplList == null) return;
+            _tplList.Clear();
+
+            var pageIds  = Distinct(_pageReg.ReadStored());
+            var popupIds = Distinct(_popupReg.ReadStored());
+
+            bool defaultExists = File.Exists(AppPaths.DefaultTemplatePath);
+            int total = 0, missing = 0;
+
+            foreach (var id in pageIds)  { if (AddTemplateRow(id, false)) missing++; total++; }
+            foreach (var id in popupIds) { if (AddTemplateRow(id, true))  missing++; total++; }
+
+            var status = new StringBuilder();
+            if (!defaultExists)
+                status.Append($"(!) Default template not found at {AppPaths.DefaultTemplatePath} (scaffold it below). ");
+            if (total == 0)
+                status.Append("No page/popup ids in NavigationData.");
+            else
+                status.Append($"{total} item(s), {missing} missing template(s).");
+            _tplStatus.text = status.ToString();
+
+            _tplGenAllBtn?.SetEnabled(missing > 0);
+            ApplyTheme();
+        }
+
+        // Возвращает true, если шаблон отсутствует (строка «missing»).
+        private bool AddTemplateRow(string id, bool isPopup)
+        {
+            var folder   = TemplateFolder(id, isPopup);
+            var uxmlPath = TemplateUxmlPath(id, isPopup);
+
+            bool folderOk = AssetDatabase.IsValidFolder(folder);
+            bool uxmlOk   = File.Exists(uxmlPath);
+            var state = !folderOk ? TplState.MissingFolder : (!uxmlOk ? TplState.MissingUxml : TplState.Ok);
+
+            var row = new VisualElement();
+            row.AddToClassList("nav-tpl-row");
+
+            var idLabel = new Label((isPopup ? "[popup] " : "[page] ") + id);
+            idLabel.AddToClassList("nav-tpl-id");
+
+            var pathLabel = new Label(uxmlPath);
+            pathLabel.AddToClassList("nav-tpl-path");
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+
+            var stateLabel = new Label(StateText(state));
+            stateLabel.AddToClassList("nav-tpl-state");
+            stateLabel.AddToClassList(state == TplState.Ok ? "nav-tpl-state--ok" : "nav-tpl-state--missing");
+
+            row.Add(idLabel);
+            row.Add(pathLabel);
+            row.Add(spacer);
+            row.Add(stateLabel);
+
+            if (state != TplState.Ok)
+            {
+                var capturedId = id;
+                var capturedPopup = isPopup;
+                var genBtn = new Button(() => GenerateOneTemplate(capturedId, capturedPopup)) { text = "Generate template" };
+                genBtn.AddToClassList("nav-btn");
+                genBtn.AddToClassList("nav-tpl-gen");
+                row.Add(genBtn);
+            }
+            else
+            {
+                var capturedPath = uxmlPath;
+                row.AddToClassList("nav-tpl-row--pingable");
+                row.tooltip = "Click to ping in Project: " + capturedPath;
+                row.RegisterCallback<PointerDownEvent>(e =>
+                {
+                    if (e.button != 0) return;
+                    var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(capturedPath);
+                    if (asset != null)
+                    {
+                        EditorGUIUtility.PingObject(asset);
+                        Selection.activeObject = asset;
+                    }
+                });
+            }
+
+            _tplList.Add(row);
+            return state != TplState.Ok;
+        }
+
+        private static string StateText(TplState s) => s switch
+        {
+            TplState.Ok            => "OK",
+            TplState.MissingUxml   => "no uxml",
+            TplState.MissingFolder => "no folder",
+            _                      => "?"
+        };
+
+        private void GenerateOneTemplate(string id, bool isPopup)
+        {
+            bool ok = CopyTemplate(id, isPopup, out var msg);
+            AssetDatabase.Refresh();
+            RefreshTemplates();
+            SetGenLog("Template: " + msg, ok ? StatusKind.Ok : StatusKind.Error);
+        }
+
+        private void GenerateAllTemplates()
+        {
+            if (!File.Exists(AppPaths.DefaultTemplatePath))
+            {
+                SetGenLog($"Default template not found at {AppPaths.DefaultTemplatePath} — scaffold it first.", StatusKind.Error);
+                return;
+            }
+
+            var pageIds  = Distinct(_pageReg.ReadStored());
+            var popupIds = Distinct(_popupReg.ReadStored());
+
+            int created = 0, failed = 0;
+            var sb = new StringBuilder();
+
+            foreach (var id in pageIds)  Run(id, false);
+            foreach (var id in popupIds) Run(id, true);
+
+            AssetDatabase.Refresh();
+            RefreshTemplates();
+
+            sb.Insert(0, $"Templates: created {created}" + (failed > 0 ? $", {failed} failed" : "") +
+                         (created == 0 && failed == 0 ? " (nothing missing)" : "") + ".\n");
+            SetGenLog(sb.ToString().TrimEnd(), failed > 0 ? StatusKind.Warning : StatusKind.Ok);
+
+            void Run(string id, bool isPopup)
+            {
+                if (File.Exists(TemplateUxmlPath(id, isPopup))) return;   // уже есть — пропускаем
+                if (CopyTemplate(id, isPopup, out var msg)) { created++; sb.AppendLine("+ " + msg); }
+                else                                         { failed++;  sb.AppendLine("! " + msg); }
+            }
+        }
+
+        // Копирует Default.uxml в папку страницы/попапа под именем <id>.uxml.
+        private static bool CopyTemplate(string id, bool isPopup, out string msg)
+        {
+            if (string.IsNullOrWhiteSpace(id)) { msg = "empty id — skipped"; return false; }
+
+            if (!File.Exists(AppPaths.DefaultTemplatePath))
+            {
+                msg = $"Default template not found at {AppPaths.DefaultTemplatePath}";
+                return false;
+            }
+
+            var folder = TemplateFolder(id, isPopup);
+            var dest   = TemplateUxmlPath(id, isPopup);
+
+            if (File.Exists(dest)) { msg = $"already exists: {dest}"; return true; }
+
+            try { EnsureAssetFolder(folder); }
+            catch (Exception e) { msg = $"cannot create folder {folder}: {e.Message}"; return false; }
+
+            var copied = AssetDatabase.CopyAsset(AppPaths.DefaultTemplatePath, dest);
+            if (!copied) { msg = $"CopyAsset failed -> {dest}"; return false; }
+
+            msg = dest;
+            return true;
+        }
+
+        // Папка = root/<PascalCase(id)>; имя файла = сырой id, почищенный от запретных символов.
+        private static string TemplateFolder(string id, bool isPopup) =>
+            $"{(isPopup ? AppPaths.PopupsRoot : AppPaths.PagesRoot)}/{ToTypeIdentNonEmpty(id, isPopup ? "Popup" : "Page")}";
+
+        private static string TemplateUxmlPath(string id, bool isPopup) =>
+            $"{TemplateFolder(id, isPopup)}/{SanitizeFileName(id)}.uxml";
+
+        private static string SanitizeFileName(string id)
+        {
+            id = (id ?? string.Empty).Trim();
+            if (id.Length == 0) return "page";
+            var invalid = Path.GetInvalidFileNameChars();
+            var sb = new StringBuilder(id.Length);
+            foreach (var ch in id) sb.Append(Array.IndexOf(invalid, ch) >= 0 ? '_' : ch);
+            return sb.ToString();
+        }
+
+        // Рекурсивно создаёт папку ассета через AssetDatabase (с .meta). "Assets" всегда валиден.
+        private static void EnsureAssetFolder(string folder)
+        {
+            folder = folder.Replace('\\', '/').TrimEnd('/');
+            if (string.IsNullOrEmpty(folder) || AssetDatabase.IsValidFolder(folder)) return;
+
+            var parent = Path.GetDirectoryName(folder)?.Replace('\\', '/');
+            var leaf   = Path.GetFileName(folder);
+            if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(leaf)) return;
+
+            EnsureAssetFolder(parent);
+            AssetDatabase.CreateFolder(parent, leaf);
+        }
+
+        // ============================================================ App scaffold (НОВОЕ)
+
+        private enum ScaffoldKind
+        {
+            AppStyle, AppTheme, AppSettings,
+            AppStarter, DefaultContainer, LoadingScreen,
+            UISoundLibrary, NavigationData, NavigationSetting
+        }
+
+        private readonly struct ScaffoldItem
+        {
+            public readonly ScaffoldKind Kind;
+            public readonly string Label;
+            public readonly string Path;
+            public ScaffoldItem(ScaffoldKind kind, string label, string path)
+            { Kind = kind; Label = label; Path = path; }
+        }
+
+        // Полный дефолтный след. Пути — из AppPaths, чтобы статус не разъезжался с генерацией.
+        private static List<ScaffoldItem> ScaffoldItems() => new()
+        {
+            new(ScaffoldKind.AppStyle,         "AppStyle.uss (common style)", AppPaths.AppStylePath),
+            new(ScaffoldKind.AppTheme,         "AppTheme.tss (theme)",        AppPaths.AppThemePath),
+            new(ScaffoldKind.AppSettings,      "App Settings (PanelSettings)", AppPaths.AppSettingsPath),
+            new(ScaffoldKind.AppStarter,       "AppStarter.uxml",             AppPaths.AppStarterPath),
+            new(ScaffoldKind.DefaultContainer, "Default.uxml (page template)", AppPaths.DefaultTemplatePath),
+            new(ScaffoldKind.LoadingScreen,    "LoadingScreen.uxml",          AppPaths.LoadingScreenPath),
+            new(ScaffoldKind.UISoundLibrary,   "UISoundLibrary (default)",    AppPaths.UISoundLibraryPath),
+            new(ScaffoldKind.NavigationData,   "NavigationData (id registry)", AppPaths.NavigationDataPath),
+            new(ScaffoldKind.NavigationSetting,"NavigationSetting (routing)",  AppPaths.SettingPath),
+        };
+
+        private void BuildScaffoldSection()
+        {
+            var head = new VisualElement();
+            head.AddToClassList("nav-gen-subhead");
+
+            var title = new Label("App scaffold (default files)");
+            title.AddToClassList("nav-page-title");
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+
+            var refreshBtn = new Button(RefreshScaffold) { text = "Refresh" };
+            refreshBtn.AddToClassList("nav-btn");
+
+            _scaffoldGenAllBtn = new Button(ScaffoldAllMissing) { text = "Scaffold all missing" };
+            _scaffoldGenAllBtn.AddToClassList("nav-btn");
+            _scaffoldGenAllBtn.AddToClassList("nav-btn--apply");
+
+            head.Add(title);
+            head.Add(spacer);
+            head.Add(refreshBtn);
+            head.Add(_scaffoldGenAllBtn);
+            _genRoot.Add(head);
+
+            var desc = new Label(
+                "Idempotent default project files. Creates only what is missing — authored files are never " +
+                "overwritten. Containers get a filled \"mainContainer\" plus the shared AppStyle; AppStyle/AppTheme " +
+                "start empty for you to extend.");
+            desc.AddToClassList("nav-gen-desc");
+            _genRoot.Add(desc);
+
+            _scaffoldStatus = new Label(string.Empty);
+            _scaffoldStatus.AddToClassList("nav-tpl-status");
+            _genRoot.Add(_scaffoldStatus);
+
+            _scaffoldList = new ScrollView(ScrollViewMode.Vertical);
+            _scaffoldList.AddToClassList("nav-tpl-list");
+            _genRoot.Add(_scaffoldList);
+        }
+
+        private void RefreshScaffold()
+        {
+            if (_scaffoldList == null) return;
+            _scaffoldList.Clear();
+
+            int present = 0, total = 0;
+            foreach (var item in ScaffoldItems())
+            {
+                bool exists = ScaffoldExists(item.Path);
+                if (exists) present++;
+                total++;
+                _scaffoldList.Add(MakeScaffoldRow(item, exists));
+            }
+
+            int missing = total - present;
+            _scaffoldGenAllBtn?.SetEnabled(missing > 0);
+            if (_scaffoldStatus != null)
+                _scaffoldStatus.text = $"{present}/{total} present, {missing} missing.";
+            ApplyTheme();
+        }
+
+        private static bool ScaffoldExists(string path) =>
+            AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path) != null || File.Exists(path);
+
+        private VisualElement MakeScaffoldRow(ScaffoldItem item, bool exists)
+        {
+            var row = new VisualElement();
+            row.AddToClassList("nav-tpl-row");
+
+            var idLabel = new Label(item.Label);
+            idLabel.AddToClassList("nav-tpl-id");
+
+            var pathLabel = new Label(item.Path);
+            pathLabel.AddToClassList("nav-tpl-path");
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+
+            var stateLabel = new Label(exists ? "present" : "missing");
+            stateLabel.AddToClassList("nav-tpl-state");
+            stateLabel.AddToClassList(exists ? "nav-tpl-state--ok" : "nav-tpl-state--missing");
+
+            row.Add(idLabel);
+            row.Add(pathLabel);
+            row.Add(spacer);
+            row.Add(stateLabel);
+
+            if (!exists)
+            {
+                var kind = item.Kind;
+                var genBtn = new Button(() => ScaffoldOneAndRefresh(kind)) { text = "Create" };
+                genBtn.AddToClassList("nav-btn");
+                genBtn.AddToClassList("nav-tpl-gen");
+                row.Add(genBtn);
+            }
+            else
+            {
+                var capturedPath = item.Path;
+                row.AddToClassList("nav-tpl-row--pingable");
+                row.RegisterCallback<PointerDownEvent>(e =>
+                {
+                    if (e.button != 0) return;
+                    var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(capturedPath);
+                    if (obj != null) EditorGUIUtility.PingObject(obj);
+                });
+            }
+
+            return row;
+        }
+
+        private void ScaffoldOneAndRefresh(ScaffoldKind kind)
+        {
+            bool ok = ScaffoldOne(kind, out var msg);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            RefreshScaffold();
+            RefreshTemplates();
+            SetGenLog("Scaffold: " + msg, ok ? StatusKind.Ok : StatusKind.Error);
+        }
+
+        private void ScaffoldAllMissing()
+        {
+            int created = 0, failed = 0, skipped = 0;
+            var sb = new StringBuilder();
+
+            // Порядок важен: стиль и тема — до App Settings (PanelSettings линкует тему).
+            foreach (var item in ScaffoldItems())
+            {
+                if (ScaffoldExists(item.Path)) { skipped++; continue; }
+                if (ScaffoldOne(item.Kind, out var msg)) { created++; sb.AppendLine("+ " + msg); }
+                else                                      { failed++;  sb.AppendLine("! " + msg); }
+            }
+
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            RefreshScaffold();
+            RefreshTemplates();
+
+            sb.Insert(0, $"Scaffold: created {created}, skipped {skipped}" +
+                         (failed > 0 ? $", {failed} failed" : "") + ".\n");
+            SetGenLog(sb.ToString().TrimEnd(), failed > 0 ? StatusKind.Warning : StatusKind.Ok);
+        }
+
+        // Идемпотентное создание одного артефакта. Существующее не трогаем.
+        private bool ScaffoldOne(ScaffoldKind kind, out string msg)
+        {
+            try
+            {
+                switch (kind)
+                {
+                    case ScaffoldKind.AppStyle:
+                        return WriteTextAssetIfMissing(AppPaths.AppStylePath, AppStyleContent(), out msg);
+
+                    case ScaffoldKind.AppTheme:
+                        return WriteTextAssetIfMissing(AppPaths.AppThemePath, AppThemeContent(), out msg);
+
+                    case ScaffoldKind.AppSettings:
+                        return CreatePanelSettings(out msg);
+
+                    case ScaffoldKind.AppStarter:
+                        return WriteTextAssetIfMissing(AppPaths.AppStarterPath, ContainerUxmlContent(), out msg);
+
+                    case ScaffoldKind.DefaultContainer:
+                        return WriteTextAssetIfMissing(AppPaths.DefaultTemplatePath, ContainerUxmlContent(), out msg);
+
+                    case ScaffoldKind.LoadingScreen:
+                        return WriteTextAssetIfMissing(AppPaths.LoadingScreenPath, ContainerUxmlContent(), out msg);
+
+                    case ScaffoldKind.UISoundLibrary:
+                        return CreateScriptableIfMissing<UISoundLibrary>(AppPaths.UISoundLibraryPath, out msg);
+
+                    case ScaffoldKind.NavigationData:
+                        return CreateScriptableIfMissing<NavigationData>(AppPaths.NavigationDataPath, out msg);
+
+                    case ScaffoldKind.NavigationSetting:
+                        return CreateScriptableIfMissing<NavigationSetting>(AppPaths.SettingPath, out msg);
+
+                    default:
+                        msg = "unknown kind"; return false;
+                }
+            }
+            catch (Exception e)
+            {
+                msg = $"{kind}: {e.Message}";
+                return false;
+            }
+        }
+
+        // ---- writers ----
+
+        private static bool WriteTextAssetIfMissing(string path, string content, out string msg)
+        {
+            if (ScaffoldExists(path)) { msg = $"already exists: {path}"; return true; }
+
+            var dir = Path.GetDirectoryName(path)?.Replace('\\', '/');
+            if (!string.IsNullOrEmpty(dir)) EnsureAssetFolder(dir);
+
+            File.WriteAllText(path, content, new UTF8Encoding(false));
+            AssetDatabase.ImportAsset(path);
+            msg = path;
+            return true;
+        }
+
+        private static bool CreateScriptableIfMissing<T>(string path, out string msg) where T : ScriptableObject
+        {
+            if (ScaffoldExists(path)) { msg = $"already exists: {path}"; return true; }
+
+            var dir = Path.GetDirectoryName(path)?.Replace('\\', '/');
+            if (!string.IsNullOrEmpty(dir)) EnsureAssetFolder(dir);
+
+            var so = ScriptableObject.CreateInstance<T>();
+            AssetDatabase.CreateAsset(so, path);
+            msg = path;
+            return true;
+        }
+
+        // App Settings = PanelSettings со ссылкой на сгенерированную тему (1920x1080, scale-with-screen).
+        private static bool CreatePanelSettings(out string msg)
+        {
+            var path = AppPaths.AppSettingsPath;
+            if (ScaffoldExists(path)) { msg = $"already exists: {path}"; return true; }
+
+            // тема нужна до PanelSettings — создаём, если ещё нет
+            if (!ScaffoldExists(AppPaths.AppThemePath))
+                WriteTextAssetIfMissing(AppPaths.AppThemePath, AppThemeContent(), out _);
+
+            var dir = Path.GetDirectoryName(path)?.Replace('\\', '/');
+            if (!string.IsNullOrEmpty(dir)) EnsureAssetFolder(dir);
+
+            var ps = ScriptableObject.CreateInstance<PanelSettings>();
+            ps.scaleMode = PanelScaleMode.ScaleWithScreenSize;
+            ps.referenceResolution = new Vector2Int(1920, 1080);
+
+            var theme = AssetDatabase.LoadAssetAtPath<ThemeStyleSheet>(AppPaths.AppThemePath);
+            if (theme != null) ps.themeStyleSheet = theme;
+
+            AssetDatabase.CreateAsset(ps, path);
+            msg = theme != null ? path : $"{path} (theme not linked — AppTheme missing)";
+            return true;
+        }
+
+        // ---- content templates ----
+
+        private static string AppStyleContent() =>
+            "/* AppStyle.uss — общий стиль приложения.\n" +
+            "   По умолчанию прокидывается <Style>-ом в каждый контейнер (AppStarter/Default/LoadingScreen).\n" +
+            "   Изначально пуст — расширяй под проект. */\n";
+
+        private static string AppThemeContent() =>
+            "@import url(\"unity-theme://default\");\n\nVisualElement {\n}\n";
+
+        // Контейнер: mainContainer на весь экран с заливкой + общий AppStyle.
+        private static string ContainerUxmlContent() =>
+            "<ui:UXML xmlns:ui=\"UnityEngine.UIElements\" xmlns:uie=\"UnityEditor.UIElements\" editor-extension-mode=\"False\">\n" +
+            $"    <Style src=\"project://database/{AppPaths.AppStylePath}\" />\n" +
+            "    <ui:VisualElement name=\"mainContainer\" style=\"flex-grow: 1; background-color: rgb(20, 20, 20);\" />\n" +
+            "</ui:UXML>\n";
+
+        // ============================================================ UID-генерация (NavTargets)
+
+        private void GenerateUids()
+        {
+            var sb = new StringBuilder();
+            bool ok = GenerateUids(sb);
+            AssetDatabase.Refresh();
+            SetGenLog(sb.ToString().TrimEnd(), ok ? StatusKind.Ok : StatusKind.Warning);
+        }
+
+        // Возвращает true, если файл записан. Пишет отчёт в log.
+        private bool GenerateUids(StringBuilder log)
+        {
+            var pageIds  = Distinct(_pageReg.ReadStored());
+            var popupIds = Distinct(_popupReg.ReadStored());
+
+            if (pageIds.Count == 0 && popupIds.Count == 0)
+            {
+                log.AppendLine("UIDs: no page/popup ids in NavigationData — " + AppPaths.UidFileName + ".cs left untouched.");
+                return false;
+            }
+
+            var body = new StringBuilder();
+            body.AppendLine("// <auto-generated> Generated by App (Nexus) editor. Do not edit by hand. </auto-generated>");
+            body.AppendLine("using App.Core;");
+            body.AppendLine();
+            body.AppendLine($"namespace {AppPaths.GenNamespace}");
+            body.AppendLine("{");
+            body.AppendLine($"    public static partial class {AppPaths.UidFileName}");
+            body.AppendLine("    {");
+
+            var used = new HashSet<string>(StringComparer.Ordinal);
+            int p = EmitUidBlock(body, used, pageIds,  "PageUID",  "_Page");
+            if (pageIds.Count > 0 && popupIds.Count > 0) body.AppendLine();
+            int u = EmitUidBlock(body, used, popupIds, "PopupUID", "_Popup");
+
+            body.AppendLine("    }");
+            body.AppendLine("}");
+
+            if (!TryWrite(AppPaths.UidFileName, body.ToString(), out var path, out var err))
+            {
+                log.AppendLine("UIDs: write failed — " + err);
+                return false;
+            }
+
+            log.AppendLine($"UIDs: {p} PageUID, {u} PopupUID -> {path}");
+            return true;
+        }
+
+        // Пишет поля одного типа. id -> Pascal(id) + suffix; '_'/'-' в id отбрасываются.
+        private static int EmitUidBlock(StringBuilder sb, HashSet<string> used,
+                                        List<string> ids, string uidType, string suffix)
+        {
+            int n = 0;
+            foreach (var id in ids)
+            {
+                var ident = Unique(used, ToTypeIdent(id) + suffix);
+                var lit   = Escape(id);
+                sb.AppendLine($"        public static readonly {uidType} {ident} = new {uidType}(\"{lit}\");");
+                n++;
+            }
+            return n;
+        }
+
+        // ============================================================ генерация имён элементов
+
+        private void GenerateElementNames()
+        {
+            var sb = new StringBuilder();
+            bool ok = GenerateElementNames(sb);
+            AssetDatabase.Refresh();
+            SetGenLog(sb.ToString().TrimEnd(), ok ? StatusKind.Ok : StatusKind.Warning);
+        }
+
+        private bool GenerateElementNames(StringBuilder log)
+        {
+            if (!ScanComponentsForNames(out var sources, out var scanError))
+            {
+                log.AppendLine("Names: " + (scanError ?? "no AppRunner / no AppPage·AppPopup in the active scene") +
+                               " — " + AppPaths.NameFileName + ".cs left untouched.");
+                return false;
+            }
+
+            var classes      = new List<(string name, List<(string ident, string value)> members)>();
+            var usedClassIds = new HashSet<string>(StringComparer.Ordinal);
+            int totalMembers = 0, skippedUnnamed = 0, pagesEmpty = 0, badUxml = 0;
+
+            foreach (var src in sources)
+            {
+                if (src.uxmlMissing) { badUxml++; continue; }
+
+                List<(string name, string value)> raw;
+                try { raw = ExtractGenerateLinks(src.uxmlText, ref skippedUnnamed); }
+                catch (Exception e)
+                {
+                    badUxml++;
+                    log.AppendLine($"Names: cannot parse UXML of \"{src.id}\" ({src.uxmlPath}) — {e.Message}");
+                    continue;
+                }
+
+                if (raw.Count == 0) { pagesEmpty++; continue; }
+
+                var classId = Unique(usedClassIds, ToTypeIdentNonEmpty(src.id, src.isPopup ? "Popup" : "Page"));
+
+                var members   = new List<(string ident, string value)>();
+                var usedConst = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var (name, _) in raw)
+                {
+                    var ident = Unique(usedConst, ToConstIdent(name));
+                    members.Add((ident, name));
+                    totalMembers++;
+                }
+                classes.Add((classId, members));
+            }
+
+            if (classes.Count == 0)
+            {
+                log.AppendLine($"Names: no elements with \".{GenerateLinkClass}\" found" +
+                               (badUxml > 0 ? $" ({badUxml} UXML unreadable)" : "") +
+                               $" — {AppPaths.NameFileName}.cs left untouched.");
+                return false;
+            }
+
+            var body = new StringBuilder();
+            body.AppendLine("// <auto-generated> Generated by App (Nexus) editor. Do not edit by hand. </auto-generated>");
+            body.AppendLine($"namespace {AppPaths.GenNamespace}");
+            body.AppendLine("{");
+            body.AppendLine($"    public static partial class {AppPaths.NameFileName}");
+            body.AppendLine("    {");
+
+            for (int i = 0; i < classes.Count; i++)
+            {
+                var (cname, members) = classes[i];
+                body.AppendLine($"        public static class {cname}");
+                body.AppendLine("        {");
+                foreach (var (ident, value) in members)
+                    body.AppendLine($"            public const string {ident} = \"{Escape(value)}\";");
+                body.AppendLine("        }");
+                if (i < classes.Count - 1) body.AppendLine();
+            }
+
+            body.AppendLine("    }");
+            body.AppendLine("}");
+
+            if (!TryWrite(AppPaths.NameFileName, body.ToString(), out var path, out var err))
+            {
+                log.AppendLine("Names: write failed — " + err);
+                return false;
+            }
+
+            var note = new StringBuilder();
+            note.Append($"Names: {classes.Count} class(es), {totalMembers} element(s) -> {path}");
+            if (skippedUnnamed > 0) note.Append($"; {skippedUnnamed} marked element(s) without name skipped");
+            if (pagesEmpty     > 0) note.Append($"; {pagesEmpty} page(s) with no marked elements");
+            if (badUxml        > 0) note.Append($"; {badUxml} UXML unreadable");
+            log.AppendLine(note.ToString());
+            return true;
+        }
+
+        // Элементы с class содержащим "generate-link"; возвращаем (name, name). Без name — считаем и пропускаем.
+        private static List<(string name, string value)> ExtractGenerateLinks(string uxml, ref int skippedUnnamed)
+        {
+            var result = new List<(string, string)>();
+            if (string.IsNullOrEmpty(uxml)) return result;
+
+            var doc = XDocument.Parse(uxml, LoadOptions.None);
+            foreach (var el in doc.Descendants())
+            {
+                var cls = (string)el.Attribute("class");
+                if (string.IsNullOrEmpty(cls)) continue;
+
+                bool marked = cls.Split(WS, StringSplitOptions.RemoveEmptyEntries)
+                                 .Any(t => t == GenerateLinkClass);
+                if (!marked) continue;
+
+                var name = (string)el.Attribute("name");
+                if (string.IsNullOrWhiteSpace(name)) { skippedUnnamed++; continue; }
+                result.Add((name.Trim(), name.Trim()));
+            }
+            return result;
+        }
+
+        // ============================================================ скан сцены (общий для имён и графа)
+
+        private readonly struct GenSource
+        {
+            public readonly string id;
+            public readonly bool   isPopup;
+            public readonly string uxmlText;
+            public readonly string uxmlPath;
+            public readonly bool   uxmlMissing;
+
+            public GenSource(string id, bool isPopup, string text, string path, bool missing)
+            { this.id = id; this.isPopup = isPopup; uxmlText = text; uxmlPath = path; uxmlMissing = missing; }
+        }
+
+        // true + sources — компоненты найдены; false + error — поломка; false + error==null — AppRunner/детей нет.
+        private bool ScanComponentsForNames(out List<GenSource> sources, out string error)
+        {
+            sources = new List<GenSource>();
+            error   = null;
+
+            var tRunner = ResolveType("App.AppRunner", "AppRunner");
+            var tPage   = ResolveType("App.Core.AppPage",  "AppPage");
+            var tPopup  = ResolveType("App.Core.AppPopup", "AppPopup");
+
+            if (tRunner == null) { error = "type 'AppRunner' not found"; return false; }
+            if (tPage == null && tPopup == null) { error = "neither 'AppPage' nor 'AppPopup' type found"; return false; }
+
+            var runners = UnityEngine.Object.FindObjectsByType(tRunner, FindObjectsInactive.Include);
+            if (runners == null || runners.Length == 0) return false;          // AppRunner нет
+            if (runners[0] is not Component runner) { error = "AppRunner is not a Component"; return false; }
+
+            var pages  = tPage  != null ? runner.GetComponentsInChildren(tPage,  true) : Array.Empty<Component>();
+            var popups = tPopup != null ? runner.GetComponentsInChildren(tPopup, true) : Array.Empty<Component>();
+
+            foreach (var c in pages)  AddGenSource(sources, c, false);
+            foreach (var c in popups) AddGenSource(sources, c, true);
+
+            return sources.Count > 0;
+        }
+
+        private static void AddGenSource(List<GenSource> list, Component c, bool isPopup)
+        {
+            if (c == null) return;
+            var id  = (ReadStringField(c, isPopup ? "popupId" : "pageId") ?? "").Trim();
+            var vta = ReadVisualTree(c);
+
+            if (vta == null) { list.Add(new GenSource(id, isPopup, null, null, true)); return; }
+
+            var path = AssetDatabase.GetAssetPath(vta);
+            string text = null;
+            try { if (!string.IsNullOrEmpty(path)) text = File.ReadAllText(path); }
+            catch { /* unreadable */ }
+
+            list.Add(new GenSource(id, isPopup, text, path, string.IsNullOrEmpty(text)));
+        }
+
+        // Рефлексия-хелперы сцены (ResolveType / ReadStringField / ReadVisualTree)
+        // определены в AppPage.Graph.cs — общие для скана имён и графа (кэшированные).
+
+        // ============================================================ запись кода
+
+        private static bool TryWrite(string fileNameNoExt, string content, out string path, out string error)
+        {
+            path = $"{AppPaths.GenDir}/{fileNameNoExt}.cs";
+            error = null;
+            try
+            {
+                Directory.CreateDirectory(AppPaths.GenDir);
+                File.WriteAllText(path, content, new UTF8Encoding(false));
+                AssetDatabase.ImportAsset(path);
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
+        }
+
+        // ============================================================ именование / утилиты
+
+        // id -> PascalCase, '_' и '-' (и прочие не-буквенно-цифровые) отбрасываются: game_over -> GameOver
+        private static string ToTypeIdent(string raw)
+        {
+            var sb = new StringBuilder();
+            bool up = true;
+            foreach (var ch in raw ?? string.Empty)
+            {
+                if (char.IsLetterOrDigit(ch)) { sb.Append(up ? char.ToUpperInvariant(ch) : ch); up = false; }
+                else up = true;
+            }
+            return EnsureValidIdent(sb.ToString());
+        }
+
+        private static string ToTypeIdentNonEmpty(string raw, string kind)
+        {
+            var s = ToTypeIdent(raw);
+            return s == "_" || string.IsNullOrEmpty(s) ? "Unnamed" + kind : s;
+        }
+
+        // имя элемента -> const: '-' отбрасывается, '_' СОХРАНЯЕТСЯ (restart-button_easy -> RestartButton_Easy)
+        private static string ToConstIdent(string raw)
+        {
+            var sb = new StringBuilder();
+            bool up = true;
+            foreach (var ch in raw ?? string.Empty)
+            {
+                if (ch == '_') { sb.Append('_'); up = true; }
+                else if (char.IsLetterOrDigit(ch)) { sb.Append(up ? char.ToUpperInvariant(ch) : ch); up = false; }
+                else up = true;
+            }
+            return EnsureValidIdent(sb.ToString());
+        }
+
+        private static string EnsureValidIdent(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "_";
+            if (char.IsDigit(s[0])) s = "_" + s;
+            if (CsKeywords.Contains(s)) s = "@" + s;
+            return s;
+        }
+
+        private static string Unique(HashSet<string> used, string ident)
+        {
+            var baseId = ident;
+            int i = 2;
+            while (!used.Add(ident)) ident = baseId + "_" + i++;
+            return ident;
+        }
+
+        private static List<string> Distinct(IEnumerable<string> src)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var res  = new List<string>();
+            if (src == null) return res;
+            foreach (var raw in src)
+            {
+                var id = (raw ?? string.Empty).Trim();
+                if (id.Length == 0) continue;
+                if (seen.Add(id)) res.Add(id);
+            }
+            return res;
+        }
+
+        private static string Escape(string s) =>
+            (s ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+        private static readonly HashSet<string> CsKeywords = new(StringComparer.Ordinal)
+        {
+            "abstract","as","base","bool","break","byte","case","catch","char","checked","class","const",
+            "continue","decimal","default","delegate","do","double","else","enum","event","explicit","extern",
+            "false","finally","fixed","float","for","foreach","goto","if","implicit","in","int","interface",
+            "internal","is","lock","long","namespace","new","null","object","operator","out","override","params",
+            "private","protected","public","readonly","ref","return","sbyte","sealed","short","sizeof","stackalloc",
+            "static","string","struct","switch","this","throw","true","try","typeof","uint","ulong","unchecked",
+            "unsafe","ushort","using","virtual","void","volatile","while"
+        };
+    }
+}

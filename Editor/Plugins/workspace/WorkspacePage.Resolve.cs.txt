@@ -1,0 +1,267 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using UnityEditor;
+using UnityEditorInternal;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    public sealed partial class WorkspacePage
+    {
+        // ---------- Создание карточки из объекта ----------
+
+        private WorkspaceEntry BuildEntryFromObject(UnityEngine.Object obj)
+        {
+            if (obj == null) return null;
+
+            // Ассет проекта (включая префабы, сцены, сабассеты).
+            if (AssetDatabase.Contains(obj))
+            {
+                AssetDatabase.TryGetGUIDAndLocalFileIdentifier(obj, out string guid, out long localId);
+                if (string.IsNullOrEmpty(guid)) return null;
+                return new WorkspaceEntry
+                {
+                    kind = WorkspaceEntryKind.Asset,
+                    assetGuid = guid,
+                    assetLocalId = localId,
+                    cachedName = obj.name,
+                    cachedTypeName = obj.GetType().AssemblyQualifiedName
+                };
+            }
+
+            // Объект на сцене.
+            var go = obj as GameObject ?? (obj as Component)?.gameObject;
+            if (go != null && go.scene.IsValid())
+            {
+                var gid = GlobalObjectId.GetGlobalObjectIdSlow(obj);
+                string sceneGuid = gid.assetGUID.ToString();
+                return new WorkspaceEntry
+                {
+                    kind = WorkspaceEntryKind.SceneObject,
+                    globalObjectId = gid.ToString(),
+                    sceneGuid = sceneGuid,
+                    cachedName = obj.name,
+                    cachedTypeName = obj.GetType().AssemblyQualifiedName,
+                    cachedScenePath = AssetDatabase.GUIDToAssetPath(sceneGuid),
+                    cachedHierarchyPath = HierarchyPath(go)
+                };
+            }
+
+            return null; // прочие нестандартные объекты не складываем
+        }
+
+        private WorkspaceEntry BuildExternalEntry(string absolutePath)
+        {
+            return new WorkspaceEntry
+            {
+                kind = WorkspaceEntryKind.ExternalFile,
+                externalPath = absolutePath,
+                cachedName = Path.GetFileName(absolutePath),
+                cachedTypeName = ""
+            };
+        }
+
+        // ---------- Резолв живого объекта ----------
+
+        private UnityEngine.Object ResolveObject(WorkspaceEntry entry)
+        {
+            switch (entry.kind)
+            {
+                case WorkspaceEntryKind.Asset:
+                {
+                    string path = AssetDatabase.GUIDToAssetPath(entry.assetGuid);
+                    if (string.IsNullOrEmpty(path)) return null;
+                    if (entry.assetLocalId != 0)
+                    {
+                        foreach (var a in AssetDatabase.LoadAllAssetsAtPath(path))
+                        {
+                            if (a == null) continue;
+                            if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(a, out _, out long lid) && lid == entry.assetLocalId)
+                                return a;
+                        }
+                    }
+                    return AssetDatabase.LoadMainAssetAtPath(path);
+                }
+                case WorkspaceEntryKind.SceneObject:
+                    return GlobalObjectId.TryParse(entry.globalObjectId, out var gid)
+                        ? GlobalObjectId.GlobalObjectIdentifierToObjectSlow(gid)
+                        : null;
+
+                default:
+                    return null; // внешние файлы не имеют Unity-объекта
+            }
+        }
+
+        // ---------- Иконки ----------
+
+        private Texture GetIcon(WorkspaceEntry entry, UnityEngine.Object obj)
+        {
+            if (obj != null)
+            {
+                var t = AssetPreview.GetMiniThumbnail(obj);
+                if (t != null) return t;
+            }
+
+            if (entry.kind == WorkspaceEntryKind.ExternalFile && !string.IsNullOrEmpty(entry.externalPath))
+            {
+                var t = InternalEditorUtility.GetIconForFile(entry.externalPath);
+                if (t != null) return t;
+            }
+
+            if (!string.IsNullOrEmpty(entry.cachedTypeName))
+            {
+                var type = Type.GetType(entry.cachedTypeName);
+                if (type != null)
+                {
+                    var t = AssetPreview.GetMiniTypeThumbnail(type);
+                    if (t != null) return t;
+                }
+            }
+
+            string fallback = entry.kind == WorkspaceEntryKind.SceneObject ? "d_GameObject Icon" : "d_DefaultAsset Icon";
+            return EditorGUIUtility.IconContent(fallback).image;
+        }
+
+        // ---------- Tooltip / инфо ----------
+
+        private string BuildInfo(WorkspaceEntry entry, UnityEngine.Object obj)
+        {
+            switch (entry.kind)
+            {
+                case WorkspaceEntryKind.Asset:
+                {
+                    string path = AssetDatabase.GUIDToAssetPath(entry.assetGuid);
+                    return string.IsNullOrEmpty(path)
+                        ? $"{entry.cachedName}\n(ассет отсутствует)"
+                        : $"Ассет\n{path}";
+                }
+                case WorkspaceEntryKind.SceneObject:
+                {
+                    string hier = obj is GameObject go ? HierarchyPath(go) : entry.cachedHierarchyPath;
+                    string scene = !string.IsNullOrEmpty(entry.cachedScenePath) ? entry.cachedScenePath : "(неизвестная сцена)";
+                    string state = obj == null ? "\n(сцена не открыта)" : "";
+                    return $"Сцена: {scene}\nИерархия: {hier}{state}";
+                }
+                default:
+                    return $"Внешний файл\n{entry.externalPath}";
+            }
+        }
+
+        // ---------- Хелперы ----------
+
+        // --- Наборы (Bundle) ---
+
+        private List<UnityEngine.Object> ResolveBundleObjects(WorkspaceEntry bundle)
+        {
+            var list = new List<UnityEngine.Object>();
+            foreach (var m in bundle.items)
+            {
+                var obj = ResolveObject(m);
+                if (obj != null) list.Add(obj);
+            }
+            return list;
+        }
+
+        private List<string> BundlePaths(WorkspaceEntry bundle)
+        {
+            var paths = new List<string>();
+            foreach (var m in bundle.items)
+            {
+                string p = m.kind switch
+                {
+                    WorkspaceEntryKind.Asset => AssetDatabase.GUIDToAssetPath(m.assetGuid),
+                    WorkspaceEntryKind.ExternalFile when File.Exists(m.externalPath) => m.externalPath,
+                    _ => null
+                };
+                if (!string.IsNullOrEmpty(p)) paths.Add(p);
+            }
+            return paths;
+        }
+
+        private int CountResolvable(WorkspaceEntry bundle)
+        {
+            int n = 0;
+            foreach (var m in bundle.items)
+                if (ResolveObject(m) != null) n++;
+            return n;
+        }
+
+        private static bool BundleHasSceneMembers(WorkspaceEntry bundle)
+        {
+            foreach (var m in bundle.items)
+                if (m.kind == WorkspaceEntryKind.SceneObject) return true;
+            return false;
+        }
+
+        private static string BundleDisplayName(WorkspaceEntry bundle) =>
+            string.IsNullOrEmpty(bundle.bundleName) ? $"Набор ({bundle.items.Count})" : bundle.bundleName;
+
+        private string BuildBundleInfo(WorkspaceEntry bundle)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("Набор: ").Append(BundleDisplayName(bundle))
+              .Append(" — ").Append(bundle.items.Count).Append(" элем.");
+            int cap = System.Math.Min(bundle.items.Count, 12);
+            for (int i = 0; i < cap; i++)
+            {
+                var m = bundle.items[i];
+                string nm = string.IsNullOrEmpty(m.cachedName) ? m.StableKey : m.cachedName;
+                sb.Append('\n').Append("• ").Append(nm).Append("  (").Append(ShortTypeName(m)).Append(')');
+            }
+            if (bundle.items.Count > cap) sb.Append("\n…");
+            return sb.ToString();
+        }
+
+        private static string HierarchyPath(GameObject go)
+        {
+            var stack = new List<string>();
+            var t = go.transform;
+            while (t != null) { stack.Add(t.name); t = t.parent; }
+            stack.Reverse();
+            return string.Join("/", stack);
+        }
+
+        private string EntryPath(WorkspaceEntry entry) => entry.kind switch
+        {
+            WorkspaceEntryKind.Asset => AssetDatabase.GUIDToAssetPath(entry.assetGuid),
+            WorkspaceEntryKind.SceneObject => entry.cachedScenePath,
+            WorkspaceEntryKind.ExternalFile => entry.externalPath,
+            _ => ""
+        };
+
+        private string ShortTypeName(WorkspaceEntry entry)
+        {
+            if (entry.kind == WorkspaceEntryKind.ExternalFile)
+            {
+                var ext = Path.GetExtension(entry.externalPath);
+                return string.IsNullOrEmpty(ext) ? "Файл" : ext.TrimStart('.').ToUpperInvariant();
+            }
+            if (!string.IsNullOrEmpty(entry.cachedTypeName))
+            {
+                var type = Type.GetType(entry.cachedTypeName);
+                if (type != null) return type.Name;
+                int comma = entry.cachedTypeName.IndexOf(',');
+                string full = comma > 0 ? entry.cachedTypeName.Substring(0, comma) : entry.cachedTypeName;
+                int dot = full.LastIndexOf('.');
+                return dot >= 0 ? full.Substring(dot + 1) : full;
+            }
+            return entry.kind.ToString();
+        }
+
+        private static string KindTag(WorkspaceEntryKind kind) => kind switch
+        {
+            WorkspaceEntryKind.Asset => "A",
+            WorkspaceEntryKind.SceneObject => "S",
+            WorkspaceEntryKind.ExternalFile => "F",
+            WorkspaceEntryKind.Bundle => "[ ]",
+            _ => "?"
+        };
+
+        private void CancelPendingClicks()
+        {
+            // Запланированные одиночные клики живут на самих карточках; пересборка их снимет.
+            _rebuildJob?.Pause();
+        }
+    }
+}

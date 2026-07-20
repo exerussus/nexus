@@ -1,0 +1,134 @@
+// ============================================================
+//  AppPaths.cs — единый источник путей и имён внешнего следа App.
+//
+//  ПРОЕКТНЫЙ конфиг (общий, коммитится в git): Assets/App/app.config.json.
+//  Создаётся с дефолтами при отсутствии, читается через JsonUtility (без Newtonsoft).
+//  Все остальные partial'ы страницы берут пути ТОЛЬКО отсюда — никаких хардкод-констант,
+//  чтобы статус (External) и генераторы не разъезжались между собой.
+//
+//  Дефолты соответствуют целевому layout (Assets/App/{Containers,Styles,Resources,
+//  UIToolkit,Pages,Popups,Navigation/Generated}). Меняешь раскладку — правишь JSON,
+//  а не код.
+// ============================================================
+
+#if UNITY_EDITOR
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal static class AppPaths
+    {
+        // Фиксированное место самого конфига (внутри AppRoot по умолчанию). Сам AppRoot
+        // конфиг задаёт для генерации; переезд AppRoot — синхронно с переносом этого файла.
+        public const string ConfigPath = "Assets/App/app.config.json";
+
+        [Serializable]
+        private sealed class Config
+        {
+            public string appRoot             = "Assets/App";
+
+            // подпапки (относительно appRoot)
+            public string containersDir        = "Containers";
+            public string stylesDir            = "Styles";
+            public string resourcesDir         = "Resources";
+            public string uiToolkitDir         = "UIToolkit";
+            public string pagesDir             = "Pages";
+            public string popupsDir            = "Popups";
+            public string generatedDir         = "Navigation/Generated";
+
+            // namespace генерируемого кода (NavTargets / NavigationName)
+            public string generatedNamespace   = "App.Navigation";
+
+            // имена файлов
+            public string navUssName           = "Navigation.uss";
+            public string appStyleName         = "AppStyle.uss";
+            public string appThemeName         = "AppTheme.tss";
+            public string appSettingsName      = "App Settings.asset";
+            public string navigationSettingName = "NavigationSetting.asset";
+            public string navigationDataName   = "NavigationData.asset";
+            public string uiSoundLibraryName   = "UISoundLibrary.asset";
+            public string defaultContainerName = "Default.uxml";
+            public string appStarterName       = "AppStarter.uxml";
+            public string loadingScreenName    = "LoadingScreen.uxml";
+
+            // имена генерируемых .cs (без расширения)
+            public string uidFileName          = "NavTargets";
+            public string nameFileName         = "NavigationName";
+        }
+
+        private static Config _cfg;
+        private static Config Cfg => _cfg ??= LoadOrCreate();
+
+        private static Config LoadOrCreate()
+        {
+            try
+            {
+                if (File.Exists(ConfigPath))
+                {
+                    var json = File.ReadAllText(ConfigPath);
+                    var cfg = JsonUtility.FromJson<Config>(json);
+                    if (cfg != null) return cfg;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[AppPaths] Не удалось прочитать {ConfigPath}: {e.Message}. Беру дефолты.");
+            }
+
+            var def = new Config();
+            Save(def);
+            return def;
+        }
+
+        /// <summary>Сбросить кеш — после ручной правки JSON или из Settings-вкладки.</summary>
+        public static void Reload() => _cfg = null;
+
+        private static void Save(Config c)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(ConfigPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(ConfigPath, JsonUtility.ToJson(c, true));
+                AssetDatabase.ImportAsset(ConfigPath);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[AppPaths] Не удалось записать {ConfigPath}: {e.Message}");
+            }
+        }
+
+        private static string Combine(string a, string b) => $"{a.TrimEnd('/')}/{b}";
+
+        // ---- директории ----
+        public static string AppRoot       => Cfg.appRoot.TrimEnd('/');
+        public static string ContainersDir => Combine(AppRoot, Cfg.containersDir);
+        public static string StylesDir     => Combine(AppRoot, Cfg.stylesDir);
+        public static string ResourcesDir  => Combine(AppRoot, Cfg.resourcesDir);
+        public static string UIToolkitDir  => Combine(AppRoot, Cfg.uiToolkitDir);
+        public static string PagesRoot     => Combine(AppRoot, Cfg.pagesDir);
+        public static string PopupsRoot    => Combine(AppRoot, Cfg.popupsDir);
+        public static string GenDir        => Combine(AppRoot, Cfg.generatedDir);
+
+        // ---- генерируемый код ----
+        public static string GenNamespace  => Cfg.generatedNamespace;
+        public static string UidFileName   => Cfg.uidFileName;
+        public static string NameFileName  => Cfg.nameFileName;
+
+        // ---- конкретные файлы ----
+        public static string NavUssPath         => Combine(StylesDir,    Cfg.navUssName);
+        public static string AppStylePath       => Combine(StylesDir,    Cfg.appStyleName);
+        public static string AppThemePath       => Combine(UIToolkitDir, Cfg.appThemeName);
+        public static string AppSettingsPath    => Combine(UIToolkitDir, Cfg.appSettingsName);
+        public static string SettingPath        => Combine(ResourcesDir, Cfg.navigationSettingName);
+        public static string NavigationDataPath => Combine(ResourcesDir, Cfg.navigationDataName);
+        public static string UISoundLibraryPath => Combine(ResourcesDir, Cfg.uiSoundLibraryName);
+        public static string DefaultTemplatePath => Combine(ContainersDir, Cfg.defaultContainerName);
+        public static string AppStarterPath     => Combine(ContainersDir, Cfg.appStarterName);
+        public static string LoadingScreenPath  => Combine(ContainersDir, Cfg.loadingScreenName);
+    }
+}
+#endif

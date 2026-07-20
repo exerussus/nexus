@@ -1,0 +1,76 @@
+using System;
+using System.Collections.Generic;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Реверс-поиск прямых ссылок из ассетов проекта на ассеты внутри Resources.
+    // Два режима: замыкание сцен из Build Settings (что реально едет в билд через ссылки)
+    // и весь проект (полная картина реферера). Оба — дорогие, только по кнопке.
+    public static class ReferenceScanner
+    {
+        // текстовые ассеты сериализованных ссылок не несут — пропускаем ради скорости
+        static readonly string[] SkipExt =
+            { ".cs", ".js", ".asmdef", ".asmref", ".dll", ".md", ".txt", ".json", ".xml" };
+
+        public static void ScanBuildClosure(AuditReport report, Action<float, string> progress)
+        {
+            var scenes = new List<string>();
+            foreach (var s in EditorBuildSettings.scenes)
+                if (s.enabled && !string.IsNullOrEmpty(s.path)) scenes.Add(s.path);
+
+            var candidates = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var s in scenes) candidates.Add(s);
+            // замыкание зависимостей билд-сцен: всё, что поедет в билд через ссылки
+            foreach (var dep in AssetDatabase.GetDependencies(scenes.ToArray(), true)) candidates.Add(dep);
+
+            ScanInternal(report, new List<string>(candidates), buildMode: true, progress);
+            report.refsBuildAt = Stamp.Now();
+        }
+
+        public static void ScanAll(AuditReport report, Action<float, string> progress)
+        {
+            var candidates = new List<string>();
+            foreach (var p in AssetDatabase.GetAllAssetPaths())
+                if (p.StartsWith("Assets/", StringComparison.Ordinal) ||
+                    p.StartsWith("Packages/", StringComparison.Ordinal)) candidates.Add(p);
+
+            ScanInternal(report, candidates, buildMode: false, progress);
+            report.refsAllAt = Stamp.Now();
+        }
+
+        static void ScanInternal(AuditReport report, List<string> candidates, bool buildMode,
+            Action<float, string> progress)
+        {
+            var known = new Dictionary<string, ResourceAssetEntry>(StringComparer.Ordinal);
+            foreach (var e in report.resources)
+            {
+                known[e.assetPath] = e;
+                (buildMode ? e.buildReferrers : e.referrers).Clear();
+            }
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var path = candidates[i];
+                if ((i & 63) == 0 && progress != null) progress((float)i / candidates.Count, path);
+                if (Skip(path) || AssetDatabase.IsValidFolder(path)) continue;
+
+                // только НЕрекурсивные зависимости: нужен именно непосредственный реферер
+                foreach (var dep in AssetDatabase.GetDependencies(path, false))
+                {
+                    ResourceAssetEntry e;
+                    if (dep == path || !known.TryGetValue(dep, out e)) continue;
+                    var list = buildMode ? e.buildReferrers : e.referrers;
+                    if (!list.Contains(path)) list.Add(path);
+                }
+            }
+        }
+
+        static bool Skip(string path)
+        {
+            foreach (var ext in SkipExt)
+                if (path.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+    }
+}

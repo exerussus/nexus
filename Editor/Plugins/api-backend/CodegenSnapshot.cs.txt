@@ -1,0 +1,161 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Newtonsoft.Json;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Снимок последней УСПЕШНОЙ генерации ПРОФИЛЯ. Хранит:
+    ///  - текст спеки (для дрейф-диффа спеки),
+    ///  - зеркало сгенеренных .cs (для построчного диффа кода и гарда ручных правок).
+    ///
+    /// Схема 2: снапшоты per-profile, ключ — Id профиля:
+    ///   ProjectSettings/ApiCodegen.Snapshots/&lt;id&gt;.json  (мета)
+    ///   ProjectSettings/ApiCodegen.Mirrors/&lt;id&gt;/         (зеркало кода)
+    /// Всё вне Assets (без импорта AssetDatabase) и коммитится, если хочешь
+    /// сравнивать дрейф между машинами/коммитами.
+    /// </summary>
+    [Serializable]
+    public sealed class CodegenSnapshot
+    {
+        public string TakenAtUtc;
+        public string SpecText;                          // спека на момент генерации
+        public List<string> GeneratedFiles = new();      // относительные пути (от OutputDir профиля)
+
+        [JsonIgnore] public bool Exists;
+        [JsonIgnore] public string ProfileId = "";       // чей это снимок (заполняется в Load/Commit)
+
+        private const string SnapshotsDirRel = "ProjectSettings/ApiCodegen.Snapshots";
+        private const string MirrorsDirRel = "ProjectSettings/ApiCodegen.Mirrors";
+
+        // Пути старой (однопрофильной) схемы — только для миграции и полной очистки.
+        private const string LegacyMetaRel = "ProjectSettings/ApiCodegen.Snapshot.json";
+        private const string LegacyMirrorRel = "ProjectSettings/ApiCodegen.LastGen";
+
+        private static string Abs(string rel) => Path.Combine(ApiCodegenConfig.ProjectRoot, rel);
+        private static string MetaPathFor(string profileId) => Abs(Path.Combine(SnapshotsDirRel, profileId + ".json"));
+        private static string MirrorRootFor(string profileId) => Abs(Path.Combine(MirrorsDirRel, profileId));
+
+        public static CodegenSnapshot Load(string profileId)
+        {
+            try
+            {
+                var metaPath = MetaPathFor(profileId);
+                if (File.Exists(metaPath))
+                {
+                    var snap = JsonConvert.DeserializeObject<CodegenSnapshot>(File.ReadAllText(metaPath))
+                               ?? new CodegenSnapshot();
+                    snap.Exists = true;
+                    snap.ProfileId = profileId;
+                    return snap;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[ApiCodegen] Снапшот профиля {profileId} не прочитался: {e.Message}");
+            }
+            return new CodegenSnapshot { Exists = false, ProfileId = profileId };
+        }
+
+        /// <summary>Удалить снапшот одного профиля (мета + зеркало) — при удалении профиля.</summary>
+        public static void Clear(string profileId)
+        {
+            var meta = MetaPathFor(profileId);
+            var mirror = MirrorRootFor(profileId);
+            if (File.Exists(meta)) File.Delete(meta);
+            if (Directory.Exists(mirror)) Directory.Delete(mirror, recursive: true);
+        }
+
+        /// <summary>Снести снапшоты ВСЕХ профилей (и хвосты старой схемы) — для полной очистки.</summary>
+        public static void ClearAll()
+        {
+            var snaps = Abs(SnapshotsDirRel);
+            var mirrors = Abs(MirrorsDirRel);
+            if (Directory.Exists(snaps)) Directory.Delete(snaps, recursive: true);
+            if (Directory.Exists(mirrors)) Directory.Delete(mirrors, recursive: true);
+
+            // Хвосты однопрофильной схемы — тоже подчистить.
+            var legacyMeta = Abs(LegacyMetaRel);
+            var legacyMirror = Abs(LegacyMirrorRel);
+            if (File.Exists(legacyMeta)) File.Delete(legacyMeta);
+            if (Directory.Exists(legacyMirror)) Directory.Delete(legacyMirror, recursive: true);
+        }
+
+        /// <summary>
+        /// Перевезти снапшот старой (однопрофильной) схемы на новый per-profile путь.
+        /// Зовётся один раз из миграции конфига; молча выходит, если возить нечего.
+        /// </summary>
+        public static void MigrateLegacy(string profileId)
+        {
+            try
+            {
+                var oldMeta = Abs(LegacyMetaRel);
+                var oldMirror = Abs(LegacyMirrorRel);
+                var newMeta = MetaPathFor(profileId);
+                var newMirror = MirrorRootFor(profileId);
+
+                if (File.Exists(oldMeta) && !File.Exists(newMeta))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(newMeta)!);
+                    File.Move(oldMeta, newMeta);
+                }
+                if (Directory.Exists(oldMirror) && !Directory.Exists(newMirror))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(newMirror)!);
+                    Directory.Move(oldMirror, newMirror);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[ApiCodegen] Миграция снапшота не удалась: {e.Message}");
+            }
+        }
+
+        /// <summary>Зафиксировать новый снимок профиля: записать спеку и скопировать вывод в зеркало.</summary>
+        public static CodegenSnapshot Commit(string profileId, string specText, string outputDirRel)
+        {
+            var snap = new CodegenSnapshot
+            {
+                TakenAtUtc = DateTime.UtcNow.ToString("o"),
+                SpecText = specText,
+                Exists = true,
+                ProfileId = profileId
+            };
+
+            var srcRoot = Abs(outputDirRel);
+            var mirrorRoot = MirrorRootFor(profileId);
+
+            // Чистим старое зеркало профиля и копируем актуальные .cs.
+            if (Directory.Exists(mirrorRoot)) Directory.Delete(mirrorRoot, recursive: true);
+            Directory.CreateDirectory(mirrorRoot);
+
+            if (Directory.Exists(srcRoot))
+            {
+                foreach (var file in Directory.GetFiles(srcRoot, "*.cs", SearchOption.AllDirectories))
+                {
+                    var rel = Path.GetRelativePath(srcRoot, file);
+                    snap.GeneratedFiles.Add(rel);
+                    var dst = Path.Combine(mirrorRoot, rel);
+                    Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                    File.Copy(file, dst, overwrite: true);
+                }
+            }
+
+            var metaPath = MetaPathFor(profileId);
+            Directory.CreateDirectory(Path.GetDirectoryName(metaPath)!);
+            File.WriteAllText(metaPath, JsonConvert.SerializeObject(snap, Formatting.Indented));
+            return snap;
+        }
+
+        /// <summary>Прочитать файл из зеркала (последняя генерация профиля). null — если нет.</summary>
+        public string ReadMirrored(string relPath)
+        {
+            var p = Path.Combine(MirrorRootFor(ProfileId), relPath);
+            return File.Exists(p) ? File.ReadAllText(p) : null;
+        }
+
+        public IEnumerable<string> MirroredFiles => GeneratedFiles;
+    }
+}

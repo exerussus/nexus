@@ -1,0 +1,209 @@
+using System;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.Logs
+{
+    /// <summary>
+    /// Уровень лога для бейджей, группировки, маски сбора и фильтра показа.
+    /// Числовые значения стабильны — они используются как позиции бит в масках
+    /// (EditorPrefs / SessionState), поэтому переставлять их нельзя.
+    /// </summary>
+    public enum LogGroup
+    {
+        Debug   = 0,
+        Info    = 1,
+        Warning = 2,
+        Error   = 3,
+    }
+
+    /// <summary>
+    /// Одна захваченная строка лога. Простые сериализуемые поля, чтобы весь буфер можно
+    /// было прогнать через SessionState (JsonUtility) при доменных перезагрузках.
+    /// </summary>
+    [Serializable]
+    public sealed class LogEntry
+    {
+        public long     ticks;        // DateTime.Ticks в момент захвата
+        public int      unityType;    // (int)UnityEngine.LogType — исходный тип движка
+        public int      group;        // (int)LogGroup — итоговый уровень (после тег-оверрайда)
+        public string   message;      // отображаемое сообщение: теги-токены вырезаны, пробелы схлопнуты
+        public string   raw;          // исходная, нетронутая строка condition
+        public string   stackTrace;   // сырой стек как его отдал Unity
+        public string[] tags;         // отображаемые теги: токены [...] МИНУС имена уровней, без дублей
+        public int      session;      // id прогона, проставленный LogCollector (для фильтра «эта сессия»)
+
+        public DateTime Time  => new DateTime(ticks);
+        public LogGroup Group => (LogGroup)group;
+    }
+
+    /// <summary>Одна строка стека; те, у кого HasFile, превращаются в кликабельные ссылки.</summary>
+    public struct StackFrameInfo
+    {
+        public string Display;     // полная подрезанная строка-исходник, показывается как есть
+        public string AssetPath;   // путь относительно проекта (Assets/... или Packages/...)
+        public int    Line;
+        public bool   HasFile;
+    }
+
+    /// <summary>
+    /// Чистый, потокобезопасный парсинг. Выполняется внутри (возможно, потокового)
+    /// колбэка лога — поэтому не трогает UnityEngine.Object / UI, только строки и regex.
+    /// </summary>
+    public static class LogParser
+    {
+        // [что-угодно-без-скобок]; многословные теги вроде [Player Manager] допустимы.
+        private static readonly Regex TagRx =
+            new(@"\[([^\[\]]+)\]", RegexOptions.Compiled);
+
+        private static readonly Regex WsRx =
+            new(@"\s+", RegexOptions.Compiled);
+
+        public static LogEntry Parse(string condition, string stackTrace, LogType type, DateTime now)
+        {
+            condition ??= string.Empty;
+
+            // ---- вытаскиваем теги: любой токен [...], без дублей (без учёта регистра)
+            var tags = new List<string>();
+            foreach (Match m in TagRx.Matches(condition))
+            {
+                var t = m.Groups[1].Value.Trim();
+                if (t.Length == 0) continue;
+                if (!tags.Exists(x => string.Equals(x, t, StringComparison.OrdinalIgnoreCase)))
+                    tags.Add(t);
+            }
+
+            // ---- отображаемое сообщение: убираем теги-токены, схлопываем пробелы
+            var stripped = WsRx.Replace(TagRx.Replace(condition, " "), " ").Trim();
+            if (stripped.Length == 0) stripped = condition.Trim(); // сообщение состояло только из тегов
+
+            var group = Resolve(type, tags);
+
+            // Теги-имена уровней ([Debug]/[Info]/[Warning]/[Error]) задают только уровень
+            // (через Resolve выше); как отображаемые/фильтрующие чипы они НЕ показываются,
+            // иначе это просто дублировало бы бейдж уровня.
+            List<string> display = null;
+            for (int i = 0; i < tags.Count; i++)
+            {
+                if (TryLevelTag(tags[i], out _)) continue;
+                (display ??= new List<string>()).Add(tags[i]);
+            }
+
+            return new LogEntry
+            {
+                ticks      = now.Ticks,
+                unityType  = (int)type,
+                group      = (int)group,
+                message    = stripped,
+                raw        = condition,
+                stackTrace = stackTrace ?? string.Empty,
+                tags       = display != null ? display.ToArray() : Array.Empty<string>(),
+            };
+        }
+
+        /// <summary>
+        /// Приоритет итогового уровня. Порядок задокументирован, чтобы его легко править:
+        ///   1. тег [Error]/[ERROR]            -> Error            (безусловно)
+        ///   2. реальный LogError/Exception/Assert -> Error        (настоящую ошибку не прячем)
+        ///   3. тег [Warning]/[Warn]           -> Warning
+        ///   4. реальный Warning               -> Warning
+        ///   5. тег [DEBUG]                    -> Debug
+        ///   6. тег [Info]                     -> Info
+        ///   7. иначе базовый тип (обычный Debug.Log -> Info)
+        /// </summary>
+        public static LogGroup Resolve(LogType type, List<string> tags)
+        {
+            bool hasError = false, hasWarn = false, hasDebug = false, hasInfo = false;
+            if (tags != null)
+            {
+                foreach (var t in tags)
+                {
+                    if (!TryLevelTag(t, out var g)) continue;
+                    switch (g)
+                    {
+                        case LogGroup.Error:   hasError = true; break;
+                        case LogGroup.Warning: hasWarn  = true; break;
+                        case LogGroup.Debug:   hasDebug = true; break;
+                        default:               hasInfo  = true; break;
+                    }
+                }
+            }
+
+            var baseGroup = BaseGroup(type);
+
+            if (hasError)                       return LogGroup.Error;
+            if (baseGroup == LogGroup.Error)    return LogGroup.Error;
+            if (hasWarn)                        return LogGroup.Warning;
+            if (baseGroup == LogGroup.Warning)  return LogGroup.Warning;
+            if (hasDebug)                       return LogGroup.Debug;
+            if (hasInfo)                        return LogGroup.Info;
+            return baseGroup;
+        }
+
+        public static LogGroup BaseGroup(LogType type) => type switch
+        {
+            LogType.Error or LogType.Exception or LogType.Assert => LogGroup.Error,
+            LogType.Warning                                      => LogGroup.Warning,
+            _                                                    => LogGroup.Info,
+        };
+
+        /// <summary>true, если текст тега называет уровень (без учёта регистра). Используется
+        /// и для разрешения уровня, и для подкраски чипов-тегов в строке.</summary>
+        public static bool TryLevelTag(string tag, out LogGroup group)
+        {
+            switch ((tag ?? string.Empty).Trim().ToLowerInvariant())
+            {
+                case "error": group = LogGroup.Error;   return true;
+                case "warning":
+                case "warn":  group = LogGroup.Warning; return true;
+                case "debug": group = LogGroup.Debug;   return true;
+                case "info":  group = LogGroup.Info;    return true;
+                default:      group = LogGroup.Info;     return false;
+            }
+        }
+    }
+
+    /// <summary>Разбирает стек Unity на строки-кадры, помечая те, что несут путь к исходнику
+    /// проекта + номер строки, чтобы страница могла сослаться на код.</summary>
+    public static class StackTraceUtil
+    {
+        // "... (at Assets/Scripts/Foo.cs:42)"
+        private static readonly Regex FrameRx =
+            new(@"\(at\s+(?<path>.+?):(?<line>\d+)\)", RegexOptions.Compiled);
+
+        private static readonly char[] LineSep = { '\n', '\r' };
+
+        public static List<StackFrameInfo> Parse(string stackTrace)
+        {
+            var frames = new List<StackFrameInfo>();
+            if (string.IsNullOrEmpty(stackTrace)) return frames;
+
+            foreach (var rawLine in stackTrace.Split(LineSep, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0) continue;
+
+                var info = new StackFrameInfo { Display = line, HasFile = false };
+
+                var m = FrameRx.Match(line);
+                if (m.Success && int.TryParse(m.Groups["line"].Value, out var ln))
+                {
+                    var path = m.Groups["path"].Value.Replace('\\', '/').Trim();
+                    bool inProject = path.StartsWith("Assets/", StringComparison.Ordinal)
+                                  || path.StartsWith("Packages/", StringComparison.Ordinal);
+                    if (ln > 0 && inProject)
+                    {
+                        info.AssetPath = path;
+                        info.Line      = ln;
+                        info.HasFile   = true;
+                    }
+                }
+
+                frames.Add(info);
+            }
+
+            return frames;
+        }
+    }
+}

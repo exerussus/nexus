@@ -1,0 +1,19 @@
+{
+    "name": "Exerussus.Nexus.Deployment",
+    "rootNamespace": "Exerussus.Nexus.Deployment",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "Exerussus.Nexus.Manifests"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

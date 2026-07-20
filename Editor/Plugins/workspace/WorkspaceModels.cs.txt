@@ -1,0 +1,83 @@
+using System;
+using System.Collections.Generic;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    /// <summary>Тип карточки в рабочей области.</summary>
+    internal enum WorkspaceEntryKind
+    {
+        Asset,        // обычный ассет проекта (включая префабы, сцены, сабассеты)
+        SceneObject,  // объект на сцене (хранится через GlobalObjectId)
+        ExternalFile, // файл вне проекта (только «показать в проводнике»)
+        Bundle        // набор: одна карточка, внутри — список записей (массив ассетов/объектов)
+    }
+
+    /// <summary>
+    /// Одна карточка. Для ассета храним guid+localId (переживает релоуд и переименование).
+    /// Для сценового объекта — строку GlobalObjectId (ассет не умеет ссылаться на сценовый объект,
+    /// и прямая ссылка не переживёт релоуд), плюс кэш для отрисовки, пока сцена не загружена.
+    /// </summary>
+    [Serializable]
+    internal sealed class WorkspaceEntry
+    {
+        public WorkspaceEntryKind kind;
+        public bool pinned;
+
+        // --- Asset ---
+        public string assetGuid = "";
+        public long assetLocalId;
+
+        // --- SceneObject ---
+        public string globalObjectId = "";
+        public string sceneGuid = "";
+
+        // --- ExternalFile ---
+        public string externalPath = "";
+
+        // --- Bundle (набор) ---
+        public string id = "";          // уникальный id набора (StableKey)
+        public string bundleName = "";  // отображаемое имя; пусто → "Набор (N)"
+
+        // Newtonsoft сериализует самоссылающийся тип по значению без лимита глубины 10,
+        // поэтому [SerializeReference] (нужный Unity-сериализатору) здесь больше не требуется.
+        public List<WorkspaceEntry> items = new(); // члены набора (всегда не-Bundle)
+
+        // --- Кэш для отображения, когда живой объект недоступен ---
+        public string cachedName = "";
+        public string cachedScenePath = "";
+        public string cachedHierarchyPath = "";
+        public string cachedTypeName = ""; // AssemblyQualifiedName — для иконки типа
+
+        /// <summary>Ключ дедупликации/идентификации между релоудами.</summary>
+        public string StableKey => kind switch
+        {
+            WorkspaceEntryKind.Asset => $"a:{assetGuid}:{assetLocalId}",
+            WorkspaceEntryKind.SceneObject => $"s:{globalObjectId}",
+            WorkspaceEntryKind.ExternalFile => $"e:{externalPath}",
+            WorkspaceEntryKind.Bundle => $"b:{id}",
+            _ => $"x:{cachedName}"
+        };
+    }
+
+    /// <summary>Именованная сворачиваемая полка с карточками.</summary>
+    [Serializable]
+    internal sealed class WorkspaceGroup
+    {
+        public string name = "Полка";
+        public bool collapsed;
+        public List<WorkspaceEntry> entries = new();
+    }
+
+    /// <summary>
+    /// Корень личного состояния страницы. Лежит в JSON по пути
+    /// <c>Context.GetUserConfigPath("workspace.json")</c> — переживает Restore/Disable,
+    /// стирается только командой «Clear settings» хаба.
+    /// </summary>
+    [Serializable]
+    internal sealed class WorkspaceData
+    {
+        public int schemaVersion = 1; // для собственных миграций формата файла
+        public float cardScale = 96f;
+        public List<WorkspaceGroup> groups = new();
+    }
+}

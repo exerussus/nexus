@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    public enum SalTokenKind : byte
+    {
+        Text = 0,   // дефолтный цвет — токены этого вида не эмитятся
+        Comment,
+        String,
+        Number,
+        Keyword,
+        Type,       // встроенные типы + host-классы
+        Api,        // Engine + host-API
+        Enum,       // host-энумы
+        Member,     // идентификатор сразу после точки (свойство)
+        Func,       // вызов/объявление функции: за идентификатором стоит '('
+        Count,
+    }
+
+    public readonly struct SalToken
+    {
+        public readonly int Start;
+        public readonly int Length;
+        public readonly SalTokenKind Kind;
+
+        public SalToken(int start, int length, SalTokenKind kind)
+        {
+            Start = start;
+            Length = length;
+            Kind = kind;
+        }
+    }
+
+    // Лёгкий лексер для подсветки: сканирует буфер за один проход, кладёт в переиспользуемый
+    // список только окрашиваемые спаны. Stateless. Аллокация substring на идентификатор —
+    // сознательная плата за HashSet-лукапы; это редакторный путь по нажатию клавиши.
+    public static class SalTokenizer
+    {
+        private static readonly HashSet<string> Keywords = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "trigger", "class", "enum", "func", "action", "event", "if", "else", "while",
+            "for", "in", "break", "continue", "return", "wait", "until", "spawn", "new",
+            "const", "var", "disabled", "true", "false", "null", "listener", "pass", "self",
+        };
+
+        private static readonly HashSet<string> BuiltinTypes = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "int", "float", "bool", "string", "void", "Fiber", "List", "Map", "Subscription",
+        };
+
+        public static void Tokenize(string text, SalApiModel model, List<SalToken> result)
+        {
+            result.Clear();
+            if (string.IsNullOrEmpty(text)) return;
+
+            int i = 0, n = text.Length;
+            char prevSignificant = '\0'; // последний значимый символ — детектор «после точки»
+
+            while (i < n)
+            {
+                char c = text[i];
+
+                // // строчный комментарий
+                if (c == '/' && i + 1 < n && text[i + 1] == '/')
+                {
+                    int s = i;
+                    while (i < n && text[i] != '\n') i++;
+                    result.Add(new SalToken(s, i - s, SalTokenKind.Comment));
+                    continue; // prevSignificant не трогаем: Engine./*x*/Log остаётся членом
+                }
+
+                // /* блочный комментарий */
+                if (c == '/' && i + 1 < n && text[i + 1] == '*')
+                {
+                    int s = i;
+                    i += 2;
+                    while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) i++;
+                    i = Math.Min(n, i + 2);
+                    result.Add(new SalToken(s, i - s, SalTokenKind.Comment));
+                    continue;
+                }
+
+                // "строка" и $"интерполяция" (до кавычки или конца строки; \ экранирует)
+                if (c == '"' || (c == '$' && i + 1 < n && text[i + 1] == '"'))
+                {
+                    int s = i;
+                    if (c == '$') i++;
+                    i++;
+                    while (i < n && text[i] != '"' && text[i] != '\n')
+                    {
+                        if (text[i] == '\\' && i + 1 < n) i++;
+                        i++;
+                    }
+                    if (i < n && text[i] == '"') i++;
+                    result.Add(new SalToken(s, i - s, SalTokenKind.String));
+                    prevSignificant = '"';
+                    continue;
+                }
+
+                // число: одна точка допустима и только перед цифрой — «1..5» остаётся двумя числами
+                if (char.IsDigit(c))
+                {
+                    int s = i;
+                    bool dot = false;
+                    while (i < n)
+                    {
+                        char d = text[i];
+                        if (char.IsDigit(d)) { i++; continue; }
+                        if (d == '.' && !dot && i + 1 < n && char.IsDigit(text[i + 1])) { dot = true; i++; continue; }
+                        break;
+                    }
+                    result.Add(new SalToken(s, i - s, SalTokenKind.Number));
+                    prevSignificant = '0';
+                    continue;
+                }
+
+                // идентификатор
+                if (c == '_' || char.IsLetter(c))
+                {
+                    int s = i;
+                    while (i < n && (text[i] == '_' || char.IsLetterOrDigit(text[i]))) i++;
+                    // lookahead: если за идентификатором (через пробелы) стоит '(' — это функция
+                    int j = i;
+                    while (j < n && (text[j] == ' ' || text[j] == '\t')) j++;
+                    bool nextIsParen = j < n && text[j] == '(';
+                    var kind = Classify(text.Substring(s, i - s), prevSignificant == '.', nextIsParen, model);
+                    if (kind != SalTokenKind.Text)
+                        result.Add(new SalToken(s, i - s, kind));
+                    prevSignificant = 'a';
+                    continue;
+                }
+
+                if (!char.IsWhiteSpace(c)) prevSignificant = c;
+                i++;
+            }
+        }
+
+        private static SalTokenKind Classify(string word, bool afterDot, bool nextIsParen, SalApiModel model)
+        {
+            if (afterDot) return nextIsParen ? SalTokenKind.Func : SalTokenKind.Member;
+            if (BuiltinTypes.Contains(word)) return SalTokenKind.Type;
+            if (Keywords.Contains(word)) return SalTokenKind.Keyword;   // 'if (' остаётся ключевым словом
+            if (word == "Engine" || (model != null && model.IsApi(word))) return SalTokenKind.Api;
+            if (model != null && model.IsEnum(word)) return SalTokenKind.Enum;
+            if (model != null && model.IsClass(word)) return SalTokenKind.Type;
+            if (nextIsParen) return SalTokenKind.Func;                  // свои func: RegenLoop(...)
+            return SalTokenKind.Text;
+        }
+
+        // Грубая строчная эвристика: внутри "строки" (нечётное число неэкранированных кавычек
+        // до каретки) или после // в текущей строке. Многострочные /* */ не ловит (v1).
+        // Живёт здесь, потому что это лексический вопрос; используют автокомплит и авто-парность.
+        public static bool IsInCommentOrString(string text, int caret)
+        {
+            int ls = caret;
+            while (ls > 0 && text[ls - 1] != '\n') ls--;
+            bool inString = false;
+            for (int i = ls; i < caret; i++)
+            {
+                char c = text[i];
+                if (inString)
+                {
+                    if (c == '\\') i++;
+                    else if (c == '"') inString = false;
+                }
+                else if (c == '"') inString = true;
+                else if (c == '/' && i + 1 < caret && text[i + 1] == '/') return true;
+            }
+            return inString;
+        }
+    }
+}

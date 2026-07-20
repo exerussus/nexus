@@ -1,0 +1,275 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    public enum SalCompletionKind : byte { Keyword, Type, Api, Enum, Class, Method, Member, Event, Symbol }
+
+    public readonly struct SalCompletion
+    {
+        public readonly string Label;   // что показать в списке
+        public readonly string Insert;  // что вставить в буфер
+        public readonly int CaretBack;  // на сколько символов вернуть каретку (внутрь скобок)
+        public readonly string Detail;  // сигнатура/док справа
+        public readonly SalCompletionKind Kind;
+
+        public SalCompletion(string label, string insert, int caretBack, string detail, SalCompletionKind kind)
+        {
+            Label = label;
+            Insert = insert;
+            CaretBack = caretBack;
+            Detail = detail;
+            Kind = kind;
+        }
+    }
+
+    // Чистая логика подсказок: (текст, каретка, модель API) → список + начало replace-диапазона.
+    // Stateless; статики — только неизменяемые таблицы. Символы своего буфера
+    // (trigger/class/listener/enum и их члены) даёт BufferSymbolScanner.
+    public static class AutocompleteEngine
+    {
+        private static readonly string[] Keywords =
+        {
+            "trigger", "class", "enum", "func", "action", "event", "if", "else", "while",
+            "for", "in", "break", "continue", "return", "wait", "until", "spawn", "new",
+            "const", "var", "disabled", "true", "false", "null", "listener", "pass", "self",
+        };
+
+        private static readonly string[] BuiltinTypes =
+        {
+            "int", "float", "bool", "string", "void", "Fiber", "List", "Map", "Subscription",
+        };
+
+        // Полная таблица встроенного Engine (§10 справочника языка).
+        private static readonly SalCompletion[] EngineBuiltins =
+        {
+            Fn("EnableTrigger",    "T",         "включить триггер"),
+            Fn("DisableTrigger",   "T",         "выключить триггер"),
+            Fn("IsTriggerEnabled", "T",         "включён ли триггер → bool"),
+            Fn("ActivateTrigger",  "T",         "запустить action Do() → Fiber"),
+            Fn("KillAll",          "T",         "убить все файберы триггера"),
+            Fn("Kill",             "fiber",     "убить файбер (или себя)"),
+            Fn("IsAlive",          "fiber",     "жив ли файбер → bool"),
+            Fn("EnableModule",     "name",      "включить модуль по имени"),
+            Fn("DisableModule",    "name",      "выключить модуль"),
+            Fn("IsModuleEnabled",  "name",      "включён ли модуль → bool"),
+            Fn("IsModuleLoaded",   "name",      "загружен ли модуль → bool"),
+            Fn("Time",             null,        "секунды с загрузки → float"),
+            Fn("DeltaTime",        null,        "длительность последнего тика → float"),
+            Fn("Log",              "msg",       "сообщение в лог хоста"),
+            Fn("Warn",             "msg",       "предупреждение в лог"),
+            Fn("Error",            "msg",       "ошибка в лог"),
+            Fn("IsValid",          "entity",    "жив ли хендл сущности → bool"),
+            Fn("Attach",           "L, entity", "подписать listener на сущность → Subscription"),
+            Fn("Detach",           "sub",       "снять подписку (убивает её файберы)"),
+            Fn("DetachAll",        "L, entity", "снять все подписки пары"),
+            Fn("IsSubscribed",     "sub",       "жива ли подписка → bool"),
+            Fn("TriggerExists",    "name",      "есть ли триггер с именем → bool"),
+            Fn("ClassExists",      "name",      "есть ли класс с именем → bool"),
+        };
+
+        private static SalCompletion Fn(string name, string args, string doc) =>
+            new SalCompletion($"{name}({args ?? ""})", $"{name}()",
+                args == null ? 0 : 1, doc, SalCompletionKind.Method);
+
+        // Возвращает начало replace-диапазона (замещается [start..caret]).
+        public static int Collect(string text, int caret, SalApiModel model, List<SalCompletion> result)
+        {
+            text ??= "";
+            caret = Math.Clamp(caret, 0, text.Length);
+
+            // символы текущего буфера — свои блоки и их члены
+            var blocks = new List<BufferBlock>(8);
+            BufferSymbolScanner.Scan(text, blocks);
+
+            int wordStart = caret;
+            while (wordStart > 0 && IsIdent(text[wordStart - 1])) wordStart--;
+            string prefix = text.Substring(wordStart, caret - wordStart);
+
+            // контекст «Qualifier.<prefix>»
+            if (wordStart > 0 && text[wordStart - 1] == '.')
+            {
+                int qEnd = wordStart - 1, qStart = qEnd;
+                while (qStart > 0 && IsIdent(text[qStart - 1])) qStart--;
+                CollectMembers(text.Substring(qStart, qEnd - qStart), prefix, model, blocks, result);
+            }
+            // контекст «event <prefix>» — сигнатуры host-событий целиком
+            else if (IsAfterEventKeyword(text, wordStart))
+            {
+                CollectEvents(prefix, model, result);
+            }
+            else
+            {
+                CollectGlobals(prefix, model, blocks, result);
+            }
+
+            result.Sort(static (a, b) => string.CompareOrdinal(a.Label, b.Label));
+            return wordStart;
+        }
+
+        // ── контексты ───────────────────────────────────────────────────────────
+
+        private static void CollectMembers(string qual, string prefix, SalApiModel model,
+            List<BufferBlock> blocks, List<SalCompletion> result)
+        {
+            if (qual == "Engine")
+            {
+                foreach (var c in EngineBuiltins)
+                    if (Pass(c.Insert, prefix)) result.Add(c);
+                return;
+            }
+
+            if (model != null && model.TryGetApi(qual, out var api))
+            {
+                foreach (var m in api.Methods)
+                    if (Pass(m.Name, prefix)) result.Add(Method(m));
+                return;
+            }
+
+            if (model != null && model.TryGetEnum(qual, out var en))
+            {
+                foreach (var member in en.Members)
+                    if (Pass(member, prefix))
+                        result.Add(new SalCompletion(member, member, 0, $"{en.Name}.{member}",
+                            SalCompletionKind.Member));
+                return;
+            }
+
+            // свой блок буфера (trigger/class/listener/enum): его func-и, поля и члены —
+            // раньше этот случай проваливался в эвристику host-свойств, и своих методов
+            // в подсказках не было
+            foreach (var b in blocks)
+            {
+                if (!string.Equals(b.Name, qual, StringComparison.Ordinal)) continue;
+                foreach (var m in b.Members)
+                {
+                    if (!Pass(m.Name, prefix)) continue;
+                    result.Add(m.IsFunc
+                        ? new SalCompletion(m.Detail, m.Name + "()", m.HasArgs ? 1 : 0,
+                            $"{b.Kind} {b.Name} (в файле)", SalCompletionKind.Method)
+                        : new SalCompletion(m.Name, m.Name, 0,
+                            $"{m.Detail} — {b.Kind} {b.Name} (в файле)", SalCompletionKind.Member));
+                }
+                return;
+            }
+
+            if (model == null) return;
+
+            // Квалификатор — переменная: вывода типов нет, поэтому эвристика —
+            // свойства ВСЕХ host-классов с пометкой владельца.
+            foreach (var cls in model.Classes)
+                foreach (var p in cls.Props)
+                    if (Pass(p.Name, prefix))
+                        result.Add(new SalCompletion(p.Name, p.Name, 0,
+                            $"{cls.Name}.{p.Name}: {p.Type}{(p.ReadOnly ? " (ro)" : "")}" + Doc(p.Doc),
+                            SalCompletionKind.Member));
+        }
+
+        private static void CollectEvents(string prefix, SalApiModel model, List<SalCompletion> result)
+        {
+            if (model == null) return;
+            var sb = new StringBuilder(64);
+            foreach (var ev in model.Events)
+            {
+                if (!Pass(ev.Name, prefix)) continue;
+                sb.Clear();
+                JoinParams(sb, ev.Params);
+                string sig = $"{ev.Name}({sb})";
+                // вставляем сигнатуру целиком + пустое тело, каретка внутрь скобок тела
+                result.Add(new SalCompletion(sig, sig + " { }", 2, Doc(ev.Summary, trimDash: true),
+                    SalCompletionKind.Event));
+            }
+        }
+
+        private static void CollectGlobals(string prefix, SalApiModel model,
+            List<BufferBlock> blocks, List<SalCompletion> result)
+        {
+            foreach (var k in Keywords)
+                if (Pass(k, prefix))
+                    result.Add(new SalCompletion(k, k, 0, "ключевое слово", SalCompletionKind.Keyword));
+            foreach (var t in BuiltinTypes)
+                if (Pass(t, prefix))
+                    result.Add(new SalCompletion(t, t, 0, "встроенный тип", SalCompletionKind.Type));
+            if (Pass("Engine", prefix))
+                result.Add(new SalCompletion("Engine", "Engine", 0, "встроенный API движка",
+                    SalCompletionKind.Api));
+
+            if (model != null)
+            {
+                foreach (var a in model.Apis)
+                    if (Pass(a.Name, prefix))
+                        result.Add(new SalCompletion(a.Name, a.Name, 0,
+                            "host-API" + Doc(a.Summary), SalCompletionKind.Api));
+                foreach (var e in model.Enums)
+                    if (Pass(e.Name, prefix))
+                        result.Add(new SalCompletion(e.Name, e.Name, 0,
+                            "host-enum" + Doc(e.Summary), SalCompletionKind.Enum));
+                foreach (var c in model.Classes)
+                    if (Pass(c.Name, prefix))
+                        result.Add(new SalCompletion(c.Name, c.Name, 0,
+                            "host-класс" + Doc(c.Summary), SalCompletionKind.Class));
+            }
+
+            // символы буфера: имена блоков + ВСЕ func-и (без квалификатора тоже нужны:
+            // внутри своего блока их зовут напрямую)
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var b in blocks)
+            {
+                if (Pass(b.Name, prefix) && seen.Add(b.Name))
+                    result.Add(new SalCompletion(b.Name, b.Name, 0, $"{b.Kind} (в файле)",
+                        b.Kind == "enum" ? SalCompletionKind.Enum : SalCompletionKind.Symbol));
+                foreach (var m in b.Members)
+                {
+                    if (!m.IsFunc || !Pass(m.Name, prefix) || !seen.Add(m.Name)) continue;
+                    result.Add(new SalCompletion(m.Detail, m.Name + "()", m.HasArgs ? 1 : 0,
+                        $"func — {b.Kind} {b.Name} (в файле)", SalCompletionKind.Method));
+                }
+            }
+        }
+
+        // ── утилиты ─────────────────────────────────────────────────────────────
+
+        private static SalCompletion Method(SalApiMethod m)
+        {
+            var sb = new StringBuilder(64);
+            JoinParams(sb, m.Params);
+            bool hasArgs = m.Params != null && m.Params.Count > 0;
+            string ret = string.IsNullOrEmpty(m.Returns) || m.Returns == "void" ? "" : $" -> {m.Returns}";
+            return new SalCompletion($"{m.Name}({sb})", $"{m.Name}()", hasArgs ? 1 : 0,
+                $"{m.Name}({sb}){ret}" + Doc(m.Summary), SalCompletionKind.Method);
+        }
+
+        private static void JoinParams(StringBuilder sb, List<SalApiParam> ps)
+        {
+            if (ps == null) return;
+            for (int i = 0; i < ps.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(ps[i].Type).Append(' ').Append(ps[i].Name);
+            }
+        }
+
+        private static string Doc(string summary, bool trimDash = false)
+        {
+            if (string.IsNullOrEmpty(summary)) return "";
+            return trimDash ? summary : " — " + summary;
+        }
+
+        private static bool Pass(string name, string prefix) =>
+            string.IsNullOrEmpty(prefix) ||
+            name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsIdent(char c) => c == '_' || char.IsLetterOrDigit(c);
+
+        // Слово перед wordStart (через пробелы/табы) == "event"?
+        private static bool IsAfterEventKeyword(string text, int wordStart)
+        {
+            int i = wordStart;
+            while (i > 0 && (text[i - 1] == ' ' || text[i - 1] == '\t')) i--;
+            int e = i;
+            while (i > 0 && IsIdent(text[i - 1])) i--;
+            return e - i == 5 && string.CompareOrdinal(text, i, "event", 0, 5) == 0;
+        }
+    }
+}

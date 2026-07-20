@@ -1,0 +1,343 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Профиль кодогена = одна версия API, ПОЛНОСТЬЮ самодостаточная: своя спека,
+    /// свой генератор (команда/аргументы/шаблон), свой packageName (= своя asmdef),
+    /// свой link.xml и свой снапшот. Пути НЕ редактируются — они выводятся из
+    /// класса-обёртки: Assets/Api/&lt;Wrapper&gt;/{Generated, link.xml, asmdef}.
+    /// Это делает папку версии самодостаточной: снёс её — снёс версию.
+    /// </summary>
+    [Serializable]
+    public sealed class ApiCodegenProfile
+    {
+        // Стабильный ключ профиля: на нём висят снапшоты, staging и session-стейт.
+        // Переименование профиля его не меняет.
+        public string Id = Guid.NewGuid().ToString("N");
+
+        public string Name = "default";
+
+        // --- Спека ---
+        public ApiCodegenConfig.SpecSourceKind SpecSource = ApiCodegenConfig.SpecSourceKind.Url;
+        public string SpecUrl = "https://your-backend/swagger/v1/swagger.json";
+        public string SpecFilePath = ""; // от корня проекта, если SpecSource == File
+
+        // Класс-обёртка версии — ОБЯЗАТЕЛЬНА (пусто → "Api"). Из неё выводятся все
+        // пути версии и дефолтный packageName. «Определить обёртку из спеки» на
+        // вкладке Profiles вытаскивает версию из путей (api/v1.0 → ApiV10).
+        public string WrapperClass = "";
+
+        // --- Генератор (свой у каждой версии: старые сервисы могут сидеть на
+        // старой версии CLI/шаблона, новые — на новой) ---
+        public string GeneratorCommand = "openapi-generator-cli";
+
+        // packageName версии = namespace сгенеренного кода = имя её asmdef =
+        // сборка в её link.xml. Пусто → выводится из обёртки ЦЕЛИКОМ:
+        // ApiV10 → ProjectApi.Generated.ApiV10, TelegramApi → ProjectApi.Generated.TelegramApi.
+        // Обёртки уникальны (валидатор следит) → уникальны и имена сборок.
+        public string PackageName = "";
+
+        // Доп.аргументы БЕЗ packageName — его движок подставляет сам.
+        // ВНИМАНИЕ: csharp-генератор экспериментальный, флаги меняются между
+        // версиями — при апдейте CLI сверь с `openapi-generator-cli config-help -g csharp`.
+        public string GeneratorExtraArgs =
+            "--global-property models,apis,modelDocs=false,apiDocs=false,modelTests=false,apiTests=false," +
+            "supportingFiles=OpenAPIDateConverter.cs:FileParameter.cs " +
+            "--additional-properties=library=httpclient,targetFramework=netstandard2.1,validatable=false";
+
+        // Путь к кастомному api.mustache (от корня проекта). Свой на профиль:
+        // дефолт — общий Tools/openapi-templates/csharp, но версия может сидеть
+        // на своём слепке шаблона.
+        public string TemplateDir = ProjectScaffolder.TemplateDirRel;
+
+        public int HttpTimeoutSeconds = 30;
+
+        // Срезать версионный префикс из имён методов (ApiV10FooGetAsync → FooGetAsync).
+        // Префикс лепит генератор из пути /api/v1.0/…, когда в спеке нет operationId.
+        public bool StripVersionPrefixInMethods = true;
+
+        private static readonly Regex ValidIdentifier = new(@"^[A-Za-z_][A-Za-z0-9_]*$");
+
+        /// <summary>Имя обёртки с фолбэком и защитой от невалидного идентификатора.</summary>
+        public string ResolveWrapperClass()
+        {
+            var name = (WrapperClass ?? "").Trim();
+            return ValidIdentifier.IsMatch(name) ? name : "Api";
+        }
+
+        /// <summary>
+        /// packageName с фолбэком из обёртки ЦЕЛИКОМ: ProjectApi.Generated.&lt;Wrapper&gt;.
+        /// Раньше брался только суффикс V\d+ — обёртки без версии на конце
+        /// (Api, TelegramApi…) схлопывались в одно имя сборки.
+        /// </summary>
+        public string ResolvePackageName()
+        {
+            var explicitName = (PackageName ?? "").Trim();
+            if (explicitName.Length > 0) return explicitName;
+
+            return $"ProjectApi.Generated.{ResolveWrapperClass()}";
+        }
+
+        // --- Выведенные пути версии (не редактируются) ---
+
+        /// <summary>Корень версии: Assets/Api/&lt;Wrapper&gt; — самодостаточная папка.</summary>
+        public string VersionRootDir => $"{ApiCodegenConfig.ApiRootRel}/{ResolveWrapperClass()}";
+
+        /// <summary>Куда деплоятся .cs после генерации (плоско: Api|Client|Model).</summary>
+        public string OutputDir => $"{VersionRootDir}/Generated";
+
+        /// <summary>link.xml версии — сохраняет её сборку от IL2CPP-стриппинга.</summary>
+        public string LinkXmlPath => $"{VersionRootDir}/link.xml";
+
+        /// <summary>
+        /// asmdef версии; имя файла = имя сборки = packageName. Лежит в КОРНЕ версии
+        /// (не в Generated): деплой заменяет Generated целиком, а asmdef должен
+        /// переживать регенерацию — твои правки ссылок в нём не теряются.
+        /// </summary>
+        public string AsmdefPath => $"{VersionRootDir}/{ResolvePackageName()}.asmdef";
+
+        /// <summary>Staging для CLI — вне Assets, чтобы мусор генератора не импортился.</summary>
+        public string StagingDir => $"Temp/ApiCodegenStaging/{Id}";
+
+        /// <summary>Вход для генератора: URL или абсолютный путь к файлу спеки.</summary>
+        public string ResolveSpecInput() =>
+            SpecSource == ApiCodegenConfig.SpecSourceKind.Url
+                ? SpecUrl
+                : Path.Combine(ApiCodegenConfig.ProjectRoot, SpecFilePath);
+
+        /// <summary>
+        /// Полная командная строка генерации версии. -o указывает на staging: в Assets
+        /// попадает не сырой вывод CLI, а только .cs, разложенные движком (деплой —
+        /// шаг движка после CLI, в CI работает так же через ApiCodegenBatch).
+        /// </summary>
+        public string BuildCommandLinePreview()
+        {
+            var template = string.IsNullOrWhiteSpace(TemplateDir) ? "" : $" -t \"{TemplateDir.Trim()}\"";
+            return $"{GeneratorCommand} generate -i \"{ResolveSpecInput()}\" -g csharp " +
+                   $"{GeneratorExtraArgs} --additional-properties=packageName={ResolvePackageName()}" +
+                   $"{template} -o \"{StagingDir}\"";
+        }
+    }
+
+    /// <summary>
+    /// Конфиг пайплайна кодогена. Лежит коммитимым JSON в ProjectSettings/,
+    /// а не в EditorPrefs — чтобы и страница хаба, и CI читали один и тот же файл.
+    /// Схема 3: конфиг = только список профилей; ВСЕ параметры привязаны к профилю.
+    /// Схемы 1 (однопрофильная) и 2 (профили + общие поля) мигрируют при Load().
+    /// </summary>
+    [Serializable]
+    public sealed class ApiCodegenConfig
+    {
+        public enum SpecSourceKind { Url, File }
+
+        // Корень всех версий API в Assets. Версия живёт в Assets/Api/<Wrapper>/.
+        public const string ApiRootRel = "Assets/Api";
+
+        public int SchemaVersion = 3;
+
+        // После Load() тут всегда >= 1 элемента.
+        public List<ApiCodegenProfile> Profiles = new();
+
+        // --- Деривация имени обёртки из спеки ---
+
+        // Сегмент версии в пути/URL: v1, v1.0, v2.1 …
+        private static readonly Regex VersionSegment =
+            new(@"^v(\d+(?:\.\d+)*)$", RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// Имя обёртки из спеки: ищет сегмент версии (v1, v1.0, v2.1…) в путях,
+        /// затем в servers[].url. Класс всегда "Api"; версия — суффиксом "V"+цифры
+        /// без точек (v1.0 → ApiV10). Версии нет → "Api".
+        /// </summary>
+        public static string DeriveVersionClass(string specJson)
+        {
+            try
+            {
+                var root = JObject.Parse(specJson);
+                var token = FindVersionToken(root);
+                return token == null ? "Api" : "Api" + token;
+            }
+            catch
+            {
+                return "Api";
+            }
+        }
+
+        private static string FindVersionToken(JObject root)
+        {
+            if (root["paths"] is JObject paths)
+                foreach (var p in paths.Properties())
+                    if (MatchVersion(p.Name) is { } v)
+                        return v;
+
+            if (root["servers"] is JArray servers)
+                foreach (var s in servers)
+                    if ((string)s?["url"] is { } url && MatchVersion(url) is { } v)
+                        return v;
+
+            return null;
+        }
+
+        private static string MatchVersion(string pathOrUrl)
+        {
+            foreach (var seg in pathOrUrl.Split('/'))
+            {
+                var m = VersionSegment.Match(seg);
+                if (m.Success) return "V" + m.Groups[1].Value.Replace(".", "");
+            }
+            return null;
+        }
+
+        // --- Persist + миграция ---
+
+        private const string ConfigRelPath = "ProjectSettings/ApiCodegen.json";
+
+        public static string ProjectRoot =>
+            Directory.GetParent(Application.dataPath)!.FullName;
+
+        public static string ConfigAbsPath =>
+            Path.Combine(ProjectRoot, ConfigRelPath);
+
+        public static ApiCodegenConfig Load()
+        {
+            ApiCodegenConfig cfg = null;
+            try
+            {
+                if (File.Exists(ConfigAbsPath))
+                {
+                    var json = File.ReadAllText(ConfigAbsPath);
+                    cfg = JsonConvert.DeserializeObject<ApiCodegenConfig>(json) ?? new ApiCodegenConfig();
+                    cfg.Profiles ??= new List<ApiCodegenProfile>();
+
+                    var root = JObject.Parse(json);
+                    var schema = (int?)root["SchemaVersion"] ?? 1;
+                    if (schema < 3)
+                        Migrate(cfg, root, schema);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[ApiCodegen] Не удалось прочитать конфиг, беру дефолт: {e.Message}");
+                cfg = null;
+            }
+
+            cfg ??= new ApiCodegenConfig();
+            if (cfg.Profiles.Count == 0)
+                cfg.Profiles.Add(new ApiCodegenProfile()); // инвариант: всегда есть хотя бы один
+            cfg.SchemaVersion = 3;
+            return cfg;
+        }
+
+        /// <summary>
+        /// Миграция схем 1 и 2 на 3.
+        /// Схема 1: спека/обёртка лежали в корне JSON — собираем из них один профиль.
+        /// Схема 2: профили есть, но команда CLI/аргументы/шаблон/packageName были
+        /// общими — разливаем их по каждому профилю.
+        /// ВАЖНО: пути в схеме 3 выводятся из обёртки, поэтому старый OutputDir
+        /// намеренно игнорируется — вывод переезжает в Assets/Api/&lt;Wrapper&gt;/Generated,
+        /// а старую папку вывода надо снести руками после первой регенерации.
+        /// </summary>
+        private static void Migrate(ApiCodegenConfig cfg, JObject root, int schema)
+        {
+            try
+            {
+                if (schema <= 1 && cfg.Profiles.Count == 0)
+                {
+                    // Однопрофильная схема → один профиль из корневых полей.
+                    if (root["SpecUrl"] == null && root["SpecSource"] == null) return;
+
+                    var p = new ApiCodegenProfile();
+                    try { p.SpecSource = root["SpecSource"]?.ToObject<SpecSourceKind>() ?? p.SpecSource; }
+                    catch { /* мусор в поле — дефолт */ }
+                    p.SpecUrl = (string)root["SpecUrl"] ?? p.SpecUrl;
+                    p.SpecFilePath = (string)root["SpecFilePath"] ?? p.SpecFilePath;
+                    p.WrapperClass = (string)root["ApiVersionClassName"] ?? "";
+                    p.Name = string.IsNullOrWhiteSpace(p.WrapperClass) ? "default" : p.WrapperClass;
+                    cfg.Profiles.Add(p);
+                    CodegenSnapshot.MigrateLegacy(p.Id);
+                }
+
+                // Общие поля схем 1–2 разливаем по всем профилям (не перезатирая то,
+                // что профиль схемы 2 не имел и получил бы дефолтом всё равно).
+                var sharedCmd = (string)root["GeneratorCommand"];
+                var sharedArgs = (string)root["GeneratorExtraArgs"];
+                var sharedTemplate = (string)root["TemplateDir"];
+                var sharedPkg = (string)root["GeneratedPackageName"];
+                var sharedTimeout = (int?)root["HttpTimeoutSeconds"];
+                var sharedStrip = (bool?)root["StripVersionPrefixInMethods"];
+
+                foreach (var p in cfg.Profiles)
+                {
+                    if (!string.IsNullOrWhiteSpace(sharedCmd)) p.GeneratorCommand = sharedCmd;
+                    if (!string.IsNullOrWhiteSpace(sharedArgs)) p.GeneratorExtraArgs = sharedArgs;
+                    if (!string.IsNullOrWhiteSpace(sharedTemplate)) p.TemplateDir = sharedTemplate;
+                    if (sharedTimeout is { } t) p.HttpTimeoutSeconds = t;
+                    if (sharedStrip is { } s) p.StripVersionPrefixInMethods = s;
+                    // Старый общий packageName переносим как явный ТОЛЬКО одному
+                    // профилю: имена сборок должны быть уникальны, остальные версии
+                    // получат выведенный из обёртки (ProjectApi.Generated.VNN).
+                    if (!string.IsNullOrWhiteSpace(sharedPkg) && p == cfg.Profiles[0])
+                        p.PackageName = sharedPkg;
+                }
+
+                cfg.Save(); // зафиксировать новую схему сразу
+                Debug.Log($"[ApiCodegen] Конфиг мигрирован на схему 3 (полное разделение на профили). " +
+                          $"Вывод версий теперь в {ApiRootRel}/<обёртка>/Generated — старую папку вывода " +
+                          "снеси руками после первой регенерации.");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[ApiCodegen] Миграция конфига не удалась: {e.Message}");
+            }
+        }
+
+        public void Save()
+        {
+            var dir = Path.GetDirectoryName(ConfigAbsPath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(ConfigAbsPath, JsonConvert.SerializeObject(this, Formatting.Indented));
+        }
+
+        /// <summary>Профиль по Id с фолбэком на первый; null только при пустом списке.</summary>
+        public ApiCodegenProfile GetProfile(string id)
+        {
+            var p = Profiles.Find(x => x.Id == id);
+            return p ?? (Profiles.Count > 0 ? Profiles[0] : null);
+        }
+
+        /// <summary>Проверки согласованности профилей — красные варнинги для UI и CI-лога.</summary>
+        public List<string> ValidateProfiles()
+        {
+            var warnings = new List<string>();
+
+            for (var i = 0; i < Profiles.Count; i++)
+            for (var j = i + 1; j < Profiles.Count; j++)
+            {
+                var a = Profiles[i];
+                var b = Profiles[j];
+
+                if (string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase))
+                    warnings.Add($"Профили #{i + 1} и #{j + 1} называются одинаково («{a.Name}») — " +
+                                 "селекторы будут путаться.");
+
+                // Обёртка = папка версии и её типы; дубль = одна папка на двоих.
+                if (string.Equals(a.ResolveWrapperClass(), b.ResolveWrapperClass(), StringComparison.Ordinal))
+                    warnings.Add($"У «{a.Name}» и «{b.Name}» одна обёртка {a.ResolveWrapperClass()} — " +
+                                 "они будут писать в одну папку версии и конфликтовать типами.");
+
+                // packageName = имя сборки; дубль = две одноимённые asmdef в проекте.
+                if (string.Equals(a.ResolvePackageName(), b.ResolvePackageName(), StringComparison.Ordinal))
+                    warnings.Add($"У «{a.Name}» и «{b.Name}» один packageName {a.ResolvePackageName()} — " +
+                                 "имена сборок (asmdef) должны быть уникальны.");
+            }
+            return warnings;
+        }
+    }
+}

@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // ListView-попап у каретки. Часть кодовой области — стилизуется SalamanderCode.uss
+    // (классы .sal-popup*), токены темы Nexus сюда сознательно не доходят.
+    public sealed class AutocompletePopup : VisualElement
+    {
+        private const float RowHeight = 20f;
+        private const int MaxVisibleRows = 9;
+
+        private readonly ListView _list;
+        private readonly List<SalCompletion> _items = new List<SalCompletion>();
+        private bool _open;
+
+        public bool IsOpen => _open;
+        public event Action<SalCompletion> Committed;
+
+        public AutocompletePopup()
+        {
+            AddToClassList("sal-popup");
+            style.position = Position.Absolute;
+            style.display = DisplayStyle.None;
+            pickingMode = PickingMode.Position;
+
+            _list = new ListView(_items, RowHeight, MakeRow, BindRow)
+            {
+                selectionType = SelectionType.Single,
+            };
+            _list.AddToClassList("sal-popup-list");
+            Add(_list);
+        }
+
+        public void Open(Vector2 position, List<SalCompletion> items)
+        {
+            _items.Clear();
+            _items.AddRange(items);
+            if (_items.Count == 0)
+            {
+                Close();
+                return;
+            }
+            _list.RefreshItems();
+            _list.selectedIndex = 0;
+            _list.style.height = Mathf.Min(_items.Count, MaxVisibleRows) * RowHeight + 2f;
+            style.left = position.x;
+            style.top = position.y;
+            style.display = DisplayStyle.Flex;
+            _open = true;
+        }
+
+        public void Close()
+        {
+            style.display = DisplayStyle.None;
+            _open = false;
+        }
+
+        // true = клавиша съедена попапом (навигация/коммит/закрытие)
+        public bool HandleKey(KeyDownEvent e)
+        {
+            if (!_open) return false;
+            switch (e.keyCode)
+            {
+                case KeyCode.DownArrow:
+                    Move(1);
+                    return true;
+                case KeyCode.UpArrow:
+                    Move(-1);
+                    return true;
+                case KeyCode.Escape:
+                    Close();
+                    return true;
+                case KeyCode.Return:
+                case KeyCode.KeypadEnter:
+                case KeyCode.Tab:
+                    if (_list.selectedIndex >= 0 && _list.selectedIndex < _items.Count)
+                        Committed?.Invoke(_items[_list.selectedIndex]);
+                    else
+                        Close();
+                    return true;
+            }
+            return false;
+        }
+
+        private void Move(int delta)
+        {
+            if (_items.Count == 0) return;
+            int i = Mathf.Clamp(_list.selectedIndex + delta, 0, _items.Count - 1);
+            _list.selectedIndex = i;
+            _list.ScrollToItem(i);
+        }
+
+        private VisualElement MakeRow()
+        {
+            var row = new VisualElement();
+            row.AddToClassList("sal-popup-item");
+            var name = new Label();
+            name.AddToClassList("sal-popup-item-label");
+            var detail = new Label();
+            detail.AddToClassList("sal-popup-item-detail");
+            row.Add(name);
+            row.Add(detail);
+            // одиночный клик = коммит; индекс кладётся в userData при бинде (строки переиспользуются)
+            row.RegisterCallback<PointerUpEvent>(_ =>
+            {
+                if (row.userData is int i && i >= 0 && i < _items.Count)
+                    Committed?.Invoke(_items[i]);
+            });
+            return row;
+        }
+
+        // Классы цвета по виду подсказки — индексация по SalCompletionKind, сами цвета в USS.
+        private static readonly string[] KindClasses =
+        {
+            "sal-popup-kind-keyword", // Keyword
+            "sal-popup-kind-type",    // Type
+            "sal-popup-kind-api",     // Api
+            "sal-popup-kind-enum",    // Enum
+            "sal-popup-kind-class",   // Class
+            "sal-popup-kind-method",  // Method
+            "sal-popup-kind-member",  // Member
+            "sal-popup-kind-event",   // Event
+            "sal-popup-kind-symbol",  // Symbol
+        };
+
+        private void BindRow(VisualElement el, int i)
+        {
+            el.userData = i;
+            var name = (Label)el[0];
+            name.text = _items[i].Label;
+            ((Label)el[1]).text = _items[i].Detail ?? "";
+            // строки переиспользуются — включаем ровно один kind-класс
+            int kind = (int)_items[i].Kind;
+            for (int k = 0; k < KindClasses.Length; k++)
+                name.EnableInClassList(KindClasses[k], k == kind);
+        }
+    }
+}

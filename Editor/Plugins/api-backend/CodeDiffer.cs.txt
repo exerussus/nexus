@@ -1,0 +1,107 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Сравнивает ТЕКУЩИЙ вывод генератора с зеркалом последней генерации профиля.
+    /// Отвечает на исходный вопрос «видеть несостыковки» на уровне кода:
+    /// какие .cs добавятся/исчезнут/перепишутся и насколько (+N/−M строк).
+    /// Папка вывода приходит снаружи (per-profile), снапшот — того же профиля.
+    /// </summary>
+    public static class CodeDiffer
+    {
+        public enum ChangeKind { Added, Removed, Modified }
+
+        public sealed class FileChange
+        {
+            public string RelPath;
+            public ChangeKind Kind;
+            public int AddedLines;
+            public int RemovedLines;
+        }
+
+        public static List<FileChange> Diff(string outputDirRel, CodegenSnapshot snapshot)
+        {
+            var changes = new List<FileChange>();
+            var outRoot = Path.Combine(ApiCodegenConfig.ProjectRoot, outputDirRel);
+
+            // Текущее множество файлов вывода.
+            var current = new Dictionary<string, string>(); // relPath -> absPath
+            if (Directory.Exists(outRoot))
+            {
+                foreach (var file in Directory.GetFiles(outRoot, "*.cs", SearchOption.AllDirectories))
+                    current[Path.GetRelativePath(outRoot, file)] = file;
+            }
+
+            var previous = new HashSet<string>(snapshot?.MirroredFiles ?? Array.Empty<string>());
+
+            // Добавленные и изменённые.
+            foreach (var (rel, abs) in current)
+            {
+                if (!previous.Contains(rel))
+                {
+                    var lines = File.ReadAllLines(abs).Length;
+                    changes.Add(new FileChange { RelPath = rel, Kind = ChangeKind.Added, AddedLines = lines });
+                    continue;
+                }
+
+                var oldText = snapshot.ReadMirrored(rel) ?? "";
+                var newText = File.ReadAllText(abs);
+                if (oldText == newText) continue; // идентичны — не показываем
+
+                var (added, removed) = LineDelta(SplitLines(oldText), SplitLines(newText));
+                changes.Add(new FileChange
+                {
+                    RelPath = rel, Kind = ChangeKind.Modified,
+                    AddedLines = added, RemovedLines = removed
+                });
+            }
+
+            // Удалённые (были в прошлой генерации, в текущей нет).
+            foreach (var rel in previous)
+            {
+                if (current.ContainsKey(rel)) continue;
+                var oldText = snapshot.ReadMirrored(rel) ?? "";
+                changes.Add(new FileChange
+                {
+                    RelPath = rel, Kind = ChangeKind.Removed,
+                    RemovedLines = SplitLines(oldText).Length
+                });
+            }
+
+            changes.Sort((a, b) => string.CompareOrdinal(a.RelPath, b.RelPath));
+            return changes;
+        }
+
+        private static string[] SplitLines(string s) =>
+            s.Replace("\r\n", "\n").Split('\n');
+
+        /// <summary>Кол-во добавленных/удалённых строк через длину LCS.</summary>
+        private static (int added, int removed) LineDelta(string[] a, string[] b)
+        {
+            var lcs = LcsLength(a, b);
+            return (added: b.Length - lcs, removed: a.Length - lcs);
+        }
+
+        private static int LcsLength(string[] a, string[] b)
+        {
+            // Классический DP O(n*m) по памяти из двух строк — для файлов разумного размера ок.
+            var prev = new int[b.Length + 1];
+            var curr = new int[b.Length + 1];
+
+            for (var i = 1; i <= a.Length; i++)
+            {
+                for (var j = 1; j <= b.Length; j++)
+                {
+                    curr[j] = a[i - 1] == b[j - 1]
+                        ? prev[j - 1] + 1
+                        : Math.Max(prev[j], curr[j - 1]);
+                }
+                (prev, curr) = (curr, prev);
+            }
+            return prev[b.Length];
+        }
+    }
+}

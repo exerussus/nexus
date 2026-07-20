@@ -1,0 +1,19 @@
+{
+    "name": "Exerussus.Nexus.Pages.App",
+    "rootNamespace": "Exerussus.Nexus.Pages.App",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "app.core"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

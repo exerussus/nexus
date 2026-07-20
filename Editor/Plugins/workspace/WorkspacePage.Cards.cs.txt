@@ -1,0 +1,480 @@
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    public sealed partial class WorkspacePage
+    {
+        // ---------- Группа ----------
+
+        private VisualElement BuildGroup(WorkspaceGroup group)
+        {
+            var root = new VisualElement { name = "ws-group" };
+            root.AddToClassList("ws-group");
+            root.style.backgroundColor = Col(NexusToken.BgSoft);
+            SetBorder(root, Col(NexusToken.Border));
+
+            // --- Шапка ---
+            var header = new VisualElement();
+            header.AddToClassList("ws-group-header");
+            header.style.backgroundColor = Col(NexusToken.BgHard);
+            header.style.borderBottomColor = Col(NexusToken.Border);
+
+            var chevron = new Label(group.collapsed ? "\u25B8" : "\u25BE");
+            chevron.AddToClassList("ws-group-chevron");
+            chevron.style.color = Col(NexusToken.TextDim);
+            header.Add(chevron);
+
+            var title = new Label(group.name);
+            title.AddToClassList("ws-group-title");
+            title.style.color = Col(NexusToken.TextNormal);
+            header.Add(title);
+
+            int count = group.entries.Count;
+            var countLabel = new Label(count == 0 ? "пусто" : count.ToString());
+            countLabel.AddToClassList("ws-group-count");
+            countLabel.style.color = Col(NexusToken.TextDim);
+            header.Add(countLabel);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("ws-flex-spacer");
+            header.Add(spacer);
+
+            var del = new Button(() => DeleteGroup(group)) { text = "\u00D7" };
+            del.AddToClassList("ws-group-del");
+            del.tooltip = "Удалить эту группу";
+            del.style.backgroundColor = Color.clear;
+            del.style.color = Col(NexusToken.TextDim);
+            del.RegisterCallback<PointerEnterEvent>(_ => del.style.color = Col(NexusToken.Error));
+            del.RegisterCallback<PointerLeaveEvent>(_ => del.style.color = Col(NexusToken.TextDim));
+            header.Add(del);
+
+            // Клик по шапке сворачивает раздел; двойной клик по заголовку — переименование.
+            header.RegisterCallback<MouseDownEvent>(evt =>
+            {
+                if (evt.button != 0 || evt.target == del) return;
+                if (evt.target == title)
+                {
+                    if (evt.clickCount == 2) BeginRename(group, title, header);
+                    return; // одиночный клик по заголовку не сворачивает (чтобы не мешать рейнейму)
+                }
+                _store.SetCollapsed(group, !group.collapsed);
+                RebuildGroups();
+            });
+
+            root.Add(header);
+
+            // --- Тело ---
+            var body = new VisualElement();
+            body.AddToClassList("ws-group-body");
+            body.style.display = group.collapsed ? DisplayStyle.None : DisplayStyle.Flex;
+
+            var visible = group.collapsed ? new List<WorkspaceEntry>() : FilteredEntries(group);
+            if (!group.collapsed)
+            {
+                if (visible.Count == 0)
+                {
+                    var hint = new Label(string.IsNullOrEmpty(_filter)
+                        ? "Перетащите сюда ассеты или объекты сцены"
+                        : "Нет карточек по фильтру");
+                    hint.AddToClassList("ws-drop-hint");
+                    hint.style.color = Col(NexusToken.TextDim);
+                    body.Add(hint);
+                }
+                else
+                {
+                    foreach (var entry in visible)
+                        body.Add(BuildCard(group, entry));
+                }
+            }
+
+            // Дроп в тело группы → добавить/перенести в конец этой группы.
+            RegisterGroupDrop(body, () => group, () => -1);
+
+            root.Add(body);
+            return root;
+        }
+
+        private List<WorkspaceEntry> FilteredEntries(WorkspaceGroup group)
+        {
+            if (string.IsNullOrEmpty(_filter)) return new List<WorkspaceEntry>(group.entries);
+            var f = _filter.Trim().ToLowerInvariant();
+            var list = new List<WorkspaceEntry>();
+            foreach (var e in group.entries)
+            {
+                if (e.kind == WorkspaceEntryKind.Bundle)
+                {
+                    if (BundleMatchesFilter(e, f)) list.Add(e);
+                    continue;
+                }
+                var type = ShortTypeName(e);
+                if (e.cachedName.ToLowerInvariant().Contains(f) || type.ToLowerInvariant().Contains(f))
+                    list.Add(e);
+            }
+            return list;
+        }
+
+        private bool BundleMatchesFilter(WorkspaceEntry bundle, string f)
+        {
+            if (BundleDisplayName(bundle).ToLowerInvariant().Contains(f)) return true;
+            foreach (var m in bundle.items)
+                if (m.cachedName.ToLowerInvariant().Contains(f) || ShortTypeName(m).ToLowerInvariant().Contains(f))
+                    return true;
+            return false;
+        }
+
+        private void DeleteGroup(WorkspaceGroup group)
+        {
+            if (group.entries.Count > 0 &&
+                !EditorUtility.DisplayDialog("Удалить группу",
+                    $"Удалить группу «{group.name}» с {group.entries.Count} карточкой(ами)?", "Удалить", "Отмена"))
+                return;
+            _store.RemoveGroup(group);
+            _store.EnsureAtLeastOneGroup();
+            RebuildGroups();
+        }
+
+        private void BeginRename(WorkspaceGroup group, Label title, VisualElement header)
+        {
+            var field = new TextField { value = group.name };
+            field.AddToClassList("ws-group-rename");
+            int idx = header.IndexOf(title);
+            header.Remove(title);
+            header.Insert(idx, field);
+            field.Focus();
+            field.SelectAll();
+
+            void Commit()
+            {
+                _store.RenameGroup(group, field.value);
+                RebuildGroups();
+            }
+
+            field.RegisterCallback<BlurEvent>(_ => Commit());
+            field.RegisterCallback<KeyDownEvent>(evt =>
+            {
+                if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter) Commit();
+                else if (evt.keyCode == KeyCode.Escape) RebuildGroups();
+            });
+        }
+
+        // ---------- Карточка ----------
+
+        private VisualElement BuildCard(WorkspaceGroup group, WorkspaceEntry entry)
+        {
+            if (entry.kind == WorkspaceEntryKind.Bundle)
+                return BuildBundleCard(group, entry);
+
+            var obj = ResolveObject(entry);                 // живой объект (может быть null)
+            bool missing = obj == null && entry.kind != WorkspaceEntryKind.ExternalFile;
+            float size = _store.CardScale;
+
+            var card = new VisualElement();
+            card.AddToClassList("ws-card");
+            card.style.width = size;
+            card.style.height = size;
+            if (entry.pinned) card.AddToClassList("ws-card--pinned");
+            if (missing)
+            {
+                card.AddToClassList("ws-card--missing");
+                card.style.opacity = 0.85f;
+            }
+
+            // Цвета: база + ховер. Бордер зависит от состояния (закреплено/отсутствует).
+            Color baseBorder = entry.pinned ? Col(NexusToken.Accent)
+                : missing ? Col(NexusToken.Error)
+                : Col(NexusToken.Border);
+            Color hoverBorder = missing ? Col(NexusToken.Error) : Col(NexusToken.Accent);
+            Color baseBg = Col(NexusToken.BgRaised);
+            WireHover(card, baseBg, Col(NexusToken.Hover), baseBorder, hoverBorder);
+
+            // Тип-метка в углу (A / S / F).
+            var kindTag = new Label(KindTag(entry.kind));
+            kindTag.AddToClassList("ws-card-kind");
+            kindTag.style.color = Col(NexusToken.TextDim);
+            card.Add(kindTag);
+
+            if (entry.pinned)
+            {
+                var pin = new Label("\u25C9");
+                pin.AddToClassList("ws-card-pin");
+                pin.style.color = Col(NexusToken.Accent);
+                card.Add(pin);
+            }
+
+            var icon = new Image { image = GetIcon(entry, obj), scaleMode = ScaleMode.ScaleToFit };
+            icon.AddToClassList("ws-card-icon");
+            card.Add(icon);
+
+            var name = new Label(string.IsNullOrEmpty(entry.cachedName) ? "(без имени)" : entry.cachedName);
+            name.AddToClassList("ws-card-name");
+            name.style.color = Col(NexusToken.TextNormal);
+            card.Add(name);
+
+            var sub = new Label(missing ? "отсутствует" : ShortTypeName(entry));
+            sub.AddToClassList("ws-card-sub");
+            sub.style.color = missing ? Col(NexusToken.Error) : Col(NexusToken.TextDim);
+            card.Add(sub);
+
+            card.tooltip = BuildInfo(entry, obj);
+
+            WireCardInteractions(card, group, entry, missing);
+            MaybeFlash(card, entry, baseBg, baseBorder);
+            return card;
+        }
+
+        // ---------- Карточка-набор (Bundle) ----------
+
+        private VisualElement BuildBundleCard(WorkspaceGroup group, WorkspaceEntry entry)
+        {
+            float size = _store.CardScale;
+            int total = entry.items.Count;
+            int resolved = CountResolvable(entry);
+
+            var card = new VisualElement();
+            card.AddToClassList("ws-card");
+            card.AddToClassList("ws-card--bundle");
+            card.style.width = size;
+            card.style.height = size;
+            if (entry.pinned) card.AddToClassList("ws-card--pinned");
+
+            // Набор: фон глубокий, рамка акцентная (левая полоса 3px задаётся в USS).
+            Color baseBg = Col(NexusToken.BgHard);
+            Color baseBorder = Col(NexusToken.Accent);
+            WireHover(card, baseBg, Col(NexusToken.Hover), baseBorder, Col(NexusToken.Accent));
+
+            var kindTag = new Label("[ ]");
+            kindTag.AddToClassList("ws-card-kind");
+            kindTag.style.color = Col(NexusToken.TextDim);
+            card.Add(kindTag);
+
+            // Бейдж с количеством элементов (заливка Accent, цифра — на самом тёмном фоне для контраста).
+            var countBadge = new Label(total.ToString());
+            countBadge.AddToClassList("ws-card-count");
+            countBadge.style.backgroundColor = Col(NexusToken.Accent);
+            countBadge.style.color = Col(NexusToken.BgHard);
+            card.Add(countBadge);
+
+            if (entry.pinned)
+            {
+                var pin = new Label("\u25C9");
+                pin.AddToClassList("ws-card-pin");
+                pin.style.color = Col(NexusToken.Accent);
+                card.Add(pin);
+            }
+
+            // Иконка — превью первого члена (или дефолт).
+            var firstObj = total > 0 ? ResolveObject(entry.items[0]) : null;
+            var icon = new Image
+            {
+                image = total > 0 ? GetIcon(entry.items[0], firstObj) : EditorGUIUtility.IconContent("d_Preset.Context").image,
+                scaleMode = ScaleMode.ScaleToFit
+            };
+            icon.AddToClassList("ws-card-icon");
+            card.Add(icon);
+
+            var name = new Label(BundleDisplayName(entry));
+            name.AddToClassList("ws-card-name");
+            name.style.color = Col(NexusToken.TextNormal);
+            card.Add(name);
+
+            var sub = new Label(resolved == total ? $"{total} элем." : $"{resolved}/{total} элем.");
+            sub.AddToClassList("ws-card-sub");
+            sub.style.color = resolved != total ? Col(NexusToken.Warning) : Col(NexusToken.TextDim);
+            if (resolved != total) sub.AddToClassList("ws-card-sub--warn");
+            card.Add(sub);
+
+            card.tooltip = BuildBundleInfo(entry);
+
+            WireCardInteractions(card, group, entry, missing: false);
+            MaybeFlash(card, entry, baseBg, baseBorder);
+            return card;
+        }
+
+        /// <summary>Подсветка только что добавленной/дублированной карточки.</summary>
+        private void MaybeFlash(VisualElement card, WorkspaceEntry entry, Color baseBg, Color baseBorder)
+        {
+            if (_flashKey == null || entry.StableKey != _flashKey) return;
+            _flashKey = null;
+            card.AddToClassList("ws-card--flash");
+            card.style.backgroundColor = Col(NexusToken.Selection);
+            SetBorder(card, Col(NexusToken.Accent));
+            card.schedule.Execute(() =>
+            {
+                card.RemoveFromClassList("ws-card--flash");
+                card.style.backgroundColor = baseBg;
+                SetBorder(card, baseBorder);
+            }).StartingIn(750);
+        }
+
+        /// <summary>Инлайновое переименование набора (имя на самой карточке).</summary>
+        private void BeginRenameCard(VisualElement card, WorkspaceEntry entry)
+        {
+            var label = card.Q<Label>(className: "ws-card-name");
+            if (label == null) return;
+
+            var field = new TextField { value = BundleDisplayName(entry) };
+            field.AddToClassList("ws-card-rename");
+            int idx = card.IndexOf(label);
+            card.Remove(label);
+            card.Insert(idx, field);
+            field.Focus();
+            field.SelectAll();
+
+            void Commit()
+            {
+                _store.SetBundleName(entry, field.value);
+                RebuildGroups();
+            }
+
+            field.RegisterCallback<BlurEvent>(_ => Commit());
+            field.RegisterCallback<KeyDownEvent>(evt =>
+            {
+                if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter) Commit();
+                else if (evt.keyCode == KeyCode.Escape) RebuildGroups();
+            });
+        }
+
+        private void WireCardInteractions(VisualElement card, WorkspaceGroup group, WorkspaceEntry entry, bool missing)
+        {
+            IVisualElementScheduledItem pending = null;
+            bool pressActive = false;
+            Vector2 pressStart = default;
+
+            card.RegisterCallback<MouseDownEvent>(evt =>
+            {
+                if (evt.button != 0) return;
+
+                if (evt.altKey) // alt+клик — убрать карточку
+                {
+                    _store.Remove(group, entry);
+                    RebuildGroups();
+                    Context.SetStatus($"Убрано «{entry.cachedName}»", StatusKind.Info);
+                    evt.StopPropagation();
+                    return;
+                }
+
+                pressActive = true;
+                pressStart = evt.mousePosition;
+
+                if (evt.clickCount >= 2) // двойной — открыть/редактировать
+                {
+                    pending?.Pause();
+                    pending = null;
+                    ActivateOpen(entry);
+                }
+                else // одиночный — пинг+выделение (с задержкой, чтобы не сработал на double)
+                {
+                    pending?.Pause();
+                    pending = card.schedule.Execute(() =>
+                    {
+                        ActivatePing(group, entry);
+                        pending = null;
+                    }).StartingIn(210);
+                }
+                evt.StopPropagation();
+            });
+
+            card.RegisterCallback<MouseMoveEvent>(evt =>
+            {
+                if (!pressActive) return;
+                if ((evt.mousePosition - pressStart).sqrMagnitude > 36f) // порог ~6px → начать drag
+                {
+                    pending?.Pause();
+                    pending = null;
+                    pressActive = false;
+                    StartCardDrag(group, entry);
+                }
+            });
+
+            card.RegisterCallback<MouseUpEvent>(_ => pressActive = false);
+
+            // Дроп НА карточку → вставить перед ней (перенос/добавление с индексом).
+            RegisterCardDrop(card, group, entry);
+
+            // Контекстное меню.
+            card.AddManipulator(new ContextualMenuManipulator(e => BuildCardMenu(e, group, entry, missing, card)));
+        }
+
+        private void BuildCardMenu(ContextualMenuPopulateEvent e, WorkspaceGroup group, WorkspaceEntry entry, bool missing, VisualElement card)
+        {
+            if (entry.kind == WorkspaceEntryKind.Bundle) { BuildBundleMenu(e, group, entry, card); return; }
+
+            e.menu.AppendAction("Показать и выделить", _ => ActivatePing(group, entry));
+            e.menu.AppendAction("Открыть / Редактировать", _ => ActivateOpen(entry),
+                _ => entry.kind == WorkspaceEntryKind.ExternalFile
+                    ? DropdownMenuAction.Status.Disabled
+                    : DropdownMenuAction.Status.Normal);
+
+            if (entry.kind == WorkspaceEntryKind.SceneObject)
+                e.menu.AppendAction("Перейти в сцену", _ => OfferOpenScene(entry, pingAfter: true));
+
+            e.menu.AppendSeparator();
+
+            if (entry.kind != WorkspaceEntryKind.SceneObject)
+                e.menu.AppendAction("Показать в проводнике", _ => RevealEntry(entry));
+
+            e.menu.AppendAction("Копировать путь", _ =>
+                EditorGUIUtility.systemCopyBuffer = EntryPath(entry));
+
+            e.menu.AppendSeparator();
+            e.menu.AppendAction(entry.pinned ? "Открепить" : "Закрепить",
+                _ => { _store.TogglePin(entry); RebuildGroups(); });
+
+            if (missing)
+                e.menu.AppendAction("Перепривязать к выделению", _ => RelinkToSelection(group, entry),
+                    _ => Selection.activeObject != null
+                        ? DropdownMenuAction.Status.Normal
+                        : DropdownMenuAction.Status.Disabled);
+
+            e.menu.AppendSeparator();
+            e.menu.AppendAction("Убрать", _ =>
+            {
+                _store.Remove(group, entry);
+                RebuildGroups();
+            });
+        }
+
+        private void BuildBundleMenu(ContextualMenuPopulateEvent e, WorkspaceGroup group, WorkspaceEntry entry, VisualElement card)
+        {
+            e.menu.AppendAction("Показать и выделить все", _ => ActivatePing(group, entry),
+                _ => entry.items.Count > 0 ? DropdownMenuAction.Status.Normal : DropdownMenuAction.Status.Disabled);
+            e.menu.AppendAction("Открыть все", _ => ActivateOpen(entry),
+                _ => entry.items.Count > 0 ? DropdownMenuAction.Status.Normal : DropdownMenuAction.Status.Disabled);
+
+            if (BundleHasSceneMembers(entry))
+                e.menu.AppendAction("Перейти в сцену(ы)", _ => GoToBundleScenes(entry, selectAfter: true));
+
+            e.menu.AppendSeparator();
+            e.menu.AppendAction("Добавить выделение в набор", _ => AddSelectionToBundle(entry),
+                _ => Selection.objects.Length > 0 ? DropdownMenuAction.Status.Normal : DropdownMenuAction.Status.Disabled);
+            e.menu.AppendAction("Переименовать набор", _ => BeginRenameCard(card, entry));
+            e.menu.AppendAction("Разобрать на карточки", _ => { _store.Explode(group, entry); RebuildGroups(); },
+                _ => entry.items.Count > 0 ? DropdownMenuAction.Status.Normal : DropdownMenuAction.Status.Disabled);
+
+            // Члены набора: пинг и удаление по одному (с разумным лимитом длины меню).
+            const int cap = 25;
+            int shown = 0;
+            foreach (var m in entry.items)
+            {
+                if (shown++ >= cap) break;
+                var member = m;
+                string label = Sanitize(string.IsNullOrEmpty(member.cachedName) ? member.StableKey : member.cachedName);
+                e.menu.AppendAction($"Элементы/{label}", _ => ActivatePing(group, member));
+                e.menu.AppendAction($"Убрать элемент/{label}", _ => { _store.BundleRemove(entry, member); RebuildGroups(); });
+            }
+            if (entry.items.Count > cap)
+                e.menu.AppendAction($"Элементы/… (ещё {entry.items.Count - cap})", _ => { }, _ => DropdownMenuAction.Status.Disabled);
+
+            e.menu.AppendSeparator();
+            e.menu.AppendAction(entry.pinned ? "Открепить" : "Закрепить", _ => { _store.TogglePin(entry); RebuildGroups(); });
+            e.menu.AppendAction("Убрать набор", _ => { _store.Remove(group, entry); RebuildGroups(); });
+        }
+
+        // Слэш в имени ломает иерархию пунктов меню — экранируем.
+        private static string Sanitize(string s) => string.IsNullOrEmpty(s) ? "(элемент)" : s.Replace("/", "\u2215");
+    }
+}

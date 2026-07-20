@@ -1,0 +1,34 @@
+using System.IO;
+using Newtonsoft.Json;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Личные настройки страницы: UserSettings/Exerussus.Nexus/salamander-editor/prefs.json.
+    // Переживают Restore и Disable; стираются только «Clear settings» из Manage.
+    internal sealed class PagePrefs
+    {
+        public string ApiSourcePath; // откуда скопирован salamander-api.json (для авто-обновления)
+        public string LastFilePath;  // последний открытый .sal
+
+        public static PagePrefs Load(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    return JsonConvert.DeserializeObject<PagePrefs>(File.ReadAllText(path)) ?? new PagePrefs();
+            }
+            catch { /* битый prefs — начинаем с чистого */ }
+            return new PagePrefs();
+        }
+
+        public void Save(string path)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(path, JsonConvert.SerializeObject(this, Formatting.Indented));
+            }
+            catch { /* prefs — не повод ронять страницу */ }
+        }
+    }
+}

@@ -1,0 +1,869 @@
+/* ============================================================
+   SignalTimelinePage — pill-marker swimlane visual styling.
+
+   Nexus резолвит токены палитры в C#, а не как root USS --vars
+   (UI Toolkit не умеет задавать кастомные --vars из кода). Поэтому
+   companion-USS самодостаточен: семантические переменные ниже —
+   это СНИМОК дефолтной палитры soft-dark. Цвета, построенные в C#
+   (см. страницу/граф/попап), идут через Context.Theme.Get и живо
+   следуют активной палитре; USS-переменные — статичны до правки здесь.
+   ============================================================ */
+
+:root {
+    /* — снимок soft-dark (бывшие --hub-*) — */
+    --stp-text:          rgb(220, 222, 228);
+    --stp-text-dim:      rgb(150, 154, 164);
+    --stp-border:        rgba(255, 255, 255, 0.09);
+    --stp-ok:            rgb(122, 190, 110);
+    --stp-warning:       rgb(224, 168, 74);
+    --stp-error:         rgb(221, 105, 105);
+
+    /* — локальные акценты страницы — */
+    --stp-accent:        rgb(255, 140, 66);      /* orange */
+    --stp-accent-dim:    rgba(255, 140, 66, 0.4);
+    --stp-card:          rgba(48, 38, 68, 0.55); /* tinted card */
+    --stp-card-border:   rgba(122, 95, 178, 0.45);
+    --stp-pill-tint:     rgba(255, 255, 255, 0.04);
+}
+
+/* ---- Root layout ---- */
+.stp-root {
+    flex-grow: 1;
+    flex-shrink: 1;
+    /* flex-basis: 0 forces Root to start from zero height and grow only to
+       fill what the parent gives it, never to fit its content. Combined
+       with min-height: 0 this lets nested ScrollViews actually shrink to
+       their viewport — the old "flex: 1 0 auto" had flex-shrink: 0, which
+       let Root overflow downward and pushed the detail panel off-screen
+       once the list grew past the visible area. */
+    flex-basis: 0;
+    flex-direction: column;
+    min-height: 0;
+}
+/* Content wrapper (everything below the toolbar). Same constraints as
+   the root — it has to compress alongside Root, otherwise its column-flex
+   children push it past the page bounds and the detail panel disappears. */
+.stp-content {
+    flex-grow: 1;
+    flex-shrink: 1;
+    flex-basis: 0;
+    flex-direction: column;
+    min-height: 0;
+}
+
+/* ---- Tracking-off placeholder ---- */
+.stp-tracking-off {
+    flex-grow: 1;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(18, 14, 28, 0.6);
+}
+.stp-tracking-off-title {
+    color: var(--stp-text);
+    -unity-font-style: bold;
+    font-size: 14px;
+    margin-bottom: 6px;
+}
+.stp-tracking-off-sub {
+    color: var(--stp-text-dim);
+    font-size: 11px;
+}
+
+/* ---- Toolbar ---- */
+.stp-toolbar {
+    flex-shrink: 0;
+    align-items: center;
+    background-color: rgba(20, 16, 30, 0.5);
+    border-bottom-width: 1px;
+    border-color: var(--stp-border);
+    padding: 5px 6px;
+}
+
+/* Buttons inside toolbar: pill-ish dark capsules. */
+.stp-toolbar ToolbarButton {
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: var(--stp-card-border);
+    border-radius: 5px;
+    color: var(--stp-text);
+    margin-right: 6px;
+    padding: 4px 14px;
+    font-size: 11px;
+    min-height: 22px;
+    -unity-text-align: middle-center;
+}
+.stp-toolbar ToolbarButton:hover {
+    background-color: rgba(122, 95, 178, 0.25);
+}
+.stp-toolbar ToolbarButton:active {
+    background-color: rgba(255, 140, 66, 0.3);
+}
+
+/* Toggle-emulating buttons: same look, plus orange "on" state.
+   Selector qualified with `ToolbarButton` so its specificity beats
+   the base `.stp-toolbar ToolbarButton` rule even when not hovering. */
+ToolbarButton.stp-tbtn--on,
+.stp-toolbar ToolbarButton.stp-tbtn--on {
+    background-color: var(--stp-accent);
+    border-color: var(--stp-accent);
+    color: rgb(20, 14, 8);
+}
+ToolbarButton.stp-tbtn--on:hover,
+.stp-toolbar ToolbarButton.stp-tbtn--on:hover {
+    background-color: rgb(255, 165, 100);
+    border-color: rgb(255, 165, 100);
+}
+
+/* Spacer keeps native look. */
+
+/* ---- Legend chips ---- */
+.stp-legend {
+    flex-direction: row;
+    flex-shrink: 0;
+    padding: 6px 10px;
+    background-color: rgba(28, 22, 42, 0.5);
+    border-bottom-width: 1px;
+    border-color: var(--stp-border);
+}
+.stp-legend-chip {
+    flex-direction: row;
+    align-items: center;
+    margin-right: 12px;
+    padding: 3px 10px 3px 8px;
+    border-radius: 14px;
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: var(--stp-accent);
+    cursor: link;
+}
+.stp-legend-chip:hover {
+    background-color: rgba(255, 140, 66, 0.18);
+}
+.stp-legend-chip--off {
+    opacity: 0.45;
+    border-color: var(--stp-card-border);
+}
+.stp-legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+    margin-right: 6px;
+}
+.stp-legend-text {
+    color: var(--stp-text);
+    font-size: 11px;
+}
+
+/* ---- Axis row ---- */
+.stp-axis-row {
+    flex-direction: row;
+    flex-shrink: 0;
+    height: 22px;
+    background-color: rgba(28, 22, 42, 0.6);
+    border-bottom-width: 1px;
+    border-color: var(--stp-border);
+}
+.stp-axis-spacer {
+    flex-direction: row;
+    align-items: center;
+    padding: 2px 4px;
+    border-right-width: 1px;
+    border-color: var(--stp-border);
+}
+/* Global "show all events across all signals" button. Lives in the
+   axis-spacer above the labels column so it visually presides over
+   everything below. Visual matches the per-track ≡ button but stretches
+   to the spacer width since it acts on every signal. */
+.stp-allsignals-btn {
+    flex-grow: 1;
+    height: 18px;
+    margin: 0;
+    padding: 0 6px;
+    border-radius: 4px;
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: var(--stp-card-border);
+    color: var(--stp-text);
+    font-size: 10px;
+    -unity-text-align: middle-center;
+    -unity-font-style: bold;
+    cursor: link;
+}
+.stp-allsignals-btn:hover {
+    background-color: rgba(255, 140, 66, 0.18);
+    border-color: var(--stp-accent);
+    color: var(--stp-accent);
+}
+.stp-allsignals-btn:active {
+    background-color: rgba(255, 140, 66, 0.3);
+}
+.stp-axis {
+    position: relative;
+}
+.stp-tick {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    -unity-text-align: upper-left;
+}
+
+/* ---- Main lanes area ---- */
+.stp-main {
+    background-color: rgba(18, 14, 28, 0.6);
+}
+.stp-labels {
+    border-right-width: 1px;
+    border-color: var(--stp-border);
+    background-color: rgba(28, 22, 42, 0.6);
+}
+.stp-track-label {
+    flex-direction: row;
+    align-items: center;
+    padding: 4px 10px;
+    border-bottom-width: 1px;
+    border-color: rgba(122, 95, 178, 0.15);
+}
+.stp-track-label:hover {
+    background-color: rgba(122, 95, 178, 0.10);
+}
+.stp-track-label--selected {
+    background-color: rgba(255, 140, 66, 0.12);
+    border-left-width: 3px;
+    border-color: var(--stp-accent);
+}
+/* Inner column for title + sub. Lets the row keep horizontal direction
+   while the two text rows stack vertically next to the all-events button. */
+.stp-track-label-text {
+    flex-direction: column;
+    justify-content: center;
+    flex-grow: 1;
+    flex-shrink: 1;
+    min-width: 0;
+}
+.stp-track-title {
+    color: var(--stp-text);
+    -unity-font-style: bold;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.stp-track-sub {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.stp-track-sub--dead { color: var(--stp-error); }
+
+/* Small square "show all events" button anchored to the right edge of
+   the track label. Visual matches the toolbar pills but compacted. */
+.stp-track-allbtn {
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+    min-height: 22px;
+    flex-shrink: 0;
+    margin-left: 6px;
+    padding: 0;
+    border-radius: 4px;
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: var(--stp-card-border);
+    color: var(--stp-text);
+    font-size: 14px;
+    -unity-text-align: middle-center;
+    -unity-font-style: bold;
+    cursor: link;
+}
+.stp-track-allbtn:hover {
+    background-color: rgba(255, 140, 66, 0.18);
+    border-color: var(--stp-accent);
+    color: var(--stp-accent);
+}
+.stp-track-allbtn:active {
+    background-color: rgba(255, 140, 66, 0.3);
+}
+
+.stp-lanes-scroll {
+    background-color: rgba(18, 14, 28, 0.4);
+}
+.stp-lanes { position: relative; }
+.stp-lane {
+    position: relative;
+    flex-shrink: 0;
+}
+
+/* ---- Lifetime bar ---- */
+.stp-lifebar {
+    background-color: rgba(122, 95, 178, 0.4);
+    border-radius: 1px;
+}
+.stp-lifebar--alive {
+    background-color: var(--stp-accent-dim);
+}
+
+/* ---- Pill markers ---- */
+.stp-marker {
+    background-color: var(--stp-pill-tint);
+    border-radius: 11px;
+    border-width: 1px;
+    flex-direction: row;
+    align-items: center;
+    padding: 0 8px;
+    cursor: link;
+}
+.stp-marker:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.stp-marker-text {
+    color: var(--stp-text);
+    font-size: 10px;
+    -unity-text-align: middle-center;
+    -unity-font-style: bold;
+    width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Kind variants — outline + faint tint */
+.stp-marker--created      { border-color: var(--stp-ok); }
+.stp-marker--subscribed   { border-color: var(--stp-accent); }
+.stp-marker--invoked      { border-color: rgb(240, 192, 96); }
+.stp-marker--unsubscribed { border-color: var(--stp-warning); }
+.stp-marker--disposed     { border-color: var(--stp-error); }
+.stp-marker--mixed        { border-color: rgb(170, 110, 200); }
+
+/* Selected: filled orange accent */
+.stp-marker--selected {
+    background-color: var(--stp-accent);
+    border-color: var(--stp-accent);
+}
+.stp-marker--selected .stp-marker-text { color: rgb(20, 14, 8); }
+
+/* Unheard Invoke: greyed out */
+.stp-marker--unheard {
+    border-color: rgba(180, 180, 180, 0.5);
+    opacity: 0.55;
+}
+
+/* Errored: red border + corner badge */
+.stp-marker--errored {
+    border-color: var(--stp-error);
+    border-width: 2px;
+}
+.stp-error-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background-color: var(--stp-error);
+    border-width: 1px;
+    border-color: rgb(20, 20, 20);
+}
+
+/* Cluster: slightly elevated */
+.stp-marker--cluster {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* ---- Detail panel (profiler-style card layout) ---- */
+
+.stp-detail {
+    flex-shrink: 0;
+    flex-direction: column;
+    background-color: rgba(20, 16, 32, 0.85);
+    border-top-width: 1px;
+    border-color: var(--stp-border);
+    min-height: 130px;
+    max-height: 320px;
+    padding: 8px 10px;
+}
+
+.stp-detail-header {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background-color: rgba(255, 140, 66, 0.10);
+    border-width: 1px;
+    border-color: rgba(255, 140, 66, 0.35);
+}
+
+.stp-detail-kind {
+    -unity-font-style: bold;
+    font-size: 12px;
+    color: var(--stp-accent);
+    margin-right: 12px;
+}
+.stp-detail-kind--created      { color: var(--stp-ok); }
+.stp-detail-kind--subscribed   { color: var(--stp-accent); }
+.stp-detail-kind--invoked      { color: rgb(240, 192, 96); }
+.stp-detail-kind--unsubscribed { color: var(--stp-warning); }
+.stp-detail-kind--disposed     { color: var(--stp-error); }
+
+.stp-detail-type {
+    color: var(--stp-text);
+    margin-right: 12px;
+    font-size: 11px;
+}
+.stp-detail-time {
+    color: var(--stp-text-dim);
+    font-size: 11px;
+}
+.stp-detail-open {
+    margin-left: 8px;
+    background-color: var(--stp-accent);
+    color: rgb(20, 14, 8);
+    border-radius: 4px;
+    padding: 2px 10px;
+    -unity-font-style: bold;
+    border-width: 0;
+}
+.stp-detail-open:hover { background-color: rgb(255, 165, 100); }
+.stp-detail-open:disabled { background-color: rgba(255, 140, 66, 0.25); color: rgba(20,14,8,0.6); }
+
+.stp-detail-body {
+    flex-direction: row;
+    flex-grow: 1;
+    overflow: hidden;
+}
+
+/* Cards layout: two columns */
+.stp-card {
+    flex-direction: column;
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: var(--stp-card-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-left: 4px;
+    margin-right: 4px;
+    flex-grow: 1;
+    min-width: 0;
+}
+
+.stp-card-title {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    -unity-font-style: bold;
+    margin-bottom: 6px;
+}
+
+.stp-detail-row {
+    flex-direction: row;
+    align-items: flex-start;
+    margin-bottom: 3px;
+}
+.stp-detail-row-label {
+    width: 90px;
+    flex-shrink: 0;
+    color: var(--stp-text-dim);
+    font-size: 11px;
+}
+.stp-detail-row-value {
+    flex-grow: 1;
+    color: var(--stp-text);
+    font-size: 11px;
+    white-space: normal;
+}
+
+/* Errors section: full-width, sits below the two-card row */
+.stp-detail-errors {
+    margin-top: 6px;
+    flex-direction: column;
+    min-height: 0;
+}
+.stp-detail-errors-header {
+    color: var(--stp-error);
+    -unity-font-style: bold;
+    font-size: 11px;
+    margin-bottom: 4px;
+}
+.stp-detail-errors-list {
+    flex-direction: column;
+    background-color: rgba(180, 60, 60, 0.10);
+    border-left-width: 2px;
+    border-color: var(--stp-error);
+    border-radius: 4px;
+    padding: 4px 8px;
+    max-height: 140px;
+    overflow: hidden;
+}
+.stp-detail-error-item {
+    flex-direction: column;
+    margin-bottom: 6px;
+    padding: 2px 0;
+    border-bottom-width: 1px;
+    border-color: rgba(180, 60, 60, 0.25);
+}
+.stp-detail-error-header {
+    color: var(--stp-error);
+    -unity-font-style: bold;
+    font-size: 11px;
+    white-space: normal;
+    margin-bottom: 2px;
+}
+.stp-detail-error-header--clickable { cursor: link; }
+.stp-detail-error-header--clickable:hover {
+    color: rgb(255, 130, 130);
+    background-color: rgba(255, 80, 80, 0.10);
+}
+.stp-detail-error-stack {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    white-space: normal;
+}
+
+/* ---- Summary strip ---- */
+.stp-summary {
+    flex-shrink: 0;
+    color: var(--stp-text-dim);
+    font-size: 11px;
+    padding: 3px 10px;
+    background-color: rgba(28, 22, 42, 0.7);
+    border-top-width: 1px;
+    border-color: var(--stp-border);
+}
+
+/* ---- Popup row error tint (used by SignalClusterPopup) ---- */
+.stp-popup {
+    flex-direction: column;
+    background-color: rgba(20, 16, 30, 0.97);
+    border-width: 1px;
+    border-color: var(--stp-card-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+.stp-popup-header {
+    color: var(--stp-text);
+    -unity-font-style: bold;
+    font-size: 12px;
+    padding: 4px 6px 8px 6px;
+    border-bottom-width: 1px;
+    border-color: var(--stp-card-border);
+    margin-bottom: 6px;
+}
+.stp-popup-list {
+    flex-grow: 1;
+}
+.stp-popup-row {
+    flex-direction: row;
+    align-items: center;
+    height: 24px;
+    padding-left: 8px;
+    padding-right: 8px;
+    border-radius: 4px;
+    margin-bottom: 2px;
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: rgba(122, 95, 178, 0.20);
+}
+.stp-popup-row:hover {
+    background-color: rgba(255, 140, 66, 0.12);
+    border-color: var(--stp-accent);
+}
+.stp-popup-row--errored {
+    background-color: rgba(180, 60, 60, 0.16);
+    border-left-width: 3px;
+    border-color: var(--stp-error);
+}
+.stp-popup-row--errored:hover {
+    background-color: rgba(180, 60, 60, 0.26);
+}
+
+/* Solid swatch — small dot used in popup rows and legend. Independent
+   from outline-style pill markers used on the timeline. */
+.stp-swatch {
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: rgba(0, 0, 0, 0.4);
+}
+.stp-swatch--created      { background-color: var(--stp-ok); }
+.stp-swatch--subscribed   { background-color: var(--stp-accent); }
+.stp-swatch--invoked      { background-color: rgb(240, 192, 96); }
+.stp-swatch--unsubscribed { background-color: var(--stp-warning); }
+.stp-swatch--disposed     { background-color: var(--stp-error); }
+.stp-swatch--unheard      { background-color: rgb(110, 110, 110); opacity: 0.7; }
+.stp-swatch--errored      { border-color: var(--stp-error); border-width: 2px; }
+
+/* ============================================================
+   List view (alternative to the swimlane timeline). Reuses the
+   popup row visuals for individual rows and adds:
+   - a controls bar (signal filter + per-column toggle chips)
+   - a sticky column-title header
+   - a selected-row state
+   ============================================================ */
+.stp-timeline-section,
+.stp-list-section {
+    flex-direction: column;
+    flex-grow: 1;
+    flex-shrink: 1;
+    flex-basis: 0;
+    /* Flexbox quirk: a column flex child defaults to min-height: auto,
+       which means it will never shrink below the natural height of its
+       content. ListView's content = all rows summed → without this the
+       section grows past the parent and the detail panel gets pushed
+       off-screen. min-height: 0 unlocks shrinking. */
+    min-height: 0;
+}
+
+.stp-list-controls {
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+    padding: 6px 10px;
+    background-color: rgba(28, 22, 42, 0.55);
+    border-bottom-width: 1px;
+    border-color: var(--stp-border);
+}
+.stp-list-cols-label {
+    color: var(--stp-text-dim);
+    font-size: 11px;
+    margin-right: 8px;
+    -unity-font-style: bold;
+}
+.stp-list-cols {
+    flex-direction: row;
+    flex-wrap: wrap;
+    flex-grow: 1;
+}
+.stp-list-col-chip {
+    flex-direction: row;
+    align-items: center;
+    margin-right: 6px;
+    margin-bottom: 2px;
+    padding: 2px 9px;
+    border-radius: 12px;
+    background-color: var(--stp-card);
+    border-width: 1px;
+    border-color: var(--stp-accent);
+    cursor: link;
+}
+.stp-list-col-chip:hover {
+    background-color: rgba(255, 140, 66, 0.18);
+}
+.stp-list-col-chip--off {
+    opacity: 0.45;
+    border-color: var(--stp-card-border);
+}
+.stp-list-col-chip-text {
+    color: var(--stp-text);
+    font-size: 10px;
+}
+/* Master "All" chip in the filter row — slightly more prominent than
+   the per-signal chips so it reads as the parent toggle. */
+.stp-list-filter-chip--all {
+    margin-right: 10px;
+    background-color: rgba(255, 140, 66, 0.22);
+}
+.stp-list-filter-chip--all.stp-list-col-chip--off {
+    background-color: var(--stp-card);
+}
+
+.stp-list-header {
+    flex-direction: row;
+    align-items: center;
+    flex-shrink: 0;
+    height: 22px;
+    /* 17px = 8px (.stp-list padding) + 8px (.stp-popup-row padding) + 1px (.stp-popup-row border).
+       Keeps the column titles aligned over their cells. */
+    padding: 0 17px 0 17px;
+    background-color: rgba(28, 22, 42, 0.7);
+    border-bottom-width: 1px;
+    border-color: var(--stp-border);
+}
+.stp-list-col-title {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    -unity-font-style: bold;
+    margin-right: 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The ListView itself sits inside the list section. Default Unity
+   styling is mostly fine; we only need a transparent background to
+   match the dark page and a slim row gutter via padding. Height is
+   set programmatically (see UpdateListScrollHeight in C#) rather than
+   via flex-grow — flex inside a column ScrollView inside a column
+   section inside a column page is fragile in UI Toolkit, and a single
+   GeometryChangedEvent gives us reliable scrolling for any row count. */
+.stp-list {
+    background-color: rgba(18, 14, 28, 0.45);
+    padding: 4px 8px;
+    flex-shrink: 0;
+    flex-grow: 0;
+}
+/* Hide the ListView's built-in selection highlight — our row already
+   carries a selected style and the two would clash. */
+.stp-list .unity-collection-view__item--selected {
+    background-color: rgba(0, 0, 0, 0);
+}
+
+/* Selected list row: same accent as a selected timeline marker. */
+.stp-list-row--selected {
+    background-color: rgba(255, 140, 66, 0.16);
+    border-color: var(--stp-accent);
+}
+
+/* ============================================================
+   Call Graph view (third view mode) — invocation call-tree forest.
+   One block per invocation; bands (separated by dividers) each hold
+   one root call with its nested calls fanning right. Frozen time
+   gutter on the left. Reuses the page palette (--stp-*).
+   ============================================================ */
+.stp-graph-section {
+    flex-direction: column;
+    flex-grow: 1;
+    flex-shrink: 1;
+    flex-basis: 0;
+    min-height: 0;
+}
+.stp-graph-hint {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    white-space: normal;
+    flex-grow: 1;
+    flex-shrink: 1;
+}
+
+.stp-graph-body {
+    flex-direction: row;
+    flex-grow: 1;
+    min-height: 0;
+}
+
+/* Frozen left time-gutter. Clips its absolutely-positioned inner
+   element, which is transformed vertically to follow the scroll. */
+.stp-graph-gutter {
+    background-color: rgba(14, 11, 22, 0.85);
+    border-right-width: 1px;
+    border-right-color: var(--stp-card-border);
+    overflow: hidden;
+}
+.stp-graph-gutter-inner {
+    position: absolute;
+}
+.stp-graph-gutter-tick {
+    position: absolute;
+    flex-direction: column;
+    justify-content: flex-start;
+    padding: 6px 8px;
+    border-top-width: 1px;
+    border-top-color: rgba(255, 255, 255, 0.06);
+}
+.stp-graph-gutter-time {
+    color: var(--stp-text);
+    -unity-font-style: bold;
+    font-size: 12px;
+}
+.stp-graph-gutter-sub {
+    color: var(--stp-text-dim);
+    font-size: 9px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.stp-graph-scroll {
+    background-color: rgba(18, 14, 28, 0.45);
+}
+.stp-graph-canvas {
+    position: relative;
+}
+
+.stp-graph-empty {
+    flex-grow: 1;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(18, 14, 28, 0.6);
+}
+
+/* ---- Invocation block ---- */
+.stp-ginv {
+    position: absolute;
+    flex-direction: column;
+    justify-content: center;
+    background-color: rgba(40, 32, 58, 0.96);
+    border-width: 1px;
+    border-color: var(--stp-card-border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: link;
+    overflow: hidden;
+}
+.stp-ginv:hover {
+    background-color: rgba(122, 95, 178, 0.30);
+    border-color: var(--stp-accent);
+}
+/* Root invocation (fired from non-signal code) — green left accent. */
+.stp-ginv--root {
+    border-left-width: 3px;
+    border-left-color: var(--stp-ok);
+}
+.stp-ginv--unheard {
+    opacity: 0.62;
+}
+.stp-ginv--errored {
+    border-color: var(--stp-error);
+    border-width: 2px;
+}
+.stp-ginv--selected {
+    background-color: var(--stp-accent);
+    border-color: var(--stp-accent);
+}
+.stp-ginv--selected .stp-ginv-sig,
+.stp-ginv--selected .stp-ginv-time,
+.stp-ginv--selected .stp-ginv-meta,
+.stp-ginv--selected .stp-ginv-payload {
+    color: rgb(20, 14, 8);
+}
+
+.stp-ginv-head {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+}
+.stp-ginv-sig {
+    color: var(--stp-text);
+    -unity-font-style: bold;
+    font-size: 12px;
+    flex-grow: 1;
+    flex-shrink: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.stp-ginv-time {
+    color: rgba(255, 255, 255, 0.7);
+    font-size: 10px;
+    flex-shrink: 0;
+    margin-left: 6px;
+    -unity-text-align: middle-right;
+}
+.stp-ginv-meta {
+    color: var(--stp-text-dim);
+    font-size: 10px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.stp-ginv-payload {
+    color: rgba(255, 255, 255, 0.82);
+    font-size: 10px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}

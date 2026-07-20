@@ -1,0 +1,52 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Обнаружение двойной упаковки: ассет одновременно в Resources и в Addressables.
+    // Пакет Addressables опционален, поэтому вся работа — через рефлексию, без hard-dependency.
+    public static class AddressablesProbe
+    {
+        public static void Scan(AuditReport report)
+        {
+            foreach (var e in report.resources) e.addressableDuplicate = false;
+            report.addressablesPresent = false;
+
+            var defType = Type.GetType(
+                "UnityEditor.AddressableAssets.AddressableAssetSettingsDefaultObject, Unity.Addressables.Editor");
+            if (defType == null) return; // пакета нет — это не ошибка
+            report.addressablesPresent = true;
+
+            object settings = null;
+            var prop = defType.GetProperty("Settings", BindingFlags.Public | BindingFlags.Static);
+            if (prop != null) { try { settings = prop.GetValue(null); } catch { } }
+            if (settings == null) return; // пакет есть, но не сконфигурирован
+
+            var guids = new HashSet<string>(StringComparer.Ordinal);
+            var groups = settings.GetType().GetProperty("groups") != null
+                ? settings.GetType().GetProperty("groups").GetValue(settings) as IEnumerable : null;
+            if (groups == null) return;
+
+            foreach (var g in groups)
+            {
+                if (g == null) continue;
+                var entriesProp = g.GetType().GetProperty("entries");
+                var entries = entriesProp != null ? entriesProp.GetValue(g) as IEnumerable : null;
+                if (entries == null) continue;
+                foreach (var en in entries)
+                {
+                    if (en == null) continue;
+                    var guidProp = en.GetType().GetProperty("guid");
+                    var guid = guidProp != null ? guidProp.GetValue(en) as string : null;
+                    if (!string.IsNullOrEmpty(guid)) guids.Add(guid);
+                }
+            }
+
+            foreach (var e in report.resources)
+                e.addressableDuplicate = guids.Contains(AssetDatabase.AssetPathToGUID(e.assetPath));
+        }
+    }
+}

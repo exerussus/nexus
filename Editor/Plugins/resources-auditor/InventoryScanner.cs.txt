@@ -1,0 +1,92 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Инвентаризация того, что попадает в билд безусловно:
+    // все папки Resources (Assets + пакеты) и Assets/StreamingAssets.
+    public static class InventoryScanner
+    {
+        public static void Scan(AuditReport report)
+        {
+            report.resources.Clear();
+            report.streaming.Clear();
+
+            foreach (var path in AssetDatabase.GetAllAssetPaths())
+            {
+                if (!path.StartsWith("Assets/", StringComparison.Ordinal) &&
+                    !path.StartsWith("Packages/", StringComparison.Ordinal)) continue;
+                if (AssetDatabase.IsValidFolder(path)) continue;
+
+                var segments = path.Split('/');
+
+                // Всё под папкой Editor в билд не попадает — а страница показывает ровно билд.
+                // Индексы всех сегментов "Resources" собираем сразу: вложенные Resources дают
+                // ассету несколько валидных load-путей (относительно каждого корня).
+                bool underEditor = false;
+                List<int> resourceIdx = null;
+                for (int i = 0; i < segments.Length - 1; i++)
+                {
+                    if (segments[i] == "Editor") { underEditor = true; break; }
+                    if (segments[i] == "Resources")
+                        (resourceIdx = resourceIdx ?? new List<int>(1)).Add(i);
+                }
+                if (underEditor || resourceIdx == null) continue;
+
+                var entry = new ResourceAssetEntry
+                {
+                    assetPath = path,
+                    fromPackage = segments[0] == "Packages",
+                    typeName = AssetDatabase.GetMainAssetTypeAtPath(path) != null
+                        ? AssetDatabase.GetMainAssetTypeAtPath(path).Name : "?",
+                    sizeDisk = FileSize(path),
+                };
+                foreach (var idx in resourceIdx)
+                    entry.aliases.Add(StripExtension(string.Join("/", segments, idx + 1, segments.Length - idx - 1)));
+                // канонический путь — от внутренней (ближайшей к файлу) папки Resources
+                entry.resourcesPath = entry.aliases[entry.aliases.Count - 1];
+                report.resources.Add(entry);
+            }
+            report.resources.Sort((a, b) => b.sizeDisk.CompareTo(a.sizeDisk));
+
+            // StreamingAssets копируется в билд файл-в-файл — размеры на диске и в билде совпадают.
+            const string sa = "Assets/StreamingAssets";
+            if (Directory.Exists(sa))
+            {
+                foreach (var file in Directory.EnumerateFiles(sa, "*", SearchOption.AllDirectories))
+                {
+                    if (file.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) continue;
+                    report.streaming.Add(new StreamingEntry
+                    {
+                        path = file.Replace('\\', '/'),
+                        size = new FileInfo(file).Length,
+                    });
+                }
+                report.streaming.Sort((a, b) => b.size.CompareTo(a.size));
+            }
+
+            report.inventoryAt = Stamp.Now();
+        }
+
+        static long FileSize(string assetPath)
+        {
+            try
+            {
+                // GetPhysicalPath резолвит виртуальные пути пакетов (Packages/... → PackageCache)
+                var phys = FileUtil.GetPhysicalPath(assetPath);
+                if (string.IsNullOrEmpty(phys) || !File.Exists(phys)) return 0;
+                return new FileInfo(phys).Length;
+            }
+            catch { return 0; }
+        }
+
+        static string StripExtension(string rel)
+        {
+            int dot = rel.LastIndexOf('.');
+            int slash = rel.LastIndexOf('/');
+            return dot > slash ? rel.Substring(0, dot) : rel;
+        }
+    }
+}

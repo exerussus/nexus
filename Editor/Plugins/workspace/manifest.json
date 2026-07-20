@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "guid": "1825940fec254aa2a877082a27ec8bcf",
+  "id": "workspace",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.Workspace.WorkspacePage",
+  "display": {
+    "name": "Рабочая область",
+    "category": "Infrastructure",
+    "order": 20,
+    "icon": "d_Favorite"
+  },
+  "kind": "constitutive",
+  "requires": [],
+  "deploy": [
+    { "from": "Exerussus.Nexus.Pages.Workspace.asmdef.txt", "to": "Exerussus.Nexus.Pages.Workspace.asmdef" },
+    { "from": "WorkspaceModels.cs.txt", "to": "WorkspaceModels.cs" },
+    { "from": "WorkspaceStore.cs.txt", "to": "WorkspaceStore.cs" },
+    { "from": "WorkspacePage.cs.txt", "to": "WorkspacePage.cs" },
+    { "from": "WorkspacePage.Cards.cs.txt", "to": "WorkspacePage.Cards.cs" },
+    { "from": "WorkspacePage.Actions.cs.txt", "to": "WorkspacePage.Actions.cs" },
+    { "from": "WorkspacePage.DragDrop.cs.txt", "to": "WorkspacePage.DragDrop.cs" },
+    { "from": "WorkspacePage.Resolve.cs.txt", "to": "WorkspacePage.Resolve.cs" },
+    { "from": "WorkspacePage.uxml.txt", "to": "WorkspacePage.uxml" },
+    { "from": "WorkspacePage.uss.txt", "to": "WorkspacePage.uss" }
+  ]
+}

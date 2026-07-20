@@ -1,0 +1,371 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using UnityEditor;
+
+namespace Signals
+{
+    /// <summary>
+    /// Editor-only ingester. Listens to <see cref="Signal.EditorHook"/>
+    /// and turns the stream of events into <see cref="Model"/>.
+    /// <para>
+    /// Everyone else (the page, the exporter) reads <see cref="Model"/>
+    /// and subscribes to <see cref="Changed"/>. The registry never
+    /// touches UI directly.
+    /// </para>
+    /// </summary>
+    [InitializeOnLoad]
+    public static class SignalRegistry
+    {
+        public static SignalTimelineModel Model { get; private set; } = new();
+        public static event Action Changed;
+
+        /// <summary>Per-track ring-buffer cap (read from <see cref="SignalsConfig"/>).</summary>
+        public static int MaxEventsPerTrack => SignalsConfig.Instance.MaxEventsPerTrack;
+
+        /// <summary>Global event cap (read from <see cref="SignalsConfig"/>).</summary>
+        public static int MaxTotalEvents    => SignalsConfig.Instance.MaxTotalEvents;
+
+        /// <summary>
+        /// Master switch for the editor instrumentation. When false the
+        /// registry ignores every hook callback — no events are recorded.
+        /// Stored in <see cref="SignalsConfig"/>.
+        /// </summary>
+        public static bool IsEnabled => SignalsConfig.Instance.IsEnabled;
+
+        /// <summary>
+        /// Toggle tracking on/off. Allowed only outside Play mode — in Play
+        /// the call is a no-op and returns false so the caller can show a
+        /// hint. The model is cleared on switch so on→off doesn't leave
+        /// stale data lingering and off→on starts from a clean slate.
+        /// </summary>
+        public static bool TrySetEnabled(bool value)
+        {
+            if (EditorApplication.isPlayingOrWillChangePlaymode) return false;
+            if (IsEnabled == value) return true;
+            SignalsConfig.Instance.IsEnabled = value;
+            // Чистая запись при любом переключении: ось не должна содержать
+            // события из «противоположного» режима.
+            Model = new SignalTimelineModel { RecordingStartTime = Now() };
+            _nextId  = 1;
+            _nextSeq = 1;
+            ClearInvokeStack();
+            Changed?.Invoke();
+            return true;
+        }
+
+        private static int _nextId  = 1;
+        private static int _nextSeq = 1;
+
+        // Maps an alive Signal -> stable numeric id. WeakRef so we don't
+        // keep signals alive past their Dispose.
+        private static readonly ConditionalWeakTable<ISignal, IdBox> _idMap = new();
+        private sealed class IdBox { public int Id; }
+
+        // -- Call-graph invoke stack -----------------------------------------
+        //
+        // Single-threaded, main-thread-only (Signal's contract), so the chain
+        // of in-flight Invokes is a plain stack. OnInvokeBegin pushes a frame
+        // before dispatch; OnInvokeEnd pops it after. While a frame is on the
+        // stack, any nested Invoke (fired from a subscriber) records itself as
+        // a child of that frame — that's the parent→child edge of the graph.
+        //
+        // The stack is empty between frames; frames are pooled so a deep
+        // invoke chain stays allocation-free after warm-up.
+
+        private sealed class InvokeFrame
+        {
+            // This invoke's sequence, assigned at OnInvokeBegin (BEFORE dispatch)
+            // rather than at record time. That makes Sequence reflect call order
+            // (parent before its children) instead of completion order — the
+            // Invoked hook fires post-dispatch, so without this a parent would
+            // be numbered AFTER everything it triggered. 0 = assigned while
+            // tracking was off (the frame still exists for stack balance).
+            public int Seq;
+        }
+
+        private static readonly List<InvokeFrame>  _invokeStack = new(8); // index 0 == bottom
+        private static readonly Stack<InvokeFrame>  _framePool   = new();
+
+        private static void OnInvokeBegin(ISignal s, Type pt)
+        {
+            // Maintain the stack unconditionally (even when tracking is off) so
+            // push/pop stay balanced. Only burn a sequence number when tracking
+            // is on — and do it HERE, before dispatch, so call order wins.
+            var f = _framePool.Count > 0 ? _framePool.Pop() : new InvokeFrame();
+            f.Seq = IsEnabled ? _nextSeq++ : 0;
+            _invokeStack.Add(f);
+        }
+
+        private static void OnInvokeEnd(ISignal s, Type pt)
+        {
+            int n = _invokeStack.Count;
+            if (n == 0) return; // defensive; should never happen (balanced)
+            var f = _invokeStack[n - 1];
+            _invokeStack.RemoveAt(n - 1);
+            f.Seq = 0;
+            if (_framePool.Count < 64) _framePool.Push(f);
+        }
+
+        // Defensive reset — the stack is empty between frames, but clearing it
+        // on every model reset guarantees a stale frame can never leak across
+        // a play-session or a tracking toggle.
+        private static void ClearInvokeStack() => _invokeStack.Clear();
+
+        static SignalRegistry()
+        {
+            Signal.EditorHook.Created      = OnCreated;
+            Signal.EditorHook.Subscribed   = OnSubscribed;
+            Signal.EditorHook.Invoked      = OnInvoked;
+            Signal.EditorHook.Unsubscribed = OnUnsubscribed;
+            Signal.EditorHook.Disposed     = OnDisposed;
+
+            // Call-graph causality: these bracket every Invoke's dispatch
+            // so we can maintain a synchronous invoke stack (see OnInvoked).
+            Signal.EditorHook.InvokeBegin  = OnInvokeBegin;
+            Signal.EditorHook.InvokeEnd    = OnInvokeEnd;
+
+            // RecordingStartTime — origin of the displayed time axis.
+            // Now() гарантирует одинаковую шкалу с Time-источником, который
+            // будут писать события (см. ниже).
+            Model.RecordingStartTime = Now();
+
+            EditorApplication.playModeStateChanged += OnPlayModeChanged;
+        }
+
+        private static void OnPlayModeChanged(PlayModeStateChange state)
+        {
+            // На входе в Play нужно подготовить чистую модель ДО того, как
+            // пользовательский Awake/OnEnable создаст первый Signal. В этот
+            // момент Application.isPlaying ещё false, а Time.time стартует
+            // с 0 уже после ExitingEditMode — поэтому хардкодим origin = 0.
+            // С domain reload или без, итог одинаков: первый Created попадёт
+            // на ~0s.
+            if (state == PlayModeStateChange.ExitingEditMode)
+            {
+                Model = new SignalTimelineModel { RecordingStartTime = 0.0 };
+                _nextId  = 1;
+                _nextSeq = 1;
+                ClearInvokeStack();
+                Changed?.Invoke();
+            }
+        }
+
+        // Единые часы для всех записей. В Play используем Time.timeAsDouble
+        // (сбрасывается на старте Play, как и ожидает пользователь). В Edit
+        // mode — EditorApplication.timeSinceStartup, чтобы события до Play
+        // тоже имели разумные дельты.
+        private static double Now()
+        {
+            return UnityEngine.Application.isPlaying
+                ? UnityEngine.Time.timeAsDouble
+                : EditorApplication.timeSinceStartup;
+        }
+
+        // -- Public API -------------------------------------------------------
+
+        public static void ClearAll()
+        {
+            Model = new SignalTimelineModel { RecordingStartTime = Now() };
+            _nextId  = 1;
+            _nextSeq = 1;
+            ClearInvokeStack();
+            Changed?.Invoke();
+        }
+
+        public static void ClearEvents()
+        {
+            foreach (var t in Model.Tracks) t.Events.Clear();
+            Model.TotalEvents        = 0;
+            Model.FirstTime          = 0;
+            Model.LastTime           = 0;
+            Model.RecordingStartTime = Now();
+            Model.Version++;
+            Changed?.Invoke();
+        }
+
+        // -- Hook handlers ----------------------------------------------------
+
+        private static void OnCreated(ISignal s, string file, int line, string member)
+        {
+            if (!IsEnabled) return;
+            double t     = Now();
+            var    track = GetOrCreateTrack(s, t, file, line, member);
+            track.IsAlive       = true;
+            track.DisposedAt    = -1;
+            track.Name          = s.Name;
+            track.CreatedAt     = t;
+            track.CreatedFile   = file;
+            track.CreatedLine   = line;
+            track.CreatedMember = member;
+
+            AppendEvent(track, new TimelineEvent
+            {
+                Sequence   = _nextSeq++,
+                Time       = t,
+                Kind       = (int)SignalEventKind.Created,
+                FilePath   = file,
+                LineNumber = line,
+                MemberName = member,
+            });
+        }
+
+        private static void OnSubscribed(ISignal s, Type pt, int count,
+                                         string file, int line, string member)
+        {
+            if (!IsEnabled) return;
+            double t     = Now();
+            var    track = GetOrCreateTrack(s, t, file, line, member);
+
+            AppendEvent(track, new TimelineEvent
+            {
+                Sequence                = _nextSeq++,
+                Time                    = t,
+                Kind                    = (int)SignalEventKind.Subscribed,
+                PayloadType             = pt?.Name ?? "",
+                FilePath                = file,
+                LineNumber              = line,
+                MemberName              = member,
+                SubscriberCountAtMoment = count,
+            });
+        }
+
+        private static void OnInvoked(ISignal s, Type pt, string summary, int count, List<string> errors,
+                                      string file, int line, string member)
+        {
+            if (!IsEnabled) return;
+            double t     = Now();
+            var    track = GetOrCreateTrack(s, t, file, line, member);
+
+            // This invoke's frame is the top of the stack (pushed at our
+            // InvokeBegin, popped at our InvokeEnd). Its Seq was assigned then,
+            // before dispatch — so it's lower than any child we triggered. The
+            // parent frame, if any, is directly below us; its Seq is our parent.
+            int sc        = _invokeStack.Count;
+            int seq       = sc > 0 ? _invokeStack[sc - 1].Seq : _nextSeq++;
+            int parentSeq = sc >= 2 ? _invokeStack[sc - 2].Seq : 0;
+
+            AppendEvent(track, new TimelineEvent
+            {
+                Sequence                = seq,
+                Time                    = t,
+                Kind                    = (int)SignalEventKind.Invoked,
+                PayloadType             = pt?.Name ?? "",
+                PayloadSummary          = summary ?? "",
+                FilePath                = file,
+                LineNumber              = line,
+                MemberName              = member,
+                SubscriberCountAtMoment = count,
+                Errors                  = errors,
+                ParentSequence          = parentSeq,
+            });
+        }
+
+        private static void OnUnsubscribed(ISignal s, Type pt, int count,
+                                           string file, int line, string member)
+        {
+            if (!IsEnabled) return;
+            double t     = Now();
+            var    track = GetOrCreateTrack(s, t, file, line, member);
+
+            AppendEvent(track, new TimelineEvent
+            {
+                Sequence                = _nextSeq++,
+                Time                    = t,
+                Kind                    = (int)SignalEventKind.Unsubscribed,
+                PayloadType             = pt?.Name ?? "",
+                FilePath                = file,
+                LineNumber              = line,
+                MemberName              = member,
+                SubscriberCountAtMoment = count,
+            });
+        }
+
+        private static void OnDisposed(ISignal s, string file, int line, string member)
+        {
+            if (!IsEnabled) return;
+            double t     = Now();
+            var    track = GetOrCreateTrack(s, t, file, line, member);
+            track.IsAlive    = false;
+            track.DisposedAt = t;
+
+            AppendEvent(track, new TimelineEvent
+            {
+                Sequence   = _nextSeq++,
+                Time       = t,
+                Kind       = (int)SignalEventKind.Disposed,
+                FilePath   = file,
+                LineNumber = line,
+                MemberName = member,
+            });
+        }
+
+        // -- internals --------------------------------------------------------
+
+        private static int GetOrCreateId(ISignal s)
+        {
+            if (_idMap.TryGetValue(s, out var box)) return box.Id;
+            box = new IdBox { Id = _nextId++ };
+            _idMap.Add(s, box);
+            return box.Id;
+        }
+
+        private static SignalTrackData GetOrCreateTrack(ISignal s, double t,
+                                                        string file, int line, string member)
+        {
+            int id = GetOrCreateId(s);
+            // Linear scan over Tracks: fine for realistic counts (dozens).
+            // If this becomes a bottleneck, swap to Dictionary<int, idx>.
+            foreach (var tr in Model.Tracks)
+                if (tr.Id == id) return tr;
+
+            var nt = new SignalTrackData
+            {
+                Id            = id,
+                Name          = s.Name,
+                CreatedAt     = t,
+                IsAlive       = true,
+                CreatedFile   = file,
+                CreatedLine   = line,
+                CreatedMember = member,
+            };
+            Model.Tracks.Add(nt);
+            return nt;
+        }
+
+        private static void AppendEvent(SignalTrackData track, TimelineEvent evt)
+        {
+            track.Events.Add(evt);
+            Model.TotalEvents++;
+            if (Model.FirstTime == 0 || evt.Time < Model.FirstTime) Model.FirstTime = evt.Time;
+            if (evt.Time > Model.LastTime) Model.LastTime = evt.Time;
+
+            // Per-track trim with hysteresis (RemoveRange is O(n) so we
+            // amortise by only trimming when we drift +128 above cap).
+            if (track.Events.Count > MaxEventsPerTrack + 128)
+            {
+                int extra = track.Events.Count - MaxEventsPerTrack;
+                track.Events.RemoveRange(0, extra);
+                Model.TotalEvents -= extra;
+            }
+
+            // Global trim: shave the biggest track. Same amortisation.
+            if (Model.TotalEvents > MaxTotalEvents + 256)
+            {
+                SignalTrackData biggest = null;
+                foreach (var tr in Model.Tracks)
+                    if (biggest == null || tr.Events.Count > biggest.Events.Count) biggest = tr;
+                if (biggest != null && biggest.Events.Count > 0)
+                {
+                    int toRemove = Math.Min(biggest.Events.Count,
+                                            Model.TotalEvents - MaxTotalEvents);
+                    biggest.Events.RemoveRange(0, toRemove);
+                    Model.TotalEvents -= toRemove;
+                }
+            }
+
+            Model.Version++;
+            Changed?.Invoke();
+        }
+    }
+}

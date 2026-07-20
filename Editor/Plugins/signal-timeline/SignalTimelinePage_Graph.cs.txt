@@ -1,0 +1,701 @@
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using Signals;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.SignalTimeline
+{
+    /// <summary>
+    /// Call-graph view for <see cref="SignalTimelinePage"/> (third view mode,
+    /// alongside Timeline and List).
+    /// <para>
+    /// Unlike the timeline/list, which show one row per <i>event</i>, the graph
+    /// shows one block per <i>invocation</i> and wires them by causality: a
+    /// curve P → C means "while an Invoke of P was being dispatched, one of its
+    /// subscribers invoked C". The causality comes from
+    /// <see cref="TimelineEvent.ParentSequence"/>, stamped by
+    /// <see cref="SignalRegistry"/> from the synchronous invoke stack.
+    /// </para>
+    /// <para>
+    /// Layout is a <b>forest of call-trees</b>. Each <i>root</i> invocation
+    /// (one fired from non-signal code — Update, input, a coroutine…) starts
+    /// its own horizontal band, separated from its neighbours by a divider
+    /// line. Inside a band the root sits on the left and its nested calls fan
+    /// out rightward, depth = column, so reading left→right follows the call
+    /// chain and top→bottom (within a parent) follows call order. A frozen time
+    /// gutter on the left marks when each band fired; every block also carries
+    /// its own timestamp, signal id, payload type and payload summary.
+    /// </para>
+    /// <para>
+    /// Filtering reuses the shared state: the top legend chips (kind mask) and
+    /// a per-signal chip strip identical to the List view's. Clicking a block
+    /// selects that exact invocation and fills the shared detail panel.
+    /// </para>
+    /// </summary>
+    public sealed partial class SignalTimelinePage
+    {
+        // -- Layout constants --------------------------------------------------
+
+        private const float GNodeW    = 230f; // block width
+        private const float GNodeH    = 64f;  // block height
+        private const float GColGap   = 56f;  // gap between depth columns (room for connectors)
+        private const float GRowGap   = 16f;  // gap between sibling rows within a band
+        private const float GBandGap  = 26f;  // vertical gap between bands (divider sits in it)
+        private const float GMargin   = 18f;  // padding inside the canvas
+        private const float GGutterW  = 96f;  // frozen left time-gutter width
+
+        // Connector colours: painter2D не читает USS-переменные, поэтому цвета
+        // берём из активной палитры через Context.Theme прямо в момент отрисовки
+        // — так смена палитры перекрашивает и рёбра графа. Роли: forward =
+        // accent, cycle/re-entry = warning, error = error, divider = divider.
+        private Color GEdgeFwd    => Context.Theme.Get(NexusToken.Accent);
+        private Color GEdgeBack   => Context.Theme.Get(NexusToken.Warning);
+        private Color GEdgeError  => Context.Theme.Get(NexusToken.Error);
+        private Color GDividerCol => Context.Theme.Get(NexusToken.Divider);
+
+        // -- UI --------------------------------------------------------------
+
+        private VisualElement _graphSection;
+        private VisualElement _graphFilterChips;  // per-signal filter strip (own copy, List-style)
+        private ScrollView    _graphScroll;
+        private VisualElement _graphCanvas;        // sized to fit the laid-out forest
+        private VisualElement _graphEdgeLayer;     // painter2D: connectors + dividers (behind blocks)
+        private VisualElement _graphNodeLayer;     // blocks (clickable, in front)
+        private VisualElement _graphGutter;        // frozen on the left, scrolls only vertically
+        private VisualElement _graphGutterInner;   // transformed to follow vertical scroll
+        private VisualElement _graphEmpty;         // placeholder when nothing matches
+
+        // -- Graph model (rebuilt each refresh) ------------------------------
+
+        /// <summary>One invocation = one block.</summary>
+        private sealed class GInv
+        {
+            public SignalTrackData Track;
+            public TimelineEvent   Ev;          // the Invoked event itself
+            public readonly List<GInv> Children = new();
+
+            public int   Depth;                 // column within its band
+            public float X, Y;                  // canvas-space top-left
+            public float SubtreeTop, SubtreeBot;// vertical extent of the subtree (for centering)
+            public bool  IsBack;                // its edge to the parent closes a cycle
+        }
+
+        /// <summary>One band = one root invocation + everything it caused.</summary>
+        private sealed class GBand
+        {
+            public GInv  Root;
+            public float Top, Height;           // canvas-space band bounds
+        }
+
+        private List<GBand> _gBands;
+        // Invoke sequence → its node, rebuilt each refresh (parent resolution).
+        private Dictionary<int, GInv> _gBySeq = new();
+        // trackId → its currently-built blocks (for selection highlight refresh).
+        private readonly List<(int trackId, int seq, VisualElement el)> _gBlocks = new();
+        private float _graphWidth, _graphHeight;
+        private int   _gMaxDepth;
+
+        // -- Build -----------------------------------------------------------
+
+        /// <summary>
+        /// Builds the Graph section. Mirrors <see cref="BuildListSection"/>:
+        /// lives next to the timeline/list sections under _contentRoot, toggled
+        /// by <see cref="ApplyViewMode"/>, starts hidden.
+        /// </summary>
+        private void BuildGraphSection()
+        {
+            _graphSection = new VisualElement();
+            _graphSection.AddToClassList("stp-graph-section");
+            _graphSection.style.flexGrow      = 1;
+            _graphSection.style.flexShrink    = 1;
+            _graphSection.style.flexBasis     = 0;
+            _graphSection.style.minHeight     = 0;
+            _graphSection.style.flexDirection = FlexDirection.Column;
+            _graphSection.style.display       = DisplayStyle.None;
+
+            // ---- Hint line. ----
+            var hintBar = new VisualElement();
+            hintBar.AddToClassList("stp-list-controls");
+            var hint = new Label(
+                "Call graph — one block per invocation. Each band (between dividers) is one root " +
+                "call; nested calls fan out to the right in call order. Time runs down the left " +
+                "gutter. Click a block for its detail. Orange = cycle / re-entry.");
+            hint.AddToClassList("stp-graph-hint");
+            hintBar.Add(hint);
+            _graphSection.Add(hintBar);
+
+            // ---- Per-signal filter strip (List-style; shares filter state). ----
+            var filterRow = new VisualElement();
+            filterRow.AddToClassList("stp-list-controls");
+            var filterLabel = new Label("Signals:");
+            filterLabel.AddToClassList("stp-list-cols-label");
+            filterRow.Add(filterLabel);
+            _graphFilterChips = new VisualElement();
+            _graphFilterChips.AddToClassList("stp-list-cols");
+            filterRow.Add(_graphFilterChips);
+            _graphSection.Add(filterRow);
+
+            // ---- Body: frozen gutter + scrollable canvas, side by side. ----
+            var body = new VisualElement();
+            body.AddToClassList("stp-graph-body");
+            body.style.flexGrow      = 1;
+            body.style.flexShrink    = 1;
+            body.style.flexBasis     = 0;
+            body.style.minHeight     = 0;
+            body.style.flexDirection = FlexDirection.Row;
+
+            // Frozen gutter — fixed width, clips its inner content. The inner
+            // element is transformed vertically to follow the scroll offset, so
+            // the gutter scrolls with Y but never moves in X.
+            _graphGutter = new VisualElement();
+            _graphGutter.AddToClassList("stp-graph-gutter");
+            _graphGutter.style.width     = GGutterW;
+            _graphGutter.style.flexShrink = 0;
+            _graphGutter.style.overflow  = Overflow.Hidden;
+            _graphGutterInner = new VisualElement();
+            _graphGutterInner.AddToClassList("stp-graph-gutter-inner");
+            _graphGutterInner.style.position = Position.Absolute;
+            _graphGutterInner.style.left = 0; _graphGutterInner.style.top = 0;
+            _graphGutterInner.style.right = 0;
+            _graphGutter.Add(_graphGutterInner);
+            body.Add(_graphGutter);
+
+            // Scroll holds an absolutely-laid-out canvas (both axes scroll).
+            // Height is sized explicitly via UpdateGraphScrollHeight for the
+            // same reason the list does it (deep flex chain swallows min-height).
+            _graphScroll = new ScrollView(ScrollViewMode.VerticalAndHorizontal);
+            _graphScroll.AddToClassList("stp-graph-scroll");
+            _graphScroll.style.flexGrow   = 1;
+            _graphScroll.style.flexShrink = 1;
+            _graphScroll.style.minHeight  = 0;
+            _graphScroll.horizontalScrollerVisibility = ScrollerVisibility.Auto;
+            _graphScroll.verticalScrollerVisibility   = ScrollerVisibility.Auto;
+            // Keep the gutter's vertical position locked to the scroll offset.
+            _graphScroll.verticalScroller.valueChanged += SyncGraphGutter;
+
+            _graphCanvas = new VisualElement();
+            _graphCanvas.AddToClassList("stp-graph-canvas");
+            _graphCanvas.style.position = Position.Relative;
+
+            _graphEdgeLayer = new VisualElement();
+            _graphEdgeLayer.AddToClassList("stp-graph-edges");
+            _graphEdgeLayer.style.position = Position.Absolute;
+            _graphEdgeLayer.style.left = 0; _graphEdgeLayer.style.top = 0;
+            _graphEdgeLayer.style.right = 0; _graphEdgeLayer.style.bottom = 0;
+            _graphEdgeLayer.pickingMode = PickingMode.Ignore;
+            _graphEdgeLayer.generateVisualContent += DrawGraphEdges;
+            _graphCanvas.Add(_graphEdgeLayer);
+
+            _graphNodeLayer = new VisualElement();
+            _graphNodeLayer.AddToClassList("stp-graph-nodes");
+            _graphNodeLayer.style.position = Position.Absolute;
+            _graphNodeLayer.style.left = 0; _graphNodeLayer.style.top = 0;
+            _graphNodeLayer.style.right = 0; _graphNodeLayer.style.bottom = 0;
+            _graphNodeLayer.pickingMode = PickingMode.Ignore; // children still pick
+            _graphCanvas.Add(_graphNodeLayer);
+
+            _graphScroll.Add(_graphCanvas);
+            body.Add(_graphScroll);
+
+            _graphSection.Add(body);
+
+            // ---- Empty-state placeholder. ----
+            _graphEmpty = new VisualElement();
+            _graphEmpty.AddToClassList("stp-graph-empty");
+            var l1 = new Label("No invocations to graph.");
+            l1.AddToClassList("stp-tracking-off-title");
+            var l2 = new Label("Invoke a signal (and have one signal's handler invoke another) " +
+                               "to see the call tree build up. Check the kind/signal filters too.");
+            l2.AddToClassList("stp-tracking-off-sub");
+            _graphEmpty.Add(l1);
+            _graphEmpty.Add(l2);
+            _graphEmpty.style.display = DisplayStyle.None;
+            _graphSection.Add(_graphEmpty);
+
+            _graphSection.RegisterCallback<GeometryChangedEvent>(_ => UpdateGraphScrollHeight());
+
+            _root.Add(_graphSection);
+        }
+
+        private void SyncGraphGutter(float verticalOffset)
+        {
+            if (_graphGutterInner == null) return;
+            _graphGutterInner.style.translate = new Translate(0f, -verticalOffset);
+        }
+
+        /// <summary>Twin of <see cref="UpdateListScrollHeight"/> for the body row.</summary>
+        private void UpdateGraphScrollHeight()
+        {
+            if (_graphSection == null || _graphScroll == null) return;
+            // The body (gutter+scroll) is the flex child that should fill the
+            // section; UI Toolkit's nested-flex min-height fragility means we
+            // size the scroll's height explicitly from the section height.
+            float sectionH = _graphSection.resolvedStyle.height;
+            if (sectionH <= 0f) return;
+
+            float usedH = 0f;
+            int n = _graphSection.childCount;
+            for (int i = 0; i < n; i++)
+            {
+                var child = _graphSection[i];
+                if (child.resolvedStyle.display == DisplayStyle.None) continue;
+                // The body row is the scroll's parent; everything else (hint,
+                // filter strip) is fixed-height chrome above it.
+                if (child.ClassListContains("stp-graph-body")) continue;
+                usedH += child.resolvedStyle.height
+                       + child.resolvedStyle.marginTop
+                       + child.resolvedStyle.marginBottom;
+            }
+
+            float available = Mathf.Max(40f, sectionH - usedH);
+            if (Mathf.Abs(_graphScroll.resolvedStyle.height - available) > 0.5f)
+            {
+                _graphScroll.style.height = available;
+                _graphGutter.style.height = available;
+            }
+        }
+
+        // -- Rebuild ---------------------------------------------------------
+
+        /// <summary>Graph data path, called from <see cref="Rebuild"/>.</summary>
+        private void RebuildGraph(SignalTimelineModel m)
+        {
+            RebuildGraphFilterChips();
+            BuildGraphForest(m);
+
+            bool empty = _gBands.Count == 0;
+            _graphEmpty.style.display = empty ? DisplayStyle.Flex : DisplayStyle.None;
+            if (_graphScroll.parent != null)
+                _graphScroll.parent.style.display = empty ? DisplayStyle.None : DisplayStyle.Flex;
+
+            if (!empty)
+            {
+                LayoutGraphForest();
+
+                _graphCanvas.style.width      = _graphWidth;
+                _graphCanvas.style.height     = _graphHeight;
+                _graphGutterInner.style.height = _graphHeight;
+
+                _graphNodeLayer.Clear();
+                _graphGutterInner.Clear();
+                _gBlocks.Clear();
+
+                for (int i = 0; i < _gBands.Count; i++)
+                {
+                    BuildGutterTick(_gBands[i]);
+                    AddBlocksRecursive(_gBands[i].Root);
+                }
+
+                _graphEdgeLayer.MarkDirtyRepaint();
+                UpdateGraphScrollHeight();
+                SyncGraphGutter(_graphScroll.verticalScroller.value);
+            }
+
+            // Summary strip.
+            int alive = 0;
+            for (int i = 0; i < m.Tracks.Count; i++) if (m.Tracks[i].IsAlive) alive++;
+            int blocks = _gBlocks.Count;
+            int cyclic = 0;
+            for (int i = 0; i < _gBands.Count; i++) cyclic += CountCyclic(_gBands[i].Root);
+
+            _summary.text =
+                $"Signals: {m.Tracks.Count} (alive {alive})    " +
+                $"Roots: {_gBands.Count}    " +
+                $"Invocations shown: {blocks}" + (cyclic > 0 ? $"  ({cyclic} cyclic)" : "");
+        }
+
+        private static int CountCyclic(GInv n)
+        {
+            int c = n.IsBack ? 1 : 0;
+            for (int i = 0; i < n.Children.Count; i++) c += CountCyclic(n.Children[i]);
+            return c;
+        }
+
+        /// <summary>
+        /// Builds the invocation forest from recorded events, honouring the
+        /// kind mask and per-signal filter (same predicates the List view uses).
+        /// Only Invoked events are blocks; an edge follows ParentSequence.
+        /// </summary>
+        private void BuildGraphForest(SignalTimelineModel m)
+        {
+            _gBands  = new List<GBand>();
+            _gBySeq  = new Dictionary<int, GInv>();
+
+            bool invokesVisible = IsKindEnabled(SignalEventKind.Invoked);
+
+            // 1) Materialise every visible invocation as a node.
+            for (int ti = 0; ti < m.Tracks.Count; ti++)
+            {
+                var tr = m.Tracks[ti];
+                if (!IsTrackEnabledForList(tr.Id)) continue;
+                for (int ei = 0; ei < tr.Events.Count; ei++)
+                {
+                    var ev = tr.Events[ei];
+                    if (ev.Kind != (int)SignalEventKind.Invoked) continue;
+                    if (!invokesVisible) continue;
+                    _gBySeq[ev.Sequence] = new GInv { Track = tr, Ev = ev };
+                }
+            }
+
+            if (_gBySeq.Count == 0) return;
+
+            // 2) Wire children to parents. A node whose parent is missing
+            //    (root invoke, or parent filtered/trimmed away) becomes a root.
+            var roots = new List<GInv>();
+            foreach (var kv in _gBySeq)
+            {
+                var node = kv.Value;
+                int parentSeq = node.Ev.ParentSequence;
+                if (parentSeq > 0 && _gBySeq.TryGetValue(parentSeq, out var parent))
+                    parent.Children.Add(node);
+                else
+                    roots.Add(node);
+            }
+
+            // 3) Deterministic order: roots by sequence (= time), children too.
+            roots.Sort((a, b) => a.Ev.Sequence.CompareTo(b.Ev.Sequence));
+            foreach (var kv in _gBySeq)
+                kv.Value.Children.Sort((a, b) => a.Ev.Sequence.CompareTo(b.Ev.Sequence));
+
+            // 4) Mark cycle edges (a child reachable as its own ancestor) and
+            //    assign depth. Guards against runaway re-entry trees too.
+            for (int i = 0; i < roots.Count; i++)
+            {
+                var onPath = new HashSet<int>();
+                MarkDepthAndCycles(roots[i], 0, onPath);
+                _gBands.Add(new GBand { Root = roots[i] });
+            }
+        }
+
+        private static void MarkDepthAndCycles(GInv node, int depth, HashSet<int> onPath)
+        {
+            node.Depth = depth;
+            onPath.Add(node.Ev.Sequence);
+            for (int i = node.Children.Count - 1; i >= 0; i--)
+            {
+                var c = node.Children[i];
+                if (onPath.Contains(c.Ev.Sequence))
+                {
+                    // Shouldn't happen with sequence-based parenting (parents
+                    // always precede children), but guard anyway: drop the back
+                    // edge from the tree and flag it.
+                    c.IsBack = true;
+                    node.Children.RemoveAt(i);
+                    continue;
+                }
+                MarkDepthAndCycles(c, depth + 1, onPath);
+            }
+            onPath.Remove(node.Ev.Sequence);
+        }
+
+        // -- Layout (tidy tree per band, bands stacked) ----------------------
+
+        private void LayoutGraphForest()
+        {
+            _gMaxDepth = 0;
+            float cursorY = GMargin;
+            float maxRight = 0f;
+
+            for (int i = 0; i < _gBands.Count; i++)
+            {
+                var band = _gBands[i];
+                band.Top = cursorY;
+
+                // First pass: assign each leaf a row, each parent the midpoint
+                // of its children (classic tidy layout). _rowCursor walks down.
+                _rowCursor = cursorY;
+                AssignTree(band.Root);
+
+                band.Height = (_rowCursor - cursorY); // total vertical span used
+                if (band.Height < GNodeH) band.Height = GNodeH;
+
+                // Track widest column for canvas width.
+                float bandRight = DeepestRight(band.Root, 0f);
+                if (bandRight > maxRight) maxRight = bandRight;
+
+                cursorY = band.Top + band.Height + GBandGap;
+            }
+
+            _graphHeight = cursorY + GMargin;
+            _graphWidth  = Mathf.Max(maxRight + GMargin, 320f);
+        }
+
+        private float _rowCursor; // running Y while assigning leaf rows
+
+        private void AssignTree(GInv node)
+        {
+            node.X = GMargin + node.Depth * (GNodeW + GColGap);
+            if (node.Depth > _gMaxDepth) _gMaxDepth = node.Depth;
+
+            if (node.Children.Count == 0)
+            {
+                node.Y = _rowCursor;
+                _rowCursor += GNodeH + GRowGap;
+                node.SubtreeTop = node.Y;
+                node.SubtreeBot = node.Y + GNodeH;
+                return;
+            }
+
+            float top = float.MaxValue, bot = float.MinValue;
+            for (int i = 0; i < node.Children.Count; i++)
+            {
+                AssignTree(node.Children[i]);
+                top = Mathf.Min(top, node.Children[i].SubtreeTop);
+                bot = Mathf.Max(bot, node.Children[i].SubtreeBot);
+            }
+            // Centre the parent vertically against the span of its children.
+            node.Y = (top + bot) * 0.5f - GNodeH * 0.5f;
+            node.SubtreeTop = Mathf.Min(top, node.Y);
+            node.SubtreeBot = Mathf.Max(bot, node.Y + GNodeH);
+        }
+
+        private static float DeepestRight(GInv node, float acc)
+        {
+            float right = node.X + GNodeW;
+            if (right > acc) acc = right;
+            for (int i = 0; i < node.Children.Count; i++)
+                acc = DeepestRight(node.Children[i], acc);
+            return acc;
+        }
+
+        // -- Block / gutter builders -----------------------------------------
+
+        private void AddBlocksRecursive(GInv node)
+        {
+            _graphNodeLayer.Add(BuildInvBlock(node));
+            for (int i = 0; i < node.Children.Count; i++)
+                AddBlocksRecursive(node.Children[i]);
+        }
+
+        private VisualElement BuildInvBlock(GInv node)
+        {
+            var tr = node.Track;
+            var e  = node.Ev;
+            bool errored = e.Errors != null && e.Errors.Count > 0;
+            bool unheard = e.SubscriberCountAtMoment == 0;
+            bool isRoot  = e.ParentSequence <= 0;
+
+            var box = new VisualElement();
+            box.AddToClassList("stp-ginv");
+            if (errored) box.AddToClassList("stp-ginv--errored");
+            if (unheard) box.AddToClassList("stp-ginv--unheard");
+            if (isRoot)  box.AddToClassList("stp-ginv--root");
+            if (tr.Id == _selectedTrackId && e.Sequence == _selectedSequence)
+                box.AddToClassList("stp-ginv--selected");
+
+            box.style.position = Position.Absolute;
+            box.style.left   = node.X;
+            box.style.top    = node.Y;
+            box.style.width  = GNodeW;
+            box.style.height = GNodeH;
+
+            // Row 1: signal id/name (left) + timestamp (right).
+            var head = new VisualElement();
+            head.AddToClassList("stp-ginv-head");
+            var sig = new Label($"#{tr.Id} {tr.Name}");
+            sig.AddToClassList("stp-ginv-sig");
+            head.Add(sig);
+            var time = new Label($"{e.Time - TimelineOrigin(SignalRegistry.Model):F2}s");
+            time.AddToClassList("stp-ginv-time");
+            head.Add(time);
+            box.Add(head);
+
+            // Row 2: payload type + subscriber count.
+            var meta = new Label(
+                (string.IsNullOrEmpty(e.PayloadType) ? "Invoked" : $"<{e.PayloadType}>") +
+                (unheard ? "   ·  unheard" : $"   ·  {e.SubscriberCountAtMoment} subs") +
+                (errored ? $"   ·  ⚠ {e.Errors.Count}" : ""));
+            meta.AddToClassList("stp-ginv-meta");
+            box.Add(meta);
+
+            // Row 3: payload summary.
+            var payload = new Label(string.IsNullOrEmpty(e.PayloadSummary) ? "(empty)" : e.PayloadSummary);
+            payload.AddToClassList("stp-ginv-payload");
+            box.Add(payload);
+
+            if (errored)
+            {
+                var badge = new VisualElement();
+                badge.AddToClassList("stp-error-badge");
+                badge.style.position = Position.Absolute;
+                badge.style.top = 6; badge.style.right = 6;
+                box.Add(badge);
+            }
+
+            box.tooltip =
+                $"#{tr.Id} {tr.Name}  ·  Invoked\n" +
+                (string.IsNullOrEmpty(e.PayloadType) ? "" : $"<{e.PayloadType}>\n") +
+                (string.IsNullOrEmpty(e.PayloadSummary) ? "" : $"payload: {e.PayloadSummary}\n") +
+                $"t = {e.Time - TimelineOrigin(SignalRegistry.Model):F3}s\n" +
+                (isRoot ? "root invoke (from non-signal code)\n" : $"called by seq #{e.ParentSequence}\n") +
+                (string.IsNullOrEmpty(e.FilePath) ? "" : $"{e.MemberName} @ {System.IO.Path.GetFileName(e.FilePath)}:{e.LineNumber}\n") +
+                "click → detail";
+
+            var capTr = tr; var capEv = e;
+            box.RegisterCallback<ClickEvent>(_ =>
+            {
+                _selectedTrackId  = capTr.Id;
+                _selectedSequence = capEv.Sequence;
+                UpdateSelectionInfo(capTr, capEv);
+                RefreshGraphSelection();
+            });
+
+            _gBlocks.Add((tr.Id, e.Sequence, box));
+            return box;
+        }
+
+        private void BuildGutterTick(GBand band)
+        {
+            var e = band.Root.Ev;
+
+            var tick = new VisualElement();
+            tick.AddToClassList("stp-graph-gutter-tick");
+            tick.style.position = Position.Absolute;
+            tick.style.left = 0; tick.style.right = 0;
+            tick.style.top  = band.Top;
+            tick.style.height = band.Height;
+
+            var t = new Label($"{e.Time - TimelineOrigin(SignalRegistry.Model):F2}s");
+            t.AddToClassList("stp-graph-gutter-time");
+            tick.Add(t);
+
+            var seq = new Label($"#{band.Root.Track.Id} {band.Root.Track.Name}");
+            seq.AddToClassList("stp-graph-gutter-sub");
+            tick.Add(seq);
+
+            _graphGutterInner.Add(tick);
+        }
+
+        // -- Filtering (shares list state) -----------------------------------
+
+        /// <summary>
+        /// Per-signal chip strip — same look and shared state as the List
+        /// view's. Clicking routes through the existing OnSignalChipClicked /
+        /// OnAllChipClicked handlers, so the two views stay in lock-step.
+        /// </summary>
+        private void RebuildGraphFilterChips()
+        {
+            if (_graphFilterChips == null) return;
+            _graphFilterChips.Clear();
+
+            var model = SignalRegistry.Model;
+
+            var allChip = new VisualElement();
+            allChip.AddToClassList("stp-list-col-chip");
+            allChip.AddToClassList("stp-list-filter-chip--all");
+            var allText = new Label("All");
+            allText.AddToClassList("stp-list-col-chip-text");
+            allChip.Add(allText);
+            allChip.EnableInClassList("stp-list-col-chip--off", !_listAllSignalsEnabled);
+            allChip.RegisterCallback<ClickEvent>(_ => OnAllChipClicked());
+            _graphFilterChips.Add(allChip);
+
+            if (model.Tracks.Count == 0)
+            {
+                var empty = new Label("(no signals recorded)");
+                empty.AddToClassList("stp-list-cols-label");
+                empty.style.opacity = 0.6f;
+                _graphFilterChips.Add(empty);
+                return;
+            }
+
+            foreach (var tr in model.Tracks)
+            {
+                int idCap = tr.Id;
+                bool on   = IsTrackEnabledForList(tr.Id);
+
+                var chip = new VisualElement();
+                chip.AddToClassList("stp-list-col-chip");
+                var text = new Label($"#{tr.Id} {tr.Name}");
+                text.AddToClassList("stp-list-col-chip-text");
+                chip.Add(text);
+                chip.EnableInClassList("stp-list-col-chip--off", !on);
+                chip.tooltip = string.IsNullOrEmpty(tr.CreatedFile)
+                    ? text.text
+                    : $"{tr.CreatedFile}:{tr.CreatedLine}";
+                chip.RegisterCallback<ClickEvent>(_ => OnSignalChipClicked(idCap));
+                _graphFilterChips.Add(chip);
+            }
+        }
+
+        // -- Selection highlight ---------------------------------------------
+
+        private void RefreshGraphSelection()
+        {
+            for (int i = 0; i < _gBlocks.Count; i++)
+            {
+                bool sel = _gBlocks[i].trackId == _selectedTrackId &&
+                           _gBlocks[i].seq     == _selectedSequence;
+                _gBlocks[i].el.EnableInClassList("stp-ginv--selected", sel);
+            }
+        }
+
+        // -- Connectors + dividers (painter2D) -------------------------------
+
+        private void DrawGraphEdges(MeshGenerationContext ctx)
+        {
+            if (_gBands == null) return;
+            var p = ctx.painter2D;
+
+            // Divider lines between bands (drawn first, behind connectors).
+            p.strokeColor = GDividerCol;
+            p.lineWidth   = 1f;
+            for (int i = 1; i < _gBands.Count; i++)
+            {
+                float y = _gBands[i].Top - GBandGap * 0.5f;
+                p.BeginPath();
+                p.MoveTo(new Vector2(0f, y));
+                p.LineTo(new Vector2(_graphWidth, y));
+                p.Stroke();
+            }
+
+            // Parent → child connectors.
+            for (int i = 0; i < _gBands.Count; i++)
+                DrawConnectors(p, _gBands[i].Root);
+        }
+
+        private void DrawConnectors(Painter2D p, GInv node)
+        {
+            for (int i = 0; i < node.Children.Count; i++)
+            {
+                var c = node.Children[i];
+
+                Vector2 a = new Vector2(node.X + GNodeW, node.Y + GNodeH * 0.5f);
+                Vector2 b = new Vector2(c.X,             c.Y   + GNodeH * 0.5f);
+                float dx = Mathf.Max(22f, (b.x - a.x) * 0.5f);
+                Vector2 c1 = new Vector2(a.x + dx, a.y);
+                Vector2 c2 = new Vector2(b.x - dx, b.y);
+
+                Color col = (c.Ev.Errors != null && c.Ev.Errors.Count > 0)
+                    ? GEdgeError
+                    : (c.IsBack ? GEdgeBack : GEdgeFwd);
+
+                p.strokeColor = col;
+                p.lineWidth   = 2f;
+                p.BeginPath();
+                p.MoveTo(a);
+                p.BezierCurveTo(c1, c2, b);
+                p.Stroke();
+                DrawArrowHead(p, b, (b - c2).normalized, col);
+
+                DrawConnectors(p, c);
+            }
+        }
+
+        private static void DrawArrowHead(Painter2D p, Vector2 tip, Vector2 dir, Color col)
+        {
+            if (dir.sqrMagnitude < 1e-4f) dir = Vector2.right;
+            const float size = 8f;
+            Vector2 back = tip - dir * size;
+            Vector2 perp = new Vector2(-dir.y, dir.x) * (size * 0.5f);
+            p.fillColor = col;
+            p.BeginPath();
+            p.MoveTo(tip);
+            p.LineTo(back + perp);
+            p.LineTo(back - perp);
+            p.ClosePath();
+            p.Fill();
+        }
+    }
+}

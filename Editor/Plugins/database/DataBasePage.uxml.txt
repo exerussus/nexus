@@ -1,0 +1,78 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements">
+    <ui:ScrollView class="db-page">
+
+        <!-- Existing DB list toolbar -->
+        <ui:VisualElement class="db-toolbar">
+            <ui:Button name="init-all"     text="Initialize All" class="db-toolbar-button" />
+            <ui:Button name="collect-all"  text="Collect All"    class="db-toolbar-button" />
+            <ui:Button name="reinitialize" text="Reinitialize"   class="db-toolbar-button" />
+            <ui:VisualElement class="db-spacer" />
+            <ui:Label name="summary" class="db-summary" />
+        </ui:VisualElement>
+
+        <ui:VisualElement class="db-search-row">
+            <ui:TextField name="search-field" label="Filter" class="db-search" />
+        </ui:VisualElement>
+
+        <ui:ListView name="db-list" class="db-list" />
+
+        <!-- External slot -->
+        <ui:VisualElement class="db-external">
+            <ui:Label text="External Target" class="db-external-title" />
+            <uie:ObjectField name="external-slot" label="Drop ScriptableObject" />
+            <ui:VisualElement class="db-external-buttons">
+                <ui:Button name="external-ping"    text="Ping" />
+                <ui:Button name="external-init"    text="Initialize" />
+                <ui:Button name="external-collect" text="Collect" />
+            </ui:VisualElement>
+            <ui:Label class="db-external-help"
+                      text="Drop any ScriptableObject implementing IInitializable / ICollector." />
+        </ui:VisualElement>
+
+        <!-- ============================ -->
+        <!-- Auto-Generation section      -->
+        <!-- ============================ -->
+        <ui:Foldout text="Auto-Generation" class="autogen-foldout" value="true">
+
+            <!-- Project config (committed to git) -->
+            <ui:VisualElement class="autogen-config-row">
+                <ui:VisualElement class="autogen-config-info">
+                    <ui:Label text="Project config (git)" class="autogen-config-label" />
+                    <ui:Label name="autogen-config-path" class="autogen-config-path" />
+                </ui:VisualElement>
+                <ui:VisualElement class="db-spacer" />
+                <ui:Button name="autogen-reveal-config" text="Show" class="autogen-config-button" />
+                <ui:Button name="autogen-create-config" text="Create" class="autogen-config-button" />
+            </ui:VisualElement>
+
+            <ui:VisualElement name="autogen-body" class="autogen-body">
+
+                <ui:VisualElement class="autogen-toggles">
+                    <ui:Toggle name="toggle-auto-register"     label="Auto-register on regenerate"  />
+                    <ui:Toggle name="toggle-auto-create"       label="Auto-create missing assets"   />
+                    <ui:Toggle name="toggle-rescan-on-focus"   label="Re-scan on focus"             />
+                    <ui:Toggle name="toggle-full-auto"         label="Full auto mode"               />
+                    <ui:Toggle name="toggle-log"               label="Log actions"                  />
+                    <ui:Toggle name="toggle-warn-no-attr"      label="Warn on missing [DataBase]"   />
+                </ui:VisualElement>
+
+                <ui:VisualElement class="autogen-action-row">
+                    <ui:Button name="autogen-scan"          text="Scan now" />
+                    <ui:Button name="autogen-regenerate"    text="Regenerate code" />
+                    <ui:Button name="autogen-create-assets" text="Create missing assets" />
+                </ui:VisualElement>
+
+                <ui:Label name="autogen-summary" class="autogen-summary" />
+
+                <ui:Label text="Ready to register" class="autogen-list-title" />
+                <ui:ListView name="ready-list" class="autogen-list" />
+
+                <ui:Label text="Missing asset" class="autogen-list-title" />
+                <ui:ListView name="missing-list" class="autogen-list" />
+
+            </ui:VisualElement>
+
+        </ui:Foldout>
+
+    </ui:ScrollView>
+</ui:UXML>

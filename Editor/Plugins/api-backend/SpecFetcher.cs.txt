@@ -1,0 +1,118 @@
+using System;
+using System.IO;
+using System.Net.Http;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Достаёт спеку ПРОФИЛЯ из URL или файла и сразу делает health-check.
+    /// Профиль самодостаточен (таймаут — его параметр), конфиг не нужен.
+    /// Это editor-код (десктопный .NET), поэтому HttpClient тут законен —
+    /// запрет HttpClient касался только WebGL-сборки рантайма.
+    ///
+    /// Запрос синхронный с таймаутом: так удобнее и для CI (batchmode),
+    /// и для кнопки в UI. Тяжёлой асинхронщины тут не нужно.
+    /// </summary>
+    public static class SpecFetcher
+    {
+        public sealed class Result
+        {
+            public bool Ok;                 // удалось получить валидный JSON-текст
+            public string RawJson;          // тело спеки
+            public int HttpStatus;          // 0 для файла
+            public string ContentType;      // только для URL
+            public string OpenApiVersion;   // из поля "openapi"/"swagger", если распознали
+            public string Error;            // человекочитаемая причина провала
+            public string Diagnosis;        // подсказка, если что-то подозрительно (HTML вместо JSON и т.п.)
+        }
+
+        public static Result Fetch(ApiCodegenProfile profile)
+        {
+            return profile.SpecSource == ApiCodegenConfig.SpecSourceKind.Url
+                ? FetchUrl(profile.SpecUrl, profile.HttpTimeoutSeconds)
+                : FetchFile(profile.ResolveSpecInput());
+        }
+
+        private static Result FetchFile(string absPath)
+        {
+            var r = new Result();
+            if (!File.Exists(absPath))
+            {
+                r.Error = $"Файл спеки не найден: {absPath}";
+                return r;
+            }
+            r.RawJson = File.ReadAllText(absPath);
+            Inspect(r);
+            return r;
+        }
+
+        private static Result FetchUrl(string url, int timeoutSeconds)
+        {
+            var r = new Result();
+            try
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+                // .GetAwaiter().GetResult() — осознанная синхронная блокировка с таймаутом.
+                var resp = http.GetAsync(url).GetAwaiter().GetResult();
+                r.HttpStatus = (int)resp.StatusCode;
+                r.ContentType = resp.Content.Headers.ContentType?.MediaType;
+                r.RawJson = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    r.Error = $"Сервер ответил {r.HttpStatus} на {url}";
+                    // Частая засада: редирект на логин → HTML вместо спеки.
+                    if (LooksLikeHtml(r.RawJson))
+                        r.Diagnosis = "Тело похоже на HTML — вероятно, редирект на страницу логина/ошибки, а не спека.";
+                    return r;
+                }
+
+                Inspect(r);
+            }
+            catch (Exception e)
+            {
+                r.Error = $"Сеть/таймаут при запросе {url}: {e.Message}";
+            }
+            return r;
+        }
+
+        /// <summary>Проверяет, что это вообще похоже на OpenAPI-JSON, и достаёт версию.</summary>
+        private static void Inspect(Result r)
+        {
+            if (string.IsNullOrWhiteSpace(r.RawJson))
+            {
+                r.Error = "Пустое тело спеки.";
+                return;
+            }
+            if (LooksLikeHtml(r.RawJson))
+            {
+                r.Error = "Получен HTML, а не JSON.";
+                r.Diagnosis = "Похоже на login/ошибку-страницу. Проверь URL и авторизацию.";
+                return;
+            }
+
+            try
+            {
+                var root = Newtonsoft.Json.Linq.JObject.Parse(r.RawJson);
+                r.OpenApiVersion = (string)root["openapi"] ?? (string)root["swagger"];
+                if (string.IsNullOrEmpty(r.OpenApiVersion))
+                    r.Diagnosis = "В корне нет поля openapi/swagger — это точно OpenAPI-спека?";
+                if (root["paths"] == null)
+                    r.Diagnosis = (r.Diagnosis + " В спеке нет секции paths.").Trim();
+
+                r.Ok = true;
+            }
+            catch (Exception e)
+            {
+                r.Error = $"Тело не парсится как JSON: {e.Message}";
+            }
+        }
+
+        private static bool LooksLikeHtml(string s)
+        {
+            var t = s.TrimStart();
+            return t.StartsWith("<!doctype", StringComparison.OrdinalIgnoreCase)
+                   || t.StartsWith("<html", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+}

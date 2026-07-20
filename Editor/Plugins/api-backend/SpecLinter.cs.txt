@@ -1,0 +1,116 @@
+using System.Collections.Generic;
+using Newtonsoft.Json.Linq;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Прогоняет спеку и подсвечивает места, из-за которых выхлоп генератора
+    /// будет бесполезным (garbage in → garbage out) — ДО запуска генерации.
+    /// </summary>
+    public static class SpecLinter
+    {
+        public enum Severity { Info, Warning }
+
+        public sealed class Finding
+        {
+            public Severity Level;
+            public string Where;   // путь/имя схемы
+            public string Message;
+        }
+
+        public static List<Finding> Lint(string rawJson)
+        {
+            var findings = new List<Finding>();
+            JObject root;
+            try { root = JObject.Parse(rawJson); }
+            catch { return findings; } // парс-ошибку ловит фетчер, тут молча выходим
+
+            LintSchemas(root, findings);
+            LintOperations(root, findings);
+            return findings;
+        }
+
+        private static void LintSchemas(JObject root, List<Finding> findings)
+        {
+            var schemas = root["components"]?["schemas"] as JObject;
+            if (schemas == null) return;
+
+            foreach (var prop in schemas.Properties())
+            {
+                if (prop.Value is not JObject schema) continue;
+
+                var type = (string)schema["type"];
+                var hasProps = schema["properties"] is JObject p && p.Count > 0;
+                var hasComposition = schema["allOf"] != null || schema["oneOf"] != null ||
+                                     schema["anyOf"] != null || schema["$ref"] != null ||
+                                     schema["enum"] != null;
+
+                // type: object без полей и без композиции → генератор выдаст пустой класс.
+                if (type == "object" && !hasProps && !hasComposition)
+                {
+                    findings.Add(new Finding
+                    {
+                        Level = Severity.Warning,
+                        Where = $"components.schemas.{prop.Name}",
+                        Message = "Объект без properties — сгенерится пустой класс. Уточни схему на бэке."
+                    });
+                }
+            }
+        }
+
+        private static void LintOperations(JObject root, List<Finding> findings)
+        {
+            var paths = root["paths"] as JObject;
+            if (paths == null) return;
+
+            var httpMethods = new[] { "get", "post", "put", "delete", "patch", "head", "options" };
+
+            foreach (var pathProp in paths.Properties())
+            {
+                if (pathProp.Value is not JObject pathItem) continue;
+
+                foreach (var method in httpMethods)
+                {
+                    if (pathItem[method] is not JObject op) continue;
+                    var where = $"{method.ToUpperInvariant()} {pathProp.Name}";
+
+                    // Нет operationId → имя сгенеренного метода будет уродливым и нестабильным.
+                    if (string.IsNullOrEmpty((string)op["operationId"]))
+                    {
+                        findings.Add(new Finding
+                        {
+                            Level = Severity.Warning,
+                            Where = where,
+                            Message = "Нет operationId — имя метода будет автогенерным и поедет при изменении пути."
+                        });
+                    }
+
+                    // Успешный ответ без типа → клиент получит нетипизированный результат.
+                    if (!HasTypedSuccessResponse(op))
+                    {
+                        findings.Add(new Finding
+                        {
+                            Level = Severity.Info,
+                            Where = where,
+                            Message = "У 2xx-ответа нет схемы тела — типизированный результат не получится."
+                        });
+                    }
+                }
+            }
+        }
+
+        private static bool HasTypedSuccessResponse(JObject op)
+        {
+            if (op["responses"] is not JObject responses) return false;
+
+            foreach (var resp in responses.Properties())
+            {
+                if (!resp.Name.StartsWith("2")) continue; // 200, 201, 204...
+                if (resp.Name == "204") return true;       // No Content — типизация и не нужна
+                var schema = resp.Value?["content"]?["application/json"]?["schema"];
+                if (schema != null && schema.HasValues) return true;
+            }
+            return false;
+        }
+    }
+}

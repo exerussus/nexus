@@ -1,0 +1,165 @@
+using UnityEditor;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    public sealed partial class ApiBackendPage
+    {
+        private void BuildProfilesTab(VisualElement root)
+        {
+            Hint("Профиль = одна версия API, полностью самодостаточная: спека, обёртка, " +
+                 "свой пакет/asmdef/link.xml и папка Assets/Api/<обёртка>. Настройки " +
+                 "генератора выбранного профиля — на вкладке Config. CI гоняет все профили.", root);
+
+            // Красные варнинги согласованности: дубли имён/обёрток/пакетов.
+            foreach (var w in _config.ValidateProfiles())
+                Line("⚠ " + w, NexusToken.Error, root);
+
+            // ToArray — карточки могут удалять профили из списка по клику.
+            foreach (var p in _config.Profiles.ToArray())
+                BuildProfileCard(root, p);
+
+            ActionButton(NexusRole.Common, "+ Добавить профиль", AddProfile, root);
+
+            ActionButton(NexusRole.Primary, "Сохранить профили", () =>
+            {
+                _config.Save();
+                Context.SetStatus("Профили сохранены.", StatusKind.Ok);
+                SelectTab(Tab.Profiles); // перерисовать варнинги и заголовки карточек
+            }, root);
+        }
+
+        private void BuildProfileCard(VisualElement root, ApiCodegenProfile p)
+        {
+            var isSelected = SelectedProfile == p;
+            var box = Section(isSelected ? $"{p.Name} — выбран" : p.Name, root);
+
+            LabeledText("Название", p.Name, box, v => p.Name = v);
+
+            var src = new EnumField("Источник", p.SpecSource);
+            src.AddToClassList("api-field");
+            src.RegisterValueChangedCallback(e =>
+                p.SpecSource = (ApiCodegenConfig.SpecSourceKind)e.newValue);
+            box.Add(src);
+
+            LabeledText("URL спеки", p.SpecUrl, box, v => p.SpecUrl = v);
+            LabeledText("Файл спеки (от корня проекта)", p.SpecFilePath, box,
+                v => p.SpecFilePath = v);
+
+            var wrapField = LabeledText("Класс-обёртка (пусто → Api)", p.WrapperClass, box,
+                v => p.WrapperClass = v);
+
+            // Куда живёт версия (выводится из обёртки, тут только показываем).
+            Hint($"Папка версии: {p.VersionRootDir} · пакет: {p.ResolvePackageName()}", box);
+
+            // Есть ли база для дрейфа/гардов у этого профиля.
+            var snap = CodegenSnapshot.Load(p.Id);
+            Hint(snap.Exists
+                ? $"Снапшот: {snap.TakenAtUtc}"
+                : "Снапшота нет — дрейф сравнивать не с чем (сгенерируй один раз).", box);
+
+            var selectBtn = ActionButton(NexusRole.Common, "Выбрать", () =>
+            {
+                SetSelectedProfile(p.Id);
+                SelectTab(Tab.Profiles); // перерисовать подсветку «выбран»
+            }, box);
+            selectBtn.SetEnabled(!isSelected);
+
+            ActionButton(NexusRole.Common, "Health-check", () => RunProfileHealthCheck(p), box);
+
+            ActionButton(NexusRole.Common, "Определить обёртку из спеки", () =>
+            {
+                var fetch = SpecFetcher.Fetch(p);
+                if (!fetch.Ok)
+                {
+                    Context.SetStatus($"«{p.Name}»: спека недоступна: {fetch.Error} {fetch.Diagnosis}".Trim(),
+                        StatusKind.Error);
+                    return;
+                }
+                var cls = ApiCodegenConfig.DeriveVersionClass(fetch.RawJson);
+                p.WrapperClass = cls;
+                wrapField.value = cls;
+                Context.SetStatus($"«{p.Name}»: класс-обёртка {cls} (пакет {p.ResolvePackageName()}).",
+                    StatusKind.Ok);
+            }, box);
+
+            var deleteBtn = ActionButton(NexusRole.Alarm, "Удалить профиль", () => DeleteProfile(p), box);
+            deleteBtn.SetEnabled(_config.Profiles.Count > 1); // последний профиль не удаляем
+
+            var health = new Label { name = $"health-{p.Id}" };
+            health.AddToClassList("api-inline-status");
+            health.style.color = Context.Theme.Get(NexusToken.TextDim);
+            box.Add(health);
+        }
+
+        private void RunProfileHealthCheck(ApiCodegenProfile p)
+        {
+            var label = _content.Q<Label>($"health-{p.Id}");
+            var fetch = SpecFetcher.Fetch(p);
+
+            if (fetch.Ok)
+            {
+                label.text = $"OK · openapi={fetch.OpenApiVersion}" +
+                             (string.IsNullOrEmpty(fetch.Diagnosis) ? "" : $" · ⚠ {fetch.Diagnosis}");
+                label.style.color = Context.Theme.Get(NexusToken.TextDim);
+                Context.SetStatus($"«{p.Name}»: спека доступна.", StatusKind.Ok);
+            }
+            else
+            {
+                label.text = $"✗ {fetch.Error} {fetch.Diagnosis}".Trim();
+                label.style.color = Context.Theme.Get(NexusToken.Error);
+                Context.SetStatus($"«{p.Name}»: спека недоступна.", StatusKind.Error);
+            }
+        }
+
+        private void AddProfile()
+        {
+            var p = new ApiCodegenProfile { Name = $"профиль {_config.Profiles.Count + 1}" };
+            _config.Profiles.Add(p);
+            SetSelectedProfile(p.Id);
+            SelectTab(Tab.Profiles);
+            Context.SetStatus("Профиль добавлен — заполни спеку, определи обёртку и нажми " +
+                              "«Сохранить профили».", StatusKind.Info);
+        }
+
+        private void DeleteProfile(ApiCodegenProfile p)
+        {
+            // Версия самодостаточна (Assets/Api/<обёртка>), поэтому можно снести
+            // её файлы вместе с профилем — третья кнопка диалога. Это внешний
+            // футпринт servicing-страницы: убирается только так, явно.
+            var choice = EditorUtility.DisplayDialogComplex(
+                "Удалить профиль",
+                $"Профиль «{p.Name}» и его снапшот будут удалены.\n\n" +
+                $"Папка версии: {p.VersionRootDir}\n" +
+                "Удалить её тоже (Generated + link.xml + asmdef)?",
+                "Профиль и файлы версии",   // 0
+                "Отмена",                   // 1
+                "Только профиль");          // 2
+            if (choice == 1) return;
+
+            if (choice == 0)
+            {
+                if (!VersionDeployer.RemoveVersion(p, out var error))
+                {
+                    Context.SetStatus($"Удаление версии: {error}", StatusKind.Error);
+                    return;
+                }
+                AssetDatabase.Refresh();
+            }
+
+            _config.Profiles.Remove(p);
+            CodegenSnapshot.Clear(p.Id);
+            _config.Save();
+
+            if (_selectedProfileId == p.Id && _config.Profiles.Count > 0)
+                SetSelectedProfile(_config.Profiles[0].Id);
+
+            SelectTab(Tab.Profiles);
+            Context.SetStatus(choice == 0
+                ? $"Профиль «{p.Name}» и папка {p.VersionRootDir} удалены."
+                : $"Профиль «{p.Name}» удалён (файлы версии остались в {p.VersionRootDir}).",
+                StatusKind.Ok);
+        }
+    }
+}

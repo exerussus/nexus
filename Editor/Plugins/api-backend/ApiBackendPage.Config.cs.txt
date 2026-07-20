@@ -1,0 +1,99 @@
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    public sealed partial class ApiBackendPage
+    {
+        private void BuildConfigTab(VisualElement root)
+        {
+            var profile = SelectedProfile;
+            if (profile == null)
+            {
+                Hint("Нет профилей — добавь на вкладке Profiles.", root);
+                return;
+            }
+
+            Hint("Все параметры привязаны к ПРОФИЛЮ (версии API). Здесь — настройки " +
+                 "генератора выбранного профиля; спека и жизненный цикл версий — на " +
+                 "вкладке Profiles.", root);
+
+            // Смена профиля меняет ВСЕ поля таба — проще перестроить его целиком.
+            BuildProfileSelector(root, () => SelectTab(Tab.Config));
+
+            // Предпросмотр создаётся ниже, но колбэки полей должны уметь его обновлять.
+            TextField preview = null;
+            Label derived = null;
+            void Refresh()
+            {
+                if (preview != null) preview.value = profile.BuildCommandLinePreview();
+                if (derived != null) derived.text = DerivedPathsText(profile);
+            }
+
+            // --- Генератор профиля ---
+            var genSection = Section($"Генератор профиля «{profile.Name}»", root);
+            LabeledText("Команда CLI", profile.GeneratorCommand, genSection,
+                v => { profile.GeneratorCommand = v; Refresh(); });
+            LabeledText("Доп. аргументы", profile.GeneratorExtraArgs, genSection,
+                v => { profile.GeneratorExtraArgs = v; Refresh(); });
+            LabeledText("Кастомный шаблон (api.mustache dir)", profile.TemplateDir, genSection,
+                v => { profile.TemplateDir = v; Refresh(); });
+
+            var timeout = new IntegerField("Таймаут спеки, сек") { value = profile.HttpTimeoutSeconds };
+            timeout.AddToClassList("api-field");
+            timeout.RegisterValueChangedCallback(e => profile.HttpTimeoutSeconds = e.newValue);
+            genSection.Add(timeout);
+
+            // --- Пакет и выведенные пути версии ---
+            var pkgSection = Section("Пакет и пути версии", root);
+
+            Hint("packageName версии = namespace кода = имя её asmdef = сборка в её " +
+                 "link.xml. Пусто → выводится из обёртки ЦЕЛИКОМ (ApiV10 → " +
+                 "ProjectApi.Generated.ApiV10) — при уникальных обёртках имена сборок " +
+                 "не совпадут. Пути не редактируются — они выводятся из класса-обёртки, " +
+                 "чтобы папка версии была самодостаточной.", pkgSection);
+
+            LabeledText($"packageName (пусто → {profile.ResolvePackageName()})", profile.PackageName,
+                pkgSection, v => { profile.PackageName = v; Refresh(); });
+
+            derived = Line(DerivedPathsText(profile), NexusToken.TextNormal, pkgSection);
+
+            // --- Пост-обработка ---
+            var postSection = Section("Пост-обработка вывода", root);
+
+            Hint("Обёртка версии ОБЯЗАТЕЛЬНА: под-неймспейсы .Model/.Api/.Client " +
+                 "объединяются в packageName версии, все типы вкладываются в static " +
+                 "partial class — обращение ApiV10.User, ApiV10.AuthApi. Выполняется " +
+                 "движком после деплоя из staging, в команду CLI не входит " +
+                 "(в CI работает так же — движок общий).", postSection);
+
+            var stripToggle = new Toggle("Срезать версионный префикс из имён методов (ApiV10Foo → Foo)")
+                { value = profile.StripVersionPrefixInMethods };
+            stripToggle.AddToClassList("api-field");
+            stripToggle.RegisterValueChangedCallback(e => profile.StripVersionPrefixInMethods = e.newValue);
+            postSection.Add(stripToggle);
+
+            Hint("Префикс лепит генератор из пути /api/v1.0/…, когда в спеке нет " +
+                 "operationId. Чистится на выходе, после генерации, до снапшота.", postSection);
+
+            // --- Предпросмотр команды (её -o указывает на staging: в Assets попадает
+            //     не сырой вывод CLI, а деплой движка; в CI используй ApiCodegenBatch) ---
+            var previewSection = Section("Команда генерации", root);
+            preview = LogField(previewSection, "cmd-preview", profile.BuildCommandLinePreview());
+
+            // --- Сохранение ---
+            ActionButton(NexusRole.Primary, "Сохранить конфиг", () =>
+            {
+                _config.Save();
+                Refresh();
+                Context.SetStatus($"Конфиг профиля «{profile.Name}» сохранён.", StatusKind.Ok);
+            }, root);
+        }
+
+        private static string DerivedPathsText(ApiCodegenProfile p) =>
+            $"Вывод:    {p.OutputDir}\n" +
+            $"link.xml: {p.LinkXmlPath}\n" +
+            $"asmdef:   {p.AsmdefPath}\n" +
+            $"staging:  {p.StagingDir} (вне Assets, мусор CLI не импортится)";
+    }
+}

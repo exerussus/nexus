@@ -1,0 +1,156 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Скан C#-кода на Resources.Load / LoadAll / LoadAsync.
+    // Литералы резолвятся в конкретные ассеты; всё динамическое честно понижает
+    // уверенность вердиктов (hasDynamicCalls), а не игнорируется.
+    public static class CodeUsageScanner
+    {
+        // Одно выражение ловит и литерал (группа p), и любой другой первый аргумент (raw).
+        // $"..." — интерполяция: p формально совпадёт, но raw начнётся с '$' → динамика.
+        static readonly Regex CallRx = new Regex(
+            @"Resources\s*\.\s*(?<m>Load(?:All)?(?:Async)?)\s*(?:<[^>\r\n]*>)?\s*\(\s*(?<raw>\$?@?""(?<p>[^""\r\n]*)""|[^)\r\n]*)",
+            RegexOptions.Compiled);
+
+        public static void Scan(AuditReport report, Action<float, string> progress)
+        {
+            foreach (var e in report.resources) { e.callSites.Clear(); e.caseMismatch = false; }
+            report.dynamicCalls.Clear();
+            report.brokenCalls.Clear();
+            report.hasDynamicCalls = false;
+
+            // индексы алиасов: точный и регистронезависимый (ловля опечаток регистра)
+            var exact = new Dictionary<string, List<ResourceAssetEntry>>(StringComparer.Ordinal);
+            var loose = new Dictionary<string, List<ResourceAssetEntry>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in report.resources)
+                foreach (var alias in e.aliases) { AddIndex(exact, alias, e); AddIndex(loose, alias, e); }
+
+            var files = new List<string>();
+            CollectCs("Assets", files);
+            CollectCs("Packages", files);             // embedded-пакеты
+            CollectCs("Library/PackageCache", files); // registry-пакеты: их код тоже грузит СВОИ Resources (TMP и т.п.)
+
+            for (int i = 0; i < files.Count; i++)
+            {
+                if ((i & 31) == 0 && progress != null) progress((float)i / files.Count, files[i]);
+
+                string text;
+                try { text = File.ReadAllText(files[i]); } catch { continue; }
+                if (text.IndexOf("Resources", StringComparison.Ordinal) < 0) continue; // дешёвый отсев
+
+                var norm = files[i].Replace('\\', '/');
+                bool editorCode = norm.Contains("/Editor/");
+
+                foreach (Match m in CallRx.Matches(text))
+                {
+                    int line = LineOf(text, m.Index);
+                    string method = m.Groups["m"].Value;
+                    string raw = m.Groups["raw"].Value.TrimStart();
+                    bool isLiteral = m.Groups["p"].Success && !raw.StartsWith("$", StringComparison.Ordinal);
+
+                    if (!isLiteral)
+                    {
+                        report.hasDynamicCalls = true;
+                        report.dynamicCalls.Add(NewCall(norm, line, method, null, text, m.Index, editorCode));
+                        continue;
+                    }
+                    Resolve(report, exact, loose, m.Groups["p"].Value.Trim('/'),
+                        method, norm, line, editorCode, text, m.Index);
+                }
+            }
+
+            report.codeAt = Stamp.Now();
+        }
+
+        static void Resolve(AuditReport report,
+            Dictionary<string, List<ResourceAssetEntry>> exact,
+            Dictionary<string, List<ResourceAssetEntry>> loose,
+            string literal, string method, string file, int line, bool editorCode,
+            string text, int index)
+        {
+            var hits = new List<ResourceAssetEntry>();
+            bool caseOnly = false;
+
+            if (method == "LoadAll")
+            {
+                // LoadAll("") грузит вообще всё; иначе — всё поддерево папки
+                foreach (var e in report.resources)
+                    if (literal.Length == 0 || HasPrefix(e, literal, StringComparison.Ordinal)) hits.Add(e);
+                if (hits.Count == 0 && literal.Length > 0)
+                {
+                    foreach (var e in report.resources)
+                        if (HasPrefix(e, literal, StringComparison.OrdinalIgnoreCase)) hits.Add(e);
+                    caseOnly = hits.Count > 0;
+                }
+            }
+            else
+            {
+                List<ResourceAssetEntry> list;
+                if (exact.TryGetValue(literal, out list)) hits.AddRange(list);
+                else if (loose.TryGetValue(literal, out list)) { hits.AddRange(list); caseOnly = true; }
+            }
+
+            if (hits.Count == 0)
+            {
+                // литерал, под которым нет ассета — опечатка или последствия переноса
+                report.brokenCalls.Add(NewCall(file, line, method, literal, text, index, editorCode));
+                return;
+            }
+
+            foreach (var e in hits)
+            {
+                if (caseOnly) e.caseMismatch = true; // на case-sensitive платформах такой вызов сломается
+                e.callSites.Add(new CallSite { file = file, line = line, method = method, editorCode = editorCode });
+            }
+        }
+
+        static bool HasPrefix(ResourceAssetEntry e, string folder, StringComparison cmp)
+        {
+            foreach (var a in e.aliases)
+                if (a.StartsWith(folder, cmp) && a.Length > folder.Length && a[folder.Length] == '/') return true;
+            return false;
+        }
+
+        static void AddIndex(Dictionary<string, List<ResourceAssetEntry>> map, string key, ResourceAssetEntry e)
+        {
+            List<ResourceAssetEntry> list;
+            if (!map.TryGetValue(key, out list)) map[key] = list = new List<ResourceAssetEntry>(1);
+            if (!list.Contains(e)) list.Add(e);
+        }
+
+        static void CollectCs(string root, List<string> files)
+        {
+            if (!Directory.Exists(root)) return;
+            try { files.AddRange(Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDirectories)); }
+            catch { /* недоступные каталоги пропускаем молча */ }
+        }
+
+        static int LineOf(string text, int index)
+        {
+            int line = 1;
+            for (int i = 0; i < index && i < text.Length; i++)
+                if (text[i] == '\n') line++;
+            return line;
+        }
+
+        static CodeCallEntry NewCall(string file, int line, string method, string literal,
+            string text, int index, bool editorCode)
+        {
+            // сниппет — текущая строка кода, обрезанная до вменяемой длины
+            int start = text.LastIndexOf('\n', Math.Min(index, text.Length - 1)) + 1;
+            int end = text.IndexOf('\n', index);
+            if (end < 0) end = text.Length;
+            var snippet = text.Substring(start, end - start).Trim();
+            if (snippet.Length > 140) snippet = snippet.Substring(0, 140) + "…";
+            return new CodeCallEntry
+            {
+                file = file, line = line, method = method,
+                literal = literal, snippet = snippet, editorCode = editorCode,
+            };
+        }
+    }
+}

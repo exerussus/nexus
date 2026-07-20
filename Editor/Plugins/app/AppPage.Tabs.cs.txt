@@ -1,0 +1,66 @@
+// ============================================================
+//  AppPage.Tabs.cs — таб-бар и переключение вкладок.
+//
+//  Вынесено из графа: переключение работает независимо от тяжёлого
+//  графового «вью» (AppPage.Graph.cs), который добавляется отдельно.
+//  ShowTab — чистый тоггл видимости + активный класс, без обращений к
+//  внутренностям конкретных вкладок (каждая обновляется своей кнопкой Refresh).
+// ============================================================
+
+using System.Collections.Generic;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        private readonly List<Button> _tabButtons = new();
+        private VisualElement _tabBar;
+
+        // Порядок вкладок = порядок корней в ShowTab.
+        private static readonly string[] TabLabels =
+        {
+            "Editor", "Graph", "Generation", "Hooks", "Nav classes", "External"
+        };
+
+        private void BuildTabBar()
+        {
+            _tabBar = new VisualElement();
+            _tabBar.AddToClassList("nav-tabbar");
+
+            for (int i = 0; i < TabLabels.Length; i++)
+            {
+                var index = i; // захват
+                var btn = new Button(() => ShowTab(index)) { text = TabLabels[i] };
+                btn.AddToClassList("nav-tab-btn");
+                _tabButtons.Add(btn);
+                _tabBar.Add(btn);
+            }
+
+            _root.Add(_tabBar);
+        }
+
+        private void ShowTab(int index)
+        {
+            var roots = new[] { _editorRoot, _graphRoot, _genRoot, _hooksRoot, _navClassesRoot, _extRoot };
+
+            for (int i = 0; i < roots.Length; i++)
+                if (roots[i] != null)
+                    roots[i].style.display = i == index ? DisplayStyle.Flex : DisplayStyle.None;
+
+            for (int i = 0; i < _tabButtons.Count; i++)
+                _tabButtons[i].EnableInClassList("nav-tab-btn--active", i == index);
+
+            // refresh-on-show: сцена/файлы могли измениться с прошлого входа
+            switch (index)
+            {
+                case 1: RebuildGraph();        break; // Graph
+                case 2: RefreshTemplates();
+                        RefreshScaffold();     break; // Generation
+                case 3: RefreshHooks();        break; // Hooks
+                case 4: RefreshNavClasses();   break; // Nav classes
+                case 5: RefreshExternalFiles(); break; // External
+            }
+        }
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "Exerussus.Nexus.Pages.ResourcesAuditor",
+  "rootNamespace": "Exerussus.Nexus.Pages.ResourcesAuditor",
+  "references": [ "Exerussus.Nexus.Abstractions" ],
+  "includePlatforms": [ "Editor" ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": false,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

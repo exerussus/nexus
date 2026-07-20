@@ -1,0 +1,35 @@
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Сведение всех слоёв анализа в один вердикт на ассет.
+    // Главное правило честности: Dead утверждается только при ПОЛНЫХ данных
+    // (скан кода + хотя бы один скан ссылок) и отсутствии динамических вызовов в проекте.
+    public static class VerdictSolver
+    {
+        public static void Recompute(AuditReport r)
+        {
+            bool codeScanned = !string.IsNullOrEmpty(r.codeAt);
+            bool refsScanned = !string.IsNullOrEmpty(r.refsBuildAt) || !string.IsNullOrEmpty(r.refsAllAt);
+
+            foreach (var e in r.resources)
+            {
+                bool hasDirect = false, hasGroup = false, allEditor = true;
+                foreach (var c in e.callSites)
+                {
+                    if (c.method == "LoadAll") hasGroup = true; else hasDirect = true;
+                    if (!c.editorCode) allEditor = false;
+                }
+                e.editorOnlyUsage = e.callSites.Count > 0 && allEditor;
+
+                if (!codeScanned && !refsScanned) { e.verdict = AssetVerdict.NotScanned; continue; }
+                if (hasDirect) { e.verdict = AssetVerdict.UsedByCode; continue; }
+                if (hasGroup) { e.verdict = AssetVerdict.UsedByLoadAll; continue; }
+                if (e.buildReferrers.Count > 0 || e.referrers.Count > 0)
+                { e.verdict = AssetVerdict.DirectRefsOnly; continue; }
+
+                e.verdict = codeScanned && refsScanned && !r.hasDynamicCalls
+                    ? AssetVerdict.Dead
+                    : AssetVerdict.Unknown;
+            }
+        }
+    }
+}

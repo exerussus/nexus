@@ -1,0 +1,118 @@
+using System;
+using System.Collections.Generic;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Вердикт по ассету: есть ли подтверждённая причина находиться в билде.
+    public enum AssetVerdict
+    {
+        NotScanned    = 0, // анализаторы ещё не запускались
+        UsedByCode    = 1, // литеральный Resources.Load/LoadAsync на этот путь
+        UsedByLoadAll = 2, // накрыт Resources.LoadAll по папке
+        DirectRefsOnly= 3, // только прямые ссылки из ассетов — кандидат на вынос из Resources
+        Unknown       = 4, // данных недостаточно (не все сканы / есть динамические вызовы)
+        Dead          = 5, // использований нет при полных данных — вероятный мёртвый груз
+    }
+
+    [Serializable]
+    public class CallSite
+    {
+        public string file;
+        public int line;
+        public string method;     // Load | LoadAll | LoadAsync
+        public bool editorCode;   // вызов из editor-кода: билд его не исполняет
+    }
+
+    [Serializable]
+    public class ResourceAssetEntry
+    {
+        public string assetPath;
+        public string resourcesPath;              // канонический путь для Resources.Load (без расширения)
+        public List<string> aliases = new List<string>(); // все валидные load-пути (вложенные Resources)
+        public string typeName;
+        public bool fromPackage;
+        public long sizeDisk;
+        public long sizePacked = -1;              // из BuildReport; -1 = данных нет
+        public AssetVerdict verdict;
+        public bool editorOnlyUsage;              // все найденные вызовы — из editor-кода
+        public bool caseMismatch;                 // вызов совпал только без учёта регистра
+        public bool addressableDuplicate;         // одновременно упакован Addressables
+        public List<CallSite> callSites = new List<CallSite>();
+        public List<string> referrers = new List<string>();      // прямые ссылки, скан «весь проект»
+        public List<string> buildReferrers = new List<string>(); // прямые ссылки из замыкания билд-сцен
+    }
+
+    [Serializable]
+    public class CodeCallEntry
+    {
+        public string file;
+        public int line;
+        public string method;
+        public string literal;   // для битых вызовов: путь, под которым нет ассета
+        public string snippet;
+        public bool editorCode;
+    }
+
+    [Serializable]
+    public class StreamingEntry
+    {
+        public string path;
+        public long size;
+    }
+
+    [Serializable]
+    public class AuditReport
+    {
+        // штампы сканов: null/"" = скан не запускался (или устарел после нового инвентаря)
+        public string inventoryAt;
+        public string codeAt;
+        public string refsBuildAt;
+        public string refsAllAt;
+        public string buildReportAt;
+
+        public bool hasDynamicCalls;        // в проекте есть нерезолвящиеся Resources.Load
+        public string buildReportInfo;      // платформа и дата последнего билда
+        public long buildPackedTotal = -1;  // суммарный packed-вес ассетов Resources по BuildReport
+        public bool addressablesPresent;
+
+        public List<ResourceAssetEntry> resources = new List<ResourceAssetEntry>();
+        public List<StreamingEntry> streaming = new List<StreamingEntry>();
+        public List<CodeCallEntry> dynamicCalls = new List<CodeCallEntry>();
+        public List<CodeCallEntry> brokenCalls = new List<CodeCallEntry>();
+    }
+
+    public static class VerdictText
+    {
+        public static string Label(AssetVerdict v)
+        {
+            switch (v)
+            {
+                case AssetVerdict.UsedByCode:     return "код";
+                case AssetVerdict.UsedByLoadAll:  return "LoadAll";
+                case AssetVerdict.DirectRefsOnly: return "только ссылки";
+                case AssetVerdict.Unknown:        return "неизвестно";
+                case AssetVerdict.Dead:           return "мёртвый груз";
+                default:                          return "нет данных";
+            }
+        }
+    }
+
+    public static class Fmt
+    {
+        public static string Size(long b)
+        {
+            if (b < 0) return "—";
+            if (b < 1024) return b + " B";
+            double v = b / 1024.0;
+            if (v < 1024) return v.ToString("0.#") + " KB";
+            v /= 1024.0;
+            if (v < 1024) return v.ToString("0.#") + " MB";
+            return (v / 1024.0).ToString("0.##") + " GB";
+        }
+    }
+
+    public static class Stamp
+    {
+        public static string Now() { return DateTime.Now.ToString("yyyy-MM-dd HH:mm"); }
+    }
+}

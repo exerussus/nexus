@@ -1,0 +1,97 @@
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Точка входа для CI. Тот же движок, что и у страницы, но без UI.
+    /// Гоняет ВСЕ профили из конфига (в CI нет «выбранного» — выбранный
+    /// профиль на странице это чистый UI-стейт).
+    ///
+    /// Nexus: движок задеплоен вместе со страницей в Assets/NexusStates/api-backend
+    /// (State коммитится), поэтому CI работает ТОЛЬКО при задеплоенной странице —
+    /// осознанное решение. Disable страницы = эти методы исчезают из компиляции.
+    ///
+    /// Запуск:
+    ///   unity -batchmode -quit -projectPath . \
+    ///         -executeMethod Exerussus.Nexus.Pages.ApiBackend.ApiCodegenBatch.Generate
+    ///
+    /// Коды выхода: 0 — ок; 1 — генерация какого-то профиля не удалась;
+    /// 2 — спека какого-то профиля недоступна; 3 — есть ломающий дрейф.
+    /// </summary>
+    public static class ApiCodegenBatch
+    {
+        public static void Generate()
+        {
+            var config = ApiCodegenConfig.Load();
+
+            // Несогласованность профилей (дубли обёрток/пакетов) — сразу в лог,
+            // до запуска: чинить это надо в конфиге, а не в CI.
+            foreach (var w in config.ValidateProfiles())
+                Debug.LogWarning("[ApiCodegen] " + w);
+
+            // В CI ручные правки игнорируем (force) — там вывод всегда регенерится с нуля.
+            var failed = false;
+            foreach (var result in ApiCodegenEngine.GenerateAll(config, force: true))
+            {
+                Debug.Log($"[ApiCodegen] === {result.Profile.Name} ===\n{result.Log}");
+                failed |= !result.Generated;
+            }
+
+            if (failed)
+            {
+                EditorApplication.Exit(1);
+                return;
+            }
+
+            AssetDatabase.Refresh();
+            EditorApplication.Exit(0);
+        }
+
+        /// <summary>
+        /// Только проверка дрейфа всех профилей без генерации — CI-гейт на PR:
+        /// упасть, если чья-то спека уехала относительно последней генерации.
+        /// </summary>
+        public static void CheckDrift()
+        {
+            var config = ApiCodegenConfig.Load();
+            var fetchFailed = false;
+            var breakingTotal = 0;
+
+            foreach (var profile in config.Profiles)
+            {
+                var analysis = ApiCodegenEngine.Analyze(profile);
+
+                if (!analysis.Ok)
+                {
+                    Debug.LogError($"[ApiCodegen] «{profile.Name}»: спека недоступна: {analysis.Fetch?.Error}");
+                    fetchFailed = true;
+                    continue;
+                }
+
+                var drift = analysis.Drift;
+                if (!drift.HasBaseline)
+                {
+                    Debug.Log($"[ApiCodegen] «{profile.Name}»: снапшота ещё нет — дрейф не проверяется.");
+                    continue;
+                }
+
+                if (drift.BreakingCount > 0)
+                {
+                    breakingTotal += drift.BreakingCount;
+                    Debug.LogError($"[ApiCodegen] «{profile.Name}»: ломающих изменений {drift.BreakingCount} — нужна регенерация клиента.");
+                    foreach (var c in drift.Changes)
+                        Debug.LogError($"  [{c.Impact}] {c.Target} — {c.Detail}");
+                }
+                else
+                {
+                    Debug.Log($"[ApiCodegen] «{profile.Name}»: ломающего дрейфа нет.");
+                }
+            }
+
+            if (fetchFailed) { EditorApplication.Exit(2); return; }
+            if (breakingTotal > 0) { EditorApplication.Exit(3); return; }
+            EditorApplication.Exit(0);
+        }
+    }
+}

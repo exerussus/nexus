@@ -1,0 +1,204 @@
+/* Только геометрия и раскладка. Цвета (background-color/border-color/color) и состояния
+   hover/press НЕ задаются здесь — их выставляет страница в C# через Context.Theme.Get(token).
+   Здесь остаются flex, размеры, отступы, радиусы, ширины рамок, позиции, шрифты, выравнивание. */
+
+.ws-root {
+    flex-grow: 1;
+    flex-direction: column;
+}
+
+/* ---------- Тулбар ---------- */
+
+.ws-toolbar {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+    border-bottom-width: 1px;
+}
+
+.ws-btn {
+    height: 22px;
+    margin: 2px 3px;
+    padding: 0 10px;
+    border-width: 1px;
+    border-radius: 4px;
+    -unity-text-align: middle-center;
+}
+
+.ws-tool-label {
+    margin: 0 4px 0 8px;
+    font-size: 11px;
+}
+
+.ws-tool-sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 6px;
+}
+
+.ws-flex-spacer {
+    flex-grow: 1;
+}
+
+.ws-search {
+    width: 150px;
+    margin: 2px 3px;
+}
+
+.ws-search .unity-base-text-field__input {
+    border-width: 1px;
+    border-radius: 4px;
+    padding: 0 6px;
+}
+
+.ws-scale {
+    width: 130px;
+    margin: 2px 6px;
+}
+
+/* ---------- Скролл / список групп ---------- */
+
+.ws-scroll {
+    flex-grow: 1;
+}
+
+.ws-groups {
+    flex-direction: column;
+    padding: 6px;
+}
+
+/* ---------- Группа ---------- */
+
+.ws-group {
+    margin-bottom: 8px;
+    border-width: 1px;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.ws-group-header {
+    flex-direction: row;
+    align-items: center;
+    height: 26px;
+    padding: 0 8px;
+    border-bottom-width: 1px;
+}
+
+.ws-group-chevron {
+    width: 14px;
+    font-size: 11px;
+    -unity-text-align: middle-center;
+}
+
+.ws-group-title {
+    margin-left: 4px;
+    font-size: 12px;
+    -unity-font-style: bold;
+}
+
+.ws-group-count {
+    margin-left: 8px;
+    font-size: 10px;
+}
+
+.ws-group-rename {
+    margin-left: 4px;
+    width: 180px;
+}
+
+.ws-group-del {
+    width: 20px;
+    height: 18px;
+    padding: 0;
+    border-width: 0;
+    font-size: 14px;
+    -unity-text-align: middle-center;
+}
+
+.ws-group-body {
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 8px;
+    min-height: 40px;
+}
+
+.ws-drop-hint {
+    padding: 12px;
+    font-size: 11px;
+    -unity-font-style: italic;
+}
+
+/* ---------- Карточка ---------- */
+
+.ws-card {
+    width: 96px;
+    height: 96px;
+    margin: 4px;
+    padding: 6px 4px 4px 4px;
+    border-width: 1px;
+    border-radius: 6px;
+    align-items: center;
+    justify-content: flex-start;
+    overflow: hidden;
+}
+
+.ws-card--bundle {
+    border-left-width: 3px;
+}
+
+.ws-card-icon {
+    width: 40px;
+    height: 40px;
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+
+.ws-card-name {
+    width: 100%;
+    font-size: 10px;
+    -unity-text-align: middle-center;
+    white-space: normal;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ws-card-sub {
+    width: 100%;
+    font-size: 9px;
+    -unity-text-align: middle-center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ws-card-rename {
+    width: 100%;
+}
+
+.ws-card-kind {
+    position: absolute;
+    top: 2px;
+    left: 4px;
+    font-size: 9px;
+}
+
+.ws-card-pin {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    font-size: 10px;
+}
+
+.ws-card-count {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    min-width: 16px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 7px;
+    font-size: 9px;
+    -unity-text-align: middle-center;
+    -unity-font-style: bold;
+}

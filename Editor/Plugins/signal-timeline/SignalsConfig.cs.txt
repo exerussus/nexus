@@ -1,0 +1,90 @@
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+namespace Signals
+{
+    /// <summary>
+    /// ScriptableObject-backed settings for the editor signal registry.
+    /// Lives at <see cref="DefaultAssetPath"/>; created automatically if
+    /// missing. Edit via the inspector or via <see cref="Instance"/>.
+    /// </summary>
+    [CreateAssetMenu(menuName = "Signals/Signals Config", fileName = "SignalsConfig")]
+    public sealed class SignalsConfig : ScriptableObject
+    {
+        public const string DefaultAssetPath = "Assets/Signals/Editor/Config/SignalsConfig.asset";
+
+        [Tooltip("Master switch for the editor signal timeline. " +
+                 "When off, no events are recorded.")]
+        [SerializeField] private bool isEnabled = true;
+
+        [Tooltip("Per-track ring-buffer cap. Older events are dropped " +
+                 "when a track exceeds this number.")]
+        [SerializeField, Min(1)] private int maxEventsPerTrack = 5000;
+
+        [Tooltip("Global event cap across all tracks. The biggest track " +
+                 "loses the oldest events first.")]
+        [SerializeField, Min(1)] private int maxTotalEvents = 50000;
+
+        public bool IsEnabled
+        {
+            get => isEnabled;
+            set { if (isEnabled != value) { isEnabled = value; Save(); } }
+        }
+
+        public int MaxEventsPerTrack
+        {
+            get => maxEventsPerTrack;
+            set { if (maxEventsPerTrack != value) { maxEventsPerTrack = Mathf.Max(1, value); Save(); } }
+        }
+
+        public int MaxTotalEvents
+        {
+            get => maxTotalEvents;
+            set { if (maxTotalEvents != value) { maxTotalEvents = Mathf.Max(1, value); Save(); } }
+        }
+
+        private void Save()
+        {
+            EditorUtility.SetDirty(this);
+            // Откладываем фактическую запись на потом — серия мутаций в одном
+            // кадре будет схлопнута в одну запись на диск.
+            EditorApplication.delayCall -= SaveDeferred;
+            EditorApplication.delayCall += SaveDeferred;
+        }
+
+        private static void SaveDeferred()
+        {
+            AssetDatabase.SaveAssetIfDirty(Instance);
+        }
+
+        // ---- Lazy singleton -------------------------------------------------
+
+        private static SignalsConfig _instance;
+
+        public static SignalsConfig Instance
+        {
+            get
+            {
+                if (_instance != null) return _instance;
+                _instance = AssetDatabase.LoadAssetAtPath<SignalsConfig>(DefaultAssetPath);
+                if (_instance == null) _instance = CreateAtDefaultPath();
+                return _instance;
+            }
+        }
+
+        private static SignalsConfig CreateAtDefaultPath()
+        {
+            var dir = Path.GetDirectoryName(DefaultAssetPath);
+            if (!Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+                AssetDatabase.Refresh();
+            }
+            var asset = CreateInstance<SignalsConfig>();
+            AssetDatabase.CreateAsset(asset, DefaultAssetPath);
+            AssetDatabase.SaveAssets();
+            return asset;
+        }
+    }
+}

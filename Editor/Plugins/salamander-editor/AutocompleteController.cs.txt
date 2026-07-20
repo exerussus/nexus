@@ -1,0 +1,123 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Склейка редактор ↔ движок подсказок ↔ попап. Правила открытия:
+    // точка — автоматически, Ctrl/Cmd+Space — вручную; дальше набор фильтрует список.
+    public sealed class AutocompleteController
+    {
+        private readonly CodeEditorElement _editor;
+        private readonly AutocompletePopup _popup;
+        private readonly List<SalCompletion> _buf = new List<SalCompletion>(64);
+        private int _replaceStart;
+        private int _lastTextLength;
+
+        public SalApiModel Model;
+        // с какого числа символов слова попап открывается сам (Ctrl+Space работает всегда)
+        public int MinAutoPrefix = 2;
+
+        public AutocompleteController(CodeEditorElement editor, AutocompletePopup popup)
+        {
+            _editor = editor;
+            _popup = popup;
+            _editor.Add(_popup);                  // попап — ребёнок редактора: общий USS и координаты
+            _editor.KeyInterceptor = OnKey;
+            _editor.TextChanged += OnTextChanged;
+            _popup.Committed += OnCommit;
+            // клик мимо попапа закрывает его
+            _editor.RegisterCallback<PointerDownEvent>(OnEditorPointerDown, TrickleDown.TrickleDown);
+        }
+
+        private bool OnKey(KeyDownEvent e)
+        {
+            if (_popup.HandleKey(e)) return true;
+            if (e.keyCode == KeyCode.Space && (e.ctrlKey || e.commandKey))
+            {
+                OpenOrRefresh();
+                return true;
+            }
+            return false;
+        }
+
+        private void OnTextChanged()
+        {
+            string t = _editor.Text;
+            int delta = t.Length - _lastTextLength;
+            _lastTextLength = t.Length;
+            int caret = _editor.CaretIndex;
+            char prev = caret > 0 && caret <= t.Length ? t[caret - 1] : '\0';
+
+            if (_popup.IsOpen)
+            {
+                // набор идентификатора/точки (и удаление внутри слова) уточняет список;
+                // всё прочее закрывает попап
+                if (prev == '.' || prev == '_' || char.IsLetterOrDigit(prev)) OpenOrRefresh();
+                else _popup.Close();
+                return;
+            }
+
+            // авто-открытие только на одиночное нажатие: загрузка файла/паста попап не дёргают
+            if (delta != 1) return;
+
+            if (prev == '.')
+            {
+                OpenOrRefresh();
+                return;
+            }
+
+            // впервые набираемое слово: с MinAutoPrefix символов, вне строк и комментариев
+            if ((prev == '_' || char.IsLetterOrDigit(prev)) &&
+                CurrentWordLength(t, caret) >= MinAutoPrefix &&
+                !SalTokenizer.IsInCommentOrString(t, caret))
+            {
+                OpenOrRefresh();
+            }
+        }
+
+        // Длина идентификатора слева от каретки; слово, начатое с цифры, — число, не идентификатор.
+        private static int CurrentWordLength(string t, int caret)
+        {
+            int s = caret;
+            while (s > 0 && (t[s - 1] == '_' || char.IsLetterOrDigit(t[s - 1]))) s--;
+            return s < caret && (t[s] == '_' || char.IsLetter(t[s])) ? caret - s : 0;
+        }
+
+        private void OpenOrRefresh()
+        {
+            _buf.Clear();
+            _replaceStart = AutocompleteEngine.Collect(_editor.Text, _editor.CaretIndex, Model, _buf);
+            if (_buf.Count == 0)
+            {
+                _popup.Close();
+                return;
+            }
+            // единственный кандидат уже полностью набран — подсказывать нечего
+            if (_buf.Count == 1 &&
+                _buf[0].Insert == _editor.Text.Substring(_replaceStart, _editor.CaretIndex - _replaceStart))
+            {
+                _popup.Close();
+                return;
+            }
+            var pos = _editor.GetCaretPositionIn(_editor);
+            // не даём попапу вылезти за края редактора
+            pos.x = Mathf.Max(0f, Mathf.Min(pos.x, _editor.layout.width - 300f));
+            pos.y = Mathf.Max(0f, Mathf.Min(pos.y, _editor.layout.height - 40f));
+            _popup.Open(pos, _buf);
+        }
+
+        private void OnCommit(SalCompletion c)
+        {
+            _popup.Close();
+            _editor.ReplaceRange(_replaceStart, _editor.CaretIndex, c.Insert, c.CaretBack);
+        }
+
+        private void OnEditorPointerDown(PointerDownEvent e)
+        {
+            if (!_popup.IsOpen) return;
+            if (e.target is VisualElement ve && (ve == _popup || _popup.Contains(ve))) return;
+            _popup.Close();
+        }
+    }
+}

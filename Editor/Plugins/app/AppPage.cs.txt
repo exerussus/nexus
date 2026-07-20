@@ -1,0 +1,1023 @@
+using Exerussus.Nexus.Abstractions;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using App.Core;
+using App.Services.Navigator;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    // id ("app") — стабильный ключ страницы и имя папки в State/Preserve/UserSettings.
+    // Переклассифицировано из "navigation": это замена, не эволюция (новый guid в манифесте).
+    [EditorPage("app", "App", PageCategory.Infrastructure, order: 10, icon: "d_Linked")]
+    public sealed partial class AppPage : EditorPageBase
+    {
+        // Собственный стиль страницы — companion-ассет плагина: грузится через Context, путь не хардкодим.
+        private const string PageUssName = "AppPage.uss";
+
+        // Опциональные поля аффиксов в NavigationSetting (рефлексия). Нет полей — работаем на дефолтах.
+        private static readonly FieldInfo SettingPagePrefixField   = AffixField("prefix");
+        private static readonly FieldInfo SettingPagePostfixField  = AffixField("postfix");
+        private static readonly FieldInfo SettingPopupPrefixField  = AffixField("popupPrefix");
+        private static readonly FieldInfo SettingPopupPostfixField = AffixField("popupPostfix");
+
+        private static FieldInfo AffixField(string name) =>
+            typeof(NavigationSetting).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+
+        // USS class должен оставаться валидным селектором.
+        private static readonly Regex ClassRx =
+            new(@"^[A-Za-z_][A-Za-z0-9_\-]*$", RegexOptions.Compiled);
+
+        // Атрибут class="..." / class='...' в uxml. Singleline на случай переносов внутри значения.
+        private static readonly Regex ClassAttrRx =
+            new(@"class\s*=\s*(?<q>[""'])(?<val>.*?)\k<q>",
+                RegexOptions.Compiled | RegexOptions.Singleline);
+
+        private static readonly char[] WS = { ' ', '\t', '\n', '\r' };
+
+        // Источник истины по id — теперь типизированный SO из app.core (db больше нет).
+        private NavigationSetting _setting;
+        private NavigationData    _navData;
+
+        private Registry _pageReg;
+        private Registry _popupReg;
+
+        // Корень UI страницы. Им пользуются и остальные partial-файлы (таб-бар и т.п.).
+        private VisualElement _root;
+
+        // Корни вкладок (наполняются в соответствующих partial'ах).
+        private VisualElement _editorRoot;
+        private VisualElement _graphRoot;
+        private VisualElement _genRoot;
+        private VisualElement _hooksRoot;
+        private VisualElement _navClassesRoot;
+        private VisualElement _extRoot;
+
+        private Button _applyBtn;
+        private bool   _dirty;
+
+        // ----------------------------------------------------- models
+
+        // Реестр id (страницы или попапы): источник, аффиксы, строки, снапшот, своя UI-секция.
+        private sealed class Registry
+        {
+            public string Name;                       // "page"/"popup" — для сообщений/тултипов
+            public string SectionTitle;
+
+            // Чтение/запись id в NavigationData (раньше — рефлексия по DataBase.Pages/Popups).
+            public Func<IReadOnlyList<string>>   ReadStored;
+            public Action<IEnumerable<string>>   WriteStored;
+
+            public Func<string, long> HashOf;         // new PageUID/PopupUID(id).Id
+            public string UidTypeName;                 // "PageUID"/"PopupUID" — для комментариев в uss
+            public string DefaultPrefix, DefaultPostfix;
+            public FieldInfo PrefixField, PostfixField;
+            public NavigationSetting.EntryKind EntryKind;
+
+            public string Prefix, Postfix;
+            public string OriginalPrefix, OriginalPostfix;
+
+            public readonly List<PageRow> Rows        = new();
+            public readonly List<string>  OriginalIds = new();
+
+            public VisualElement ListView;
+            public Label         AffixExample;
+            public TextField     PrefixUI, PostfixUI;
+        }
+
+        private sealed class PageRow
+        {
+            public string Id = "";
+            public string OriginalId;        // null => новая строка (нет старого класса в uxml)
+            public VisualElement Container;
+            public Label ClassLabel;
+            public Label HashLabel;
+        }
+
+        private enum MigrationAction { Skip, Rename, Delete }
+
+        private sealed class ClassMigration
+        {
+            public string Label;             // "page"/"popup"
+            public string OldClass;
+            public string NewClass;          // null => удаление
+            public int    Hits;
+            public MigrationAction Action;
+
+            // для переименования самого uxml-файла и его папки (только Action == Rename)
+            public bool   IsPopup;
+            public string OldId;
+            public string NewId;
+        }
+
+        // ---------------------------------------------------------------- UI
+
+        public override VisualElement BuildUI()
+        {
+            _root = new VisualElement();
+
+            InitRegistries();
+
+            // Собственный стиль страницы — companion-ассет: путь резолвит хаб, мы передаём имя файла.
+            var ss = Context.LoadDeployedAsset<StyleSheet>(PageUssName);
+            if (ss != null)
+                _root.styleSheets.Add(ss);
+
+            _root.AddToClassList("nav-page");
+
+            // ---- tabs ---- (реализация в AppPage.Graph.cs)
+            BuildTabBar();
+
+            _editorRoot = new VisualElement();
+            _editorRoot.AddToClassList("nav-tab");
+            _root.Add(_editorRoot);
+
+            _graphRoot = new VisualElement();
+            _graphRoot.AddToClassList("nav-tab");
+            _root.Add(_graphRoot);
+
+            _genRoot = new VisualElement();
+            _genRoot.AddToClassList("nav-tab");
+            _root.Add(_genRoot);
+
+            _hooksRoot = new VisualElement();
+            _hooksRoot.AddToClassList("nav-tab");
+            _root.Add(_hooksRoot);
+
+            _navClassesRoot = new VisualElement();
+            _navClassesRoot.AddToClassList("nav-tab");
+            _root.Add(_navClassesRoot);
+
+            _extRoot = new VisualElement();
+            _extRoot.AddToClassList("nav-tab");
+            _root.Add(_extRoot);
+
+            // ---- editor toolbar ----
+            var toolbar = new VisualElement();
+            toolbar.AddToClassList("nav-toolbar");
+
+            var title = new Label("App");
+            title.AddToClassList("nav-page-title");
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+
+            _applyBtn = new Button(OnApplyClicked) { text = "Apply" };
+            _applyBtn.AddToClassList("nav-btn");
+            _applyBtn.AddToClassList("nav-btn--apply");
+
+            toolbar.Add(title);
+            toolbar.Add(spacer);
+            toolbar.Add(_applyBtn);
+            _editorRoot.Add(toolbar);
+
+            // ---- sections ----
+            BuildSection(_pageReg,  "+ Page");
+            BuildSection(_popupReg, "+ Popup");
+
+            var hint = new Label(
+                "Each id generates one USS class: prefix + id.ToLower() + postfix, into the same Navigation.uss. " +
+                "At runtime the id becomes a PageUID/PopupUID. On Apply, renamed or removed ids ask how to migrate " +
+                "the old class across all UXML files.");
+            hint.AddToClassList("nav-hint");
+            _editorRoot.Add(hint);
+
+            // ---- остальные вкладки ----
+            BuildGraphTab();           // AppPage.Graph.cs
+            BuildGenerationTab();      // AppPage.Generation.cs
+            BuildHooksTab();           // AppPage.Hooks.cs
+            BuildNavClassesTab();      // AppPage.NavClasses.cs
+            BuildExternalFilesTab();   // AppPage.External.cs
+            ShowTab(0);
+
+            ApplyTheme();              // AppPage.Theme.cs — палитра Nexus в C#
+            return _root;
+        }
+
+        private void InitRegistries()
+        {
+            _pageReg = new Registry
+            {
+                Name           = "page",
+                SectionTitle   = "Pages (PageUID source)",
+                ReadStored     = () => _navData != null ? _navData.Pages : Array.Empty<string>(),
+                WriteStored    = ids => _navData?.EditorSetPages(ids),
+                HashOf         = id => new PageUID(id).Id,
+                UidTypeName    = "PageUID",
+                DefaultPrefix  = "to-",
+                DefaultPostfix = "__navigation",
+                PrefixField    = SettingPagePrefixField,
+                PostfixField   = SettingPagePostfixField,
+                EntryKind      = NavigationSetting.EntryKind.Page,
+            };
+            _pageReg.Prefix  = _pageReg.OriginalPrefix  = _pageReg.DefaultPrefix;
+            _pageReg.Postfix = _pageReg.OriginalPostfix = _pageReg.DefaultPostfix;
+
+            _popupReg = new Registry
+            {
+                Name           = "popup",
+                SectionTitle   = "Popups (PopupUID source)",
+                ReadStored     = () => _navData != null ? _navData.Popups : Array.Empty<string>(),
+                WriteStored    = ids => _navData?.EditorSetPopups(ids),
+                HashOf         = id => new PopupUID(id).Id,
+                UidTypeName    = "PopupUID",
+                DefaultPrefix  = "open-",
+                DefaultPostfix = "__navigation",
+                PrefixField    = SettingPopupPrefixField,
+                PostfixField   = SettingPopupPostfixField,
+                EntryKind      = NavigationSetting.EntryKind.Popup,
+            };
+            _popupReg.Prefix  = _popupReg.OriginalPrefix  = _popupReg.DefaultPrefix;
+            _popupReg.Postfix = _popupReg.OriginalPostfix = _popupReg.DefaultPostfix;
+        }
+
+        private void BuildSection(Registry reg, string addLabel)
+        {
+            var bar = new VisualElement();
+            bar.AddToClassList("nav-toolbar");
+
+            var title = new Label(reg.SectionTitle);
+            title.AddToClassList("nav-section-title");
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+
+            var addBtn = new Button(() => OnAddRow(reg)) { text = addLabel };
+            addBtn.AddToClassList("nav-btn");
+
+            bar.Add(title);
+            bar.Add(spacer);
+            bar.Add(addBtn);
+            _editorRoot.Add(bar);
+
+            var affixRow = new VisualElement();
+            affixRow.AddToClassList("nav-affix-row");
+
+            reg.PrefixUI = new TextField("Prefix") { value = reg.Prefix };
+            reg.PrefixUI.AddToClassList("nav-affix-field");
+            reg.PrefixUI.RegisterValueChangedCallback(evt =>
+            {
+                reg.Prefix = evt.newValue ?? "";
+                RefreshAllPreviews(reg);
+                MarkDirty();
+                Validate();
+            });
+
+            reg.PostfixUI = new TextField("Postfix") { value = reg.Postfix };
+            reg.PostfixUI.AddToClassList("nav-affix-field");
+            reg.PostfixUI.RegisterValueChangedCallback(evt =>
+            {
+                reg.Postfix = evt.newValue ?? "";
+                RefreshAllPreviews(reg);
+                MarkDirty();
+                Validate();
+            });
+
+            affixRow.Add(reg.PrefixUI);
+            affixRow.Add(reg.PostfixUI);
+            _editorRoot.Add(affixRow);
+
+            reg.AffixExample = new Label();
+            reg.AffixExample.AddToClassList("nav-hint");
+            _editorRoot.Add(reg.AffixExample);
+
+            var header = new VisualElement();
+            header.AddToClassList("nav-header");
+            header.Add(MakeCol("Id", "nav-col--class"));
+            header.Add(MakeCol("Generated USS class", "nav-col--page"));
+            header.Add(MakeCol("", "nav-col--actions"));
+            _editorRoot.Add(header);
+
+            reg.ListView = new ScrollView(ScrollViewMode.Vertical);
+            reg.ListView.AddToClassList("nav-list");
+            _editorRoot.Add(reg.ListView);
+
+            UpdateAffixExample(reg);
+        }
+
+        private static Label MakeCol(string text, string modifier)
+        {
+            var l = new Label(text);
+            l.AddToClassList("nav-col");
+            l.AddToClassList(modifier);
+            return l;
+        }
+
+        // ---------------------------------------------------------- rebuild
+
+        private void RebuildRows(Registry reg)
+        {
+            reg.ListView.Clear();
+
+            foreach (var row in reg.Rows)
+            {
+                var container = new VisualElement();
+                container.AddToClassList("nav-row");
+                container.AddToClassList("nav-page-row");
+                row.Container = container;
+
+                var idField = new TextField { value = row.Id };
+                idField.AddToClassList("nav-page-id-field");
+                idField.AddToClassList("nav-class-field");
+
+                var classLabel = new Label();
+                classLabel.AddToClassList("nav-page-class");
+
+                var hashLabel = new Label();
+                hashLabel.AddToClassList("nav-page-hash");
+
+                row.ClassLabel = classLabel;
+                row.HashLabel  = hashLabel;
+
+                idField.RegisterValueChangedCallback(evt =>
+                {
+                    row.Id = evt.newValue?.Trim() ?? "";
+                    RefreshPreview(reg, row);   // только эта строка — фокус не теряем
+                    MarkDirty();
+                    Validate();
+                });
+
+                container.Add(idField);
+                container.Add(classLabel);
+                container.Add(hashLabel);
+
+                var captured = row;
+                var remove = new Button(() =>
+                {
+                    reg.Rows.Remove(captured);
+                    RebuildRows(reg);
+                    MarkDirty();
+                    Validate();
+                }) { text = "\u2715" };
+                remove.AddToClassList("nav-remove");
+                remove.tooltip = $"Remove this {reg.Name} id (asks about its UXML class on Apply)";
+                container.Add(remove);
+
+                reg.ListView.Add(container);
+
+                RefreshPreview(reg, row);
+            }
+
+            Validate();
+            ApplyTheme();
+        }
+
+        private void RefreshPreview(Registry reg, PageRow row)
+        {
+            var id  = (row.Id ?? "").Trim();
+            var cls = Compose(reg.Prefix, reg.Postfix, id);
+            if (row.ClassLabel != null) row.ClassLabel.text = id.Length == 0 ? "\u2014" : $".{cls}";
+            if (row.HashLabel  != null) row.HashLabel.text  = id.Length == 0 ? "" : $"0x{reg.HashOf(id):X16}";
+        }
+
+        private void RefreshAllPreviews(Registry reg)
+        {
+            UpdateAffixExample(reg);
+            foreach (var row in reg.Rows)
+                RefreshPreview(reg, row);
+        }
+
+        private void UpdateAffixExample(Registry reg)
+        {
+            if (reg.AffixExample != null)
+                reg.AffixExample.text = $"Example: \"MainMenu\"  \u2192  .{Compose(reg.Prefix, reg.Postfix, "MainMenu")}";
+        }
+
+        private void SyncAffixUI(Registry reg)
+        {
+            reg.PrefixUI?.SetValueWithoutNotify(reg.Prefix);
+            reg.PostfixUI?.SetValueWithoutNotify(reg.Postfix);
+            UpdateAffixExample(reg);
+        }
+
+        // --------------------------------------------------------- validate
+
+        private void Validate()
+        {
+            // class-уникальность — глобально (один uss-файл); id-уникальность — внутри реестра.
+            var classCount = new Dictionary<string, int>(StringComparer.Ordinal);
+            var pageIds  = TallyClasses(_pageReg,  classCount);
+            var popupIds = TallyClasses(_popupReg, classCount);
+
+            var errors = MarkRows(_pageReg, pageIds, classCount)
+                       + MarkRows(_popupReg, popupIds, classCount);
+
+            _applyBtn?.SetEnabled(errors == 0);
+
+            if (errors > 0)
+                Context.SetStatus(
+                    "Issue(s): empty/duplicate id, colliding generated class (across pages & popups), or invalid class.",
+                    StatusKind.Error);
+            else
+                Context.SetStatus(
+                    $"{pageIds.Count} page(s), {popupIds.Count} popup(s). Ready to Apply.",
+                    StatusKind.Info);
+        }
+
+        private Dictionary<string, int> TallyClasses(Registry reg, Dictionary<string, int> classCount)
+        {
+            var idCount = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var row in reg.Rows)
+            {
+                var id = (row.Id ?? "").Trim();
+                if (id.Length == 0) continue;
+
+                idCount.TryGetValue(id, out var ic);
+                idCount[id] = ic + 1;
+
+                var cls = Compose(reg.Prefix, reg.Postfix, id);
+                classCount.TryGetValue(cls, out var cc);
+                classCount[cls] = cc + 1;
+            }
+            return idCount;
+        }
+
+        private int MarkRows(Registry reg, Dictionary<string, int> idCount, Dictionary<string, int> classCount)
+        {
+            var errors = 0;
+            foreach (var row in reg.Rows)
+            {
+                var id = (row.Id ?? "").Trim();
+
+                bool conflict;
+                if (id.Length == 0)
+                {
+                    conflict = true;
+                }
+                else
+                {
+                    var cls = Compose(reg.Prefix, reg.Postfix, id);
+                    conflict = idCount[id] > 1 || classCount[cls] > 1 || !ClassRx.IsMatch(cls);
+                }
+
+                if (conflict) errors++;
+
+                // класс — маркер состояния; цвет красим в C# (тема Nexus резолвится из кода)
+                if (row.Container != null)
+                {
+                    row.Container.EnableInClassList("nav-row--conflict", conflict);
+                    ApplyRowState(row.Container, conflict);   // AppPage.Theme.cs
+                }
+            }
+            return errors;
+        }
+
+        // ----------------------------------------------------------- actions
+
+        private void OnAddRow(Registry reg)
+        {
+            reg.Rows.Add(new PageRow());
+            RebuildRows(reg);
+            MarkDirty();
+        }
+
+        private void OnApplyClicked()
+        {
+            Validate();
+            if (_applyBtn is { enabledSelf: false })
+            {
+                Context.SetStatus("Cannot apply \u2014 resolve the highlighted issues first.", StatusKind.Error);
+                return;
+            }
+
+            if (_navData == null)
+            {
+                Context.SetStatus("NavigationData asset not found/created.", StatusKind.Error);
+                return;
+            }
+
+            var idsPages  = DedupIds(_pageReg);
+            var idsPopups = DedupIds(_popupReg);
+
+            // ---- 1. диффим оба реестра, спрашиваем про uxml ----
+            var migrations = new List<ClassMigration>();
+            migrations.AddRange(BuildMigrations(_pageReg));
+            migrations.AddRange(BuildMigrations(_popupReg));
+
+            List<(string path, string text)> uxml = null;
+
+            if (migrations.Count > 0)
+            {
+                uxml = LoadAllUxml();
+                foreach (var mig in migrations)
+                {
+                    foreach (var f in uxml)
+                        mig.Hits += CountToken(f.text, mig.OldClass);
+
+                    if (mig.Hits == 0)
+                    {
+                        mig.Action = MigrationAction.Skip;   // нечего мигрировать — не дёргаем диалог
+                        continue;
+                    }
+                    ResolveMigrationDialog(mig);
+                }
+            }
+
+            // ---- 2. id обоих видов в NavigationData (типизированно, без рефлексии) ----
+            UnityEditor.Undo.RecordObject(_navData, "Edit App Navigation Ids");
+            _pageReg.WriteStored(idsPages);
+            _popupReg.WriteStored(idsPopups);
+            EditorUtility.SetDirty(_navData);
+
+            // ---- 3. NavigationSetting (entries обоих видов + аффиксы) ----
+            UnityEditor.Undo.RecordObject(_setting, "Edit Navigation Links");
+            var entries = new List<NavigationSetting.NavigationEntry>();
+            AppendEntries(entries, _pageReg, idsPages);
+            AppendEntries(entries, _popupReg, idsPopups);
+            _setting.EditorSetEntries(entries);
+            WriteAffix(_pageReg);
+            WriteAffix(_popupReg);
+            EditorUtility.SetDirty(_setting);
+
+            // ---- 4. uss (оба реестра в один файл) ----
+            RegenerateUss(idsPages, idsPopups);
+
+            // ---- 5. uxml-миграция: единый словарь токенов, один проход ----
+            var filesChanged = 0;
+            if (uxml != null)
+            {
+                var map = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var mig in migrations)
+                {
+                    if (mig.Action == MigrationAction.Skip) continue;
+                    map[mig.OldClass] = mig.Action == MigrationAction.Rename ? mig.NewClass : null; // null => delete
+                }
+
+                if (map.Count > 0)
+                {
+                    foreach (var f in uxml)
+                    {
+                        var newText = RewriteTokens(f.text, map, out var changed);
+                        if (!changed) continue;
+                        File.WriteAllText(f.path, newText);
+                        AssetDatabase.ImportAsset(f.path);
+                        filesChanged++;
+                    }
+                }
+            }
+
+            // ---- 5b. переименование самих uxml-файлов и их папок по смене id ----
+            var renames = new List<(string oldId, string newId, bool isPopup)>();
+            CollectIdRenames(_pageReg, renames);
+            CollectIdRenames(_popupReg, renames);
+            var (assetsRenamed, renameNote) = RenamePageAssets(renames);
+
+            AssetDatabase.SaveAssets();
+
+            // ---- 6. пересобираем снапшоты обоих реестров ----
+            Resnapshot(_pageReg, idsPages);
+            Resnapshot(_popupReg, idsPopups);
+            ClearDirty();
+
+            Context.SetStatus(
+                $"Applied: {idsPages.Count} page(s), {idsPopups.Count} popup(s) \u2192 NavigationData + {AppPaths.NavUssPath}; " +
+                $"UXML files changed: {filesChanged}; assets renamed: {assetsRenamed}.{renameNote}",
+                StatusKind.Ok);
+        }
+
+        // Собирает реальные переименования id (включая смену только регистра/папки),
+        // независимо от того, менялся ли USS-класс и есть ли он в uxml.
+        private static void CollectIdRenames(Registry reg, List<(string oldId, string newId, bool isPopup)> acc)
+        {
+            bool isPopup = reg.EntryKind == NavigationSetting.EntryKind.Popup;
+            foreach (var row in reg.Rows)
+            {
+                if (string.IsNullOrEmpty(row.OriginalId)) continue;   // новая строка
+                var newId = (row.Id ?? "").Trim();
+                if (newId.Length == 0) continue;
+                if (string.Equals(row.OriginalId, newId, StringComparison.Ordinal)) continue;
+                acc.Add((row.OriginalId, newId, isPopup));
+            }
+        }
+
+        // Переименовывает <PagesRoot|PopupsRoot>/<Class>/<id>.uxml и саму папку.
+        // Аккуратно: только если старый ассет/папка существуют и в целевом месте ничего нет.
+        private (int renamed, string note) RenamePageAssets(List<(string oldId, string newId, bool isPopup)> renames)
+        {
+            if (renames == null || renames.Count == 0) return (0, string.Empty);
+
+            int renamed = 0;
+            var notes = new List<string>();
+
+            foreach (var (oldId, newId, isPopup) in renames)
+            {
+                var oldFolder = TemplateFolder(oldId, isPopup);
+                var newFolder = TemplateFolder(newId, isPopup);
+                var oldUxml   = TemplateUxmlPath(oldId, isPopup);
+                var newUxmlNameNoExt = SanitizeFileName(newId);
+
+                bool fileMoved = false, folderMoved = false;
+
+                // 1) переименовать файл внутри старой папки (если он там есть и имя меняется)
+                if (File.Exists(oldUxml))
+                {
+                    var curNameNoExt = Path.GetFileNameWithoutExtension(oldUxml);
+                    if (!string.Equals(curNameNoExt, newUxmlNameNoExt, StringComparison.Ordinal))
+                    {
+                        var targetInOldFolder = $"{oldFolder}/{newUxmlNameNoExt}.uxml";
+                        if (File.Exists(targetInOldFolder))
+                            notes.Add($"{oldId}->{newId}: target uxml already exists, file rename skipped");
+                        else
+                        {
+                            var err = AssetDatabase.RenameAsset(oldUxml, newUxmlNameNoExt);
+                            if (string.IsNullOrEmpty(err)) fileMoved = true;
+                            else notes.Add($"{oldId}->{newId}: uxml rename failed ({err})");
+                        }
+                    }
+                }
+
+                // 2) переименовать саму папку (если имя класса-папки меняется)
+                if (!string.Equals(oldFolder, newFolder, StringComparison.Ordinal) &&
+                    AssetDatabase.IsValidFolder(oldFolder))
+                {
+                    if (AssetDatabase.IsValidFolder(newFolder))
+                    {
+                        notes.Add($"{oldId}->{newId}: target folder already exists, folder rename skipped");
+                    }
+                    else
+                    {
+                        var newLeaf = Path.GetFileName(newFolder);
+                        var err = AssetDatabase.RenameAsset(oldFolder, newLeaf);
+                        if (string.IsNullOrEmpty(err)) folderMoved = true;
+                        else notes.Add($"{oldId}->{newId}: folder rename failed ({err})");
+                    }
+                }
+
+                if (fileMoved || folderMoved) renamed++;
+            }
+
+            var note = notes.Count > 0 ? "  (" + string.Join("; ", notes) + ")" : string.Empty;
+            return (renamed, note);
+        }
+
+        private static List<string> DedupIds(Registry reg)
+        {
+            var ids = new List<string>();
+            foreach (var row in reg.Rows)
+            {
+                var id = (row.Id ?? "").Trim();
+                if (id.Length == 0) continue;
+                if (!ids.Contains(id)) ids.Add(id);
+            }
+            return ids;
+        }
+
+        private static void AppendEntries(List<NavigationSetting.NavigationEntry> entries, Registry reg, List<string> ids)
+        {
+            foreach (var id in ids)
+            {
+                entries.Add(new NavigationSetting.NavigationEntry
+                {
+                    ClassName = Compose(reg.Prefix, reg.Postfix, id),
+                    Bound     = true,
+                    Kind      = reg.EntryKind,
+                    Page      = id                 // строковый id (page/popup), различается по Kind
+                });
+            }
+        }
+
+        // --------------------------------------------------- migration core
+
+        private List<ClassMigration> BuildMigrations(Registry reg)
+        {
+            var migrations = new List<ClassMigration>();
+
+            // переименования/смена аффиксов у выживших строк, у которых был OriginalId
+            foreach (var row in reg.Rows)
+            {
+                if (string.IsNullOrEmpty(row.OriginalId)) continue;  // новая строка
+                var newId = (row.Id ?? "").Trim();
+                if (newId.Length == 0) continue;                     // заблокировано валидацией
+
+                var oldClass = Compose(reg.OriginalPrefix, reg.OriginalPostfix, row.OriginalId);
+                var newClass = Compose(reg.Prefix, reg.Postfix, newId);
+                if (!string.Equals(oldClass, newClass, StringComparison.Ordinal))
+                    migrations.Add(new ClassMigration
+                    {
+                        Label    = reg.Name,
+                        OldClass = oldClass,
+                        NewClass = newClass,
+                        IsPopup  = reg.EntryKind == NavigationSetting.EntryKind.Popup,
+                        OldId    = row.OriginalId,
+                        NewId    = newId
+                    });
+            }
+
+            // удаления: оригинальные id, которыми больше не владеет ни одна строка
+            var surviving = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var row in reg.Rows)
+                if (!string.IsNullOrEmpty(row.OriginalId))
+                    surviving.Add(row.OriginalId);
+
+            foreach (var origId in reg.OriginalIds)
+            {
+                if (surviving.Contains(origId)) continue;
+                migrations.Add(new ClassMigration
+                {
+                    Label    = reg.Name,
+                    OldClass = Compose(reg.OriginalPrefix, reg.OriginalPostfix, origId),
+                    NewClass = null
+                });
+            }
+
+            return migrations;
+        }
+
+        private static void ResolveMigrationDialog(ClassMigration mig)
+        {
+            var noun = char.ToUpperInvariant(mig.Label[0]) + mig.Label.Substring(1);
+
+            if (mig.NewClass != null)
+            {
+                var msg =
+                    $"{noun} class changed:\n\n  .{mig.OldClass}\n      \u2193\n  .{mig.NewClass}\n\n" +
+                    $"Old class is used by {mig.Hits} UXML element(s).\nWhat should happen to it?";
+                var r = EditorUtility.DisplayDialogComplex(
+                    $"App \u2014 {mig.Label} id changed",
+                    msg, "Rename to new", "Do nothing", "Delete old");
+                mig.Action = r == 0 ? MigrationAction.Rename
+                           : r == 2 ? MigrationAction.Delete
+                                    : MigrationAction.Skip;
+            }
+            else
+            {
+                var msg =
+                    $"{noun} removed. Its USS class is gone:\n\n  .{mig.OldClass}\n\n" +
+                    $"Still used by {mig.Hits} UXML element(s).\nDelete it from UXML?";
+                var del = EditorUtility.DisplayDialog(
+                    $"App \u2014 {mig.Label} removed",
+                    msg, "Delete old", "Do nothing");
+                mig.Action = del ? MigrationAction.Delete : MigrationAction.Skip;
+            }
+        }
+
+        // ------------------------------------------------------ uxml helpers
+
+        private static List<(string path, string text)> LoadAllUxml()
+        {
+            var list = new List<(string, string)>();
+            foreach (var guid in AssetDatabase.FindAssets("t:VisualTreeAsset"))
+            {
+                var path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(path) || !path.EndsWith(".uxml", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try { list.Add((path, File.ReadAllText(path))); }
+                catch { /* нечитаемый файл — пропускаем */ }
+            }
+            return list;
+        }
+
+        private static int CountToken(string text, string token)
+        {
+            var count = 0;
+            foreach (Match m in ClassAttrRx.Matches(text))
+            {
+                var val = m.Groups["val"].Value;
+                foreach (var t in val.Split(WS, StringSplitOptions.RemoveEmptyEntries))
+                    if (string.Equals(t, token, StringComparison.Ordinal))
+                        count++;
+            }
+            return count;
+        }
+
+        // Единый проход: каждый токен ищется в map ровно один раз → цепочки X->Y->Z не возникают.
+        private static string RewriteTokens(string text, Dictionary<string, string> map, out bool changed)
+        {
+            var any = false;
+            var result = ClassAttrRx.Replace(text, m =>
+            {
+                var grp   = m.Groups["val"];
+                var parts = grp.Value.Split(WS, StringSplitOptions.RemoveEmptyEntries);
+                var list  = new List<string>(parts.Length);
+                var local = false;
+
+                foreach (var t in parts)
+                {
+                    if (map.TryGetValue(t, out var repl))
+                    {
+                        local = true;
+                        if (repl == null) continue;                 // delete
+                        if (!list.Contains(repl)) list.Add(repl);   // rename (с дедупом)
+                    }
+                    else if (!list.Contains(t))
+                    {
+                        list.Add(t);
+                    }
+                }
+
+                if (!local) return m.Value;
+                any = true;
+
+                var newVal = string.Join(" ", list);
+                var rel    = grp.Index - m.Index;                   // подменяем только значение, формат не трогаем
+                return m.Value.Substring(0, rel) + newVal + m.Value.Substring(rel + grp.Length);
+            });
+
+            changed = any;
+            return result;
+        }
+
+        // ---------------------------------------------------------- writers
+
+        private void WriteAffix(Registry reg)
+        {
+            // нет полей в NavigationSetting → не персистим (работаем на дефолтах в рамках сессии)
+            reg.PrefixField?.SetValue(_setting, reg.Prefix);
+            reg.PostfixField?.SetValue(_setting, reg.Postfix);
+        }
+
+        private void RegenerateUss(List<string> idsPages, List<string> idsPopups)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("/* ============================================================");
+            sb.AppendLine("   Navigation.uss \u2014 AUTO-GENERATED by Nexus / App.");
+            sb.AppendLine("   One class per id: prefix + id.ToLower() + postfix.");
+            sb.AppendLine("   Rebuilt from scratch on every Apply. Do not hand-edit.");
+            sb.AppendLine("   ============================================================ */");
+            sb.AppendLine();
+
+            AppendUssSection(sb, _pageReg, idsPages);
+            AppendUssSection(sb, _popupReg, idsPopups);
+            AppendStandardNavSection(sb);     // to-back-page__navigation и пр. — см. AppPage.NavClasses.cs
+
+            EnsureFolder(AppPaths.StylesDir);
+            File.WriteAllText(AppPaths.NavUssPath, sb.ToString());
+            AssetDatabase.ImportAsset(AppPaths.NavUssPath);
+        }
+
+        private static void AppendUssSection(StringBuilder sb, Registry reg, List<string> ids)
+        {
+            if (ids.Count == 0) return;
+
+            sb.AppendLine($"/* ---- {reg.SectionTitle} ---- */");
+            sb.AppendLine();
+
+            foreach (var id in ids)
+            {
+                var cls  = Compose(reg.Prefix, reg.Postfix, id);
+                var hash = reg.HashOf(id);
+                sb.AppendLine($".{cls} {{");
+                sb.AppendLine($"    /* -> {reg.UidTypeName} \"{id}\" 0x{hash:X16} */");
+                sb.AppendLine("}");
+                sb.AppendLine();
+            }
+        }
+
+        // ------------------------------------------------------------- state
+
+        private NavigationSetting LoadOrCreateSetting()
+        {
+            var s = AssetDatabase.LoadAssetAtPath<NavigationSetting>(AppPaths.SettingPath);
+            if (s != null)
+                return s;
+
+            EnsureFolder(AppPaths.ResourcesDir);
+            s = ScriptableObject.CreateInstance<NavigationSetting>();
+            AssetDatabase.CreateAsset(s, AppPaths.SettingPath);
+            AssetDatabase.SaveAssets();
+            Context.SetStatus($"Created {AppPaths.SettingPath}.", StatusKind.Ok);
+            return s;
+        }
+
+        private NavigationData LoadOrCreateNavigationData()
+        {
+            var d = AssetDatabase.LoadAssetAtPath<NavigationData>(AppPaths.NavigationDataPath);
+            if (d != null)
+                return d;
+
+            EnsureFolder(AppPaths.ResourcesDir);
+            d = ScriptableObject.CreateInstance<NavigationData>();
+            AssetDatabase.CreateAsset(d, AppPaths.NavigationDataPath);
+            AssetDatabase.SaveAssets();
+            Context.SetStatus($"Created {AppPaths.NavigationDataPath}.", StatusKind.Ok);
+            return d;
+        }
+
+        private void LoadAll()
+        {
+            LoadRegistry(_pageReg);
+            LoadRegistry(_popupReg);
+        }
+
+        private void LoadRegistry(Registry reg)
+        {
+            // аффиксы
+            reg.Prefix  = ReadAffix(reg.PrefixField,  reg.DefaultPrefix);
+            reg.Postfix = ReadAffix(reg.PostfixField, reg.DefaultPostfix);
+            reg.OriginalPrefix  = reg.Prefix;
+            reg.OriginalPostfix = reg.Postfix;
+
+            // id
+            reg.Rows.Clear();
+            reg.OriginalIds.Clear();
+
+            var ids = reg.ReadStored();
+            if (ids != null)
+            {
+                foreach (var raw in ids)
+                {
+                    var id = (raw ?? "").Trim();
+                    reg.Rows.Add(new PageRow { Id = id, OriginalId = id.Length == 0 ? null : id });
+                    if (id.Length > 0 && !reg.OriginalIds.Contains(id))
+                        reg.OriginalIds.Add(id);
+                }
+            }
+
+            SyncAffixUI(reg);
+            RebuildRows(reg);
+        }
+
+        private string ReadAffix(FieldInfo field, string fallback)
+        {
+            if (field == null || _setting == null) return fallback;
+            var v = field.GetValue(_setting) as string;
+            return string.IsNullOrEmpty(v) ? fallback : v;   // пустое значение трактуем как «дефолт»
+        }
+
+        private void Resnapshot(Registry reg, List<string> appliedIds)
+        {
+            reg.OriginalPrefix  = reg.Prefix;
+            reg.OriginalPostfix = reg.Postfix;
+
+            reg.OriginalIds.Clear();
+            reg.OriginalIds.AddRange(appliedIds);
+
+            foreach (var row in reg.Rows)
+            {
+                var id = (row.Id ?? "").Trim();
+                row.OriginalId = id.Length == 0 ? null : id;
+            }
+        }
+
+        private static string Compose(string prefix, string postfix, string id)
+            => $"{prefix}{(id ?? string.Empty).Trim().ToLowerInvariant()}{postfix}";
+
+        private void MarkDirty()
+        {
+            _dirty = true;
+            SessionState.SetBool(Context.GetSessionKey("dirty"), true);
+            if (_applyBtn != null)
+                _applyBtn.text = "Apply *";
+        }
+
+        private void ClearDirty()
+        {
+            _dirty = false;
+            SessionState.SetBool(Context.GetSessionKey("dirty"), false);
+            if (_applyBtn != null)
+                _applyBtn.text = "Apply";
+        }
+
+        private static void EnsureFolder(string path)
+        {
+            if (AssetDatabase.IsValidFolder(path))
+                return;
+
+            var parent = Path.GetDirectoryName(path)?.Replace("\\", "/");
+            var leaf = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(leaf))
+                return;
+
+            if (!AssetDatabase.IsValidFolder(parent))
+                EnsureFolder(parent);
+
+            AssetDatabase.CreateFolder(parent, leaf);
+        }
+
+        // ------------------------------------------------------- page hooks
+
+        public override void OnEnter()
+        {
+            _setting = LoadOrCreateSetting();
+            _navData = LoadOrCreateNavigationData();
+            LoadAll();
+            ClearDirty();
+        }
+
+        public override void OnRefresh()
+        {
+            AppPaths.Reload();
+            _setting = LoadOrCreateSetting();
+            _navData = LoadOrCreateNavigationData();
+            LoadAll();
+            ClearDirty();
+            Context.SetStatus("Reloaded from NavigationData + NavigationSetting.", StatusKind.Info);
+        }
+
+        public override bool CanClose()
+        {
+            if (_dirty)
+            {
+                Context.SetStatus("Unapplied navigation changes \u2014 press Apply to save.", StatusKind.Warning);
+                return false;
+            }
+            return true;
+        }
+    }
+}

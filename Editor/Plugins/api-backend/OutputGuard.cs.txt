@@ -1,0 +1,82 @@
+using System.Collections.Generic;
+using System.IO;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Защитные проверки перед генерацией версии:
+    ///  1. Ручные правки в выводе профиля — regen молча их затрёт.
+    ///  2. link.xml версии — без него IL2CPP-стриппинг ломает десериализацию
+    ///     моделей ЭТОЙ версии. Файл per-version: Assets/Api/&lt;Wrapper&gt;/link.xml.
+    /// </summary>
+    public static class OutputGuard
+    {
+        public sealed class ManualEdits
+        {
+            public List<string> EditedFiles = new();
+            public bool Any => EditedFiles.Count > 0;
+        }
+
+        public sealed class LinkXmlStatus
+        {
+            public bool Exists;
+            public bool PreservesModels;
+            public bool PreservesNewtonsoft;
+            public bool Ok => Exists && PreservesModels && PreservesNewtonsoft;
+            public string Hint;
+        }
+
+        /// <summary>
+        /// Файлы вывода профиля, отличающиеся от зеркала его последней генерации —
+        /// это и есть ручные правки, которые перезапись потеряет. asmdef версии
+        /// живёт в той же папке, но он не .cs — дифф его не видит, правки ссылок
+        /// в нём деплой не трогает.
+        /// </summary>
+        public static ManualEdits DetectManualEdits(ApiCodegenProfile profile, CodegenSnapshot snapshot)
+        {
+            var result = new ManualEdits();
+            if (snapshot == null || !snapshot.Exists) return result; // не с чем сравнивать
+
+            foreach (var change in CodeDiffer.Diff(profile.OutputDir, snapshot))
+            {
+                // Added/Removed относительно зеркала тоже подозрительны до regen,
+                // но самое опасное — Modified: затрётся именно отредактированный файл.
+                if (change.Kind == CodeDiffer.ChangeKind.Modified)
+                    result.EditedFiles.Add(change.RelPath);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Проверка link.xml версии. Отсутствие — не ошибка ДО первой генерации:
+        /// движок сам создаст его при генерации (VersionDeployer.EnsureVersionScaffold);
+        /// гард ловит случай, когда файл есть, но нужные сборки из него выпилили.
+        /// </summary>
+        public static LinkXmlStatus CheckLinkXml(ApiCodegenProfile profile)
+        {
+            var status = new LinkXmlStatus();
+            var abs = Path.Combine(ApiCodegenConfig.ProjectRoot, profile.LinkXmlPath);
+
+            if (!File.Exists(abs))
+            {
+                status.Hint = $"link.xml версии не найден ({profile.LinkXmlPath}) — будет создан при генерации.";
+                return status;
+            }
+
+            status.Exists = true;
+            var text = File.ReadAllText(abs);
+            status.PreservesModels = text.Contains(profile.ResolvePackageName());
+            status.PreservesNewtonsoft = text.Contains("Newtonsoft.Json");
+
+            if (!status.PreservesModels || !status.PreservesNewtonsoft)
+            {
+                var missing = new List<string>();
+                if (!status.PreservesModels) missing.Add(profile.ResolvePackageName());
+                if (!status.PreservesNewtonsoft) missing.Add("Newtonsoft.Json");
+                status.Hint = $"В {profile.LinkXmlPath} не сохранены сборки: {string.Join(", ", missing)} — " +
+                              "на IL2CPP модели этой версии могут перестать десериализоваться.";
+            }
+            return status;
+        }
+    }
+}

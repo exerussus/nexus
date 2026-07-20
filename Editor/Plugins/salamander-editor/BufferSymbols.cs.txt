@@ -1,0 +1,136 @@
+using System;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Символ-блок текущего буфера: trigger/class/listener/enum и его члены.
+    internal sealed class BufferBlock
+    {
+        public string Kind;
+        public string Name;
+        public readonly List<BufferMember> Members = new List<BufferMember>();
+    }
+
+    internal struct BufferMember
+    {
+        public string Name;
+        public string Detail;   // сигнатура func или «тип имя» поля
+        public bool IsFunc;     // вставлять со скобками
+        public bool HasArgs;    // каретку внутрь скобок при вставке
+    }
+
+    // Лёгкий скан символов буфера: регэкспы + подсчёт скобок с пропуском строк/комментариев.
+    // Это НЕ парсер — для подсказок достаточно, правду всё равно скажет компилятор.
+    internal static class BufferSymbolScanner
+    {
+        private static readonly Regex BlockRegex =
+            new Regex(@"\b(trigger|class|listener|enum)\s+([A-Za-z_]\w*)", RegexOptions.Compiled);
+        private static readonly Regex FuncRegex =
+            new Regex(@"\bfunc\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:->\s*([^\s{;]+))?", RegexOptions.Compiled);
+        private static readonly Regex FieldRegex =
+            new Regex(@"^\s*(const\s+)?([A-Za-z_]\w*(?:<[^>\n]+>)?(?:\[\])?)\s+([A-Za-z_]\w*)\s*(?:=|;)",
+                RegexOptions.Compiled | RegexOptions.Multiline);
+        private static readonly Regex IdentRegex =
+            new Regex(@"[A-Za-z_]\w*", RegexOptions.Compiled);
+
+        // Слова, которые FieldRegex ошибочно принял бы за тип поля («return n;», «else x = 1»)
+        private static readonly HashSet<string> NotAType = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "return", "else", "in", "new", "until", "wait", "spawn", "break", "continue",
+            "pass", "event", "action", "func", "if", "while", "for", "disabled",
+            "trigger", "class", "listener", "enum",
+        };
+
+        public static void Scan(string text, List<BufferBlock> result)
+        {
+            result.Clear();
+            if (string.IsNullOrEmpty(text)) return;
+
+            foreach (Match m in BlockRegex.Matches(text))
+            {
+                var block = new BufferBlock { Kind = m.Groups[1].Value, Name = m.Groups[2].Value };
+                result.Add(block);
+                int open = text.IndexOf('{', m.Index);
+                if (open < 0) continue;
+                int close = FindBlockEnd(text, open);
+                string body = text.Substring(open + 1, Math.Max(0, close - open - 1));
+                if (block.Kind == "enum") ScanEnumMembers(body, block);
+                else ScanMembers(body, block);
+            }
+        }
+
+        private static void ScanMembers(string body, BufferBlock block)
+        {
+            foreach (Match f in FuncRegex.Matches(body))
+            {
+                string args = f.Groups[2].Value.Trim();
+                string ret = f.Groups[3].Success ? " -> " + f.Groups[3].Value : "";
+                block.Members.Add(new BufferMember
+                {
+                    Name = f.Groups[1].Value,
+                    Detail = $"{f.Groups[1].Value}({args}){ret}",
+                    IsFunc = true,
+                    HasArgs = args.Length > 0,
+                });
+            }
+            foreach (Match fd in FieldRegex.Matches(body))
+            {
+                string type = fd.Groups[2].Value;
+                if (NotAType.Contains(type)) continue;
+                block.Members.Add(new BufferMember
+                {
+                    Name = fd.Groups[3].Value,
+                    Detail = $"{type} {fd.Groups[3].Value}",
+                    IsFunc = false,
+                });
+            }
+        }
+
+        private static void ScanEnumMembers(string body, BufferBlock block)
+        {
+            foreach (Match id in IdentRegex.Matches(body))
+                block.Members.Add(new BufferMember
+                {
+                    Name = id.Value,
+                    Detail = $"{block.Name}.{id.Value}",
+                });
+        }
+
+        // Конец блока: подсчёт {} с пропуском строк и комментариев —
+        // иначе скобка внутри Engine.Log("...}") ломает границы блока.
+        private static int FindBlockEnd(string t, int open)
+        {
+            int depth = 0;
+            for (int i = open; i < t.Length; i++)
+            {
+                char c = t[i];
+                if (c == '/' && i + 1 < t.Length && t[i + 1] == '/')
+                {
+                    while (i < t.Length && t[i] != '\n') i++;
+                    continue;
+                }
+                if (c == '/' && i + 1 < t.Length && t[i + 1] == '*')
+                {
+                    i += 2;
+                    while (i + 1 < t.Length && !(t[i] == '*' && t[i + 1] == '/')) i++;
+                    i++;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    i++;
+                    while (i < t.Length && t[i] != '"' && t[i] != '\n')
+                    {
+                        if (t[i] == '\\') i++;
+                        i++;
+                    }
+                    continue;
+                }
+                if (c == '{') depth++;
+                else if (c == '}' && --depth == 0) return i;
+            }
+            return t.Length - 1;
+        }
+    }
+}

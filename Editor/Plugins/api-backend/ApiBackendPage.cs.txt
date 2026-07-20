@@ -1,0 +1,257 @@
+using System;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Страница «API / Backend» — доменная: всё про стык игры с бэком.
+    /// Тонкая надстройка над ApiCodegenEngine; вся логика в движке, тут — UI.
+    /// Разнесена по табам: ApiBackendPage.Config.cs / .Profiles.cs / .Drift.cs /
+    /// .Generate.cs. Инструкция по setup — в Plugins/api-backend/README.md
+    /// (панель Nexus Manage), in-page README-таба больше нет.
+    ///
+    /// Nexus-плагин kind=servicing: продукт (Assets/Api, Tools/openapi-templates,
+    /// ProjectSettings/ApiCodegen.*) живёт ВНЕ Nexus, disable/Restore его не
+    /// трогает — сносится только явно кнопками страницы. Движок кодогена
+    /// задеплоен в State вместе со страницей: CI (ApiCodegenBatch) работает
+    /// только при задеплоенной странице — осознанное решение.
+    ///
+    /// Профили = версии API: у каждого своя спека, обёртка, вывод и снапшот.
+    /// «Выбранный» профиль — чистый UI-стейт (SessionState); CI всегда берёт все.
+    ///
+    /// Цвета — ТОЛЬКО токены палитры (Context.Theme/Context.Ui); uss страницы
+    /// держит один layout. Граф usage/impact и профили окружений — фаза 2.
+    /// </summary>
+    [EditorPage("api-backend", "API / Backend", PageCategory.Infrastructure, order: 20)]
+    public sealed partial class ApiBackendPage : EditorPageBase
+    {
+        private enum Tab { Config, Profiles, Drift, Generate }
+
+        // Общий стейт страницы (живёт между табами в рамках одного инстанса).
+        private ApiCodegenConfig _config;
+        private Tab _active = Tab.Config;
+        private string _selectedProfileId = "";
+
+        private VisualElement _root;
+        private VisualElement _tabBar;
+        private VisualElement _content;
+
+        public override VisualElement BuildUI()
+        {
+            // Только каркас: конфиг и контент таба — лениво в OnEnter (lazy by default).
+            _root = new VisualElement();
+            _root.AddToClassList("api-root");
+
+            // uss — layout-only; путь к нему знает хаб, не страница (инвариант #7).
+            var sheet = Context.LoadDeployedAsset<StyleSheet>("ApiBackendPage.uss");
+            if (sheet != null) _root.styleSheets.Add(sheet);
+
+            _tabBar = new VisualElement();
+            _tabBar.AddToClassList("api-tabbar");
+            _tabBar.style.borderBottomColor = Context.Theme.Get(NexusToken.Border);
+            _root.Add(_tabBar);
+
+            BuildTabButton("Config", Tab.Config);
+            BuildTabButton("Profiles", Tab.Profiles);
+            BuildTabButton("Drift", Tab.Drift);
+            BuildTabButton("Generate", Tab.Generate);
+
+            _content = new VisualElement();
+            _content.AddToClassList("api-content");
+            _root.Add(_content);
+
+            return _root;
+        }
+
+        public override void OnEnter()
+        {
+            _config ??= ApiCodegenConfig.Load();
+
+            // Восстанавливаем последний открытый таб и выбранный профиль
+            // (оба переживают domain reload через SessionState).
+            _selectedProfileId = SessionState.GetString(Context.GetSessionKey("profileId"), "");
+            var saved = SessionState.GetInt(Context.GetSessionKey("activeTab"), (int)Tab.Config);
+            if (!Enum.IsDefined(typeof(Tab), saved)) saved = (int)Tab.Config; // стейт старой схемы табов
+            SelectTab((Tab)saved);
+        }
+
+        public override void OnRefresh()
+        {
+            // Явный Refresh = перечитать конфиг с диска (правки CI/соседней машины).
+            // Несохранённые правки полей при этом отбрасываются — это и есть Refresh.
+            _config = ApiCodegenConfig.Load();
+            SelectTab(_active);
+        }
+
+        // --- Табы ----------------------------------------------------------------
+
+        private void BuildTabButton(string label, Tab tab)
+        {
+            var btn = new Button(() => SelectTab(tab)) { text = label };
+            btn.AddToClassList("api-tab");
+            btn.userData = tab;
+
+            // Hover красим руками: USS-псевдоклассы палитру не знают — токены живут в C#.
+            btn.RegisterCallback<PointerEnterEvent>(_ =>
+            {
+                if ((Tab)btn.userData == _active) return;
+                btn.style.color = Context.Theme.Get(NexusToken.TextNormal);
+                btn.style.backgroundColor = Context.Theme.Get(NexusToken.SurfaceHover);
+            });
+            btn.RegisterCallback<PointerLeaveEvent>(_ => PaintTab(btn, (Tab)btn.userData == _active));
+
+            _tabBar.Add(btn);
+            PaintTab(btn, tab == _active);
+        }
+
+        private void PaintTab(Button btn, bool active)
+        {
+            // Сброс inline-стилей в Null → работают transparent-дефолты из uss
+            // (никаких цветовых литералов на странице).
+            btn.style.backgroundColor = StyleKeyword.Null;
+            btn.style.color = Context.Theme.Get(active ? NexusToken.Accent : NexusToken.TextDim);
+            btn.style.borderBottomColor = active
+                ? (StyleColor)Context.Theme.Get(NexusToken.Accent)
+                : (StyleColor)StyleKeyword.Null;
+        }
+
+        private void SelectTab(Tab tab)
+        {
+            _active = tab;
+            SessionState.SetInt(Context.GetSessionKey("activeTab"), (int)tab);
+
+            foreach (var child in _tabBar.Children())
+                if (child is Button b)
+                    PaintTab(b, (Tab)b.userData == tab);
+
+            _content.Clear();
+            switch (tab)
+            {
+                case Tab.Config:   BuildConfigTab(_content);   break;
+                case Tab.Profiles: BuildProfilesTab(_content); break;
+                case Tab.Drift:    BuildDriftTab(_content);    break;
+                case Tab.Generate: BuildGenerateTab(_content); break;
+            }
+        }
+
+        // --- Выбранный профиль (UI-стейт; на билд/CI не влияет) --------------------
+
+        private ApiCodegenProfile SelectedProfile
+        {
+            get
+            {
+                var p = _config.GetProfile(_selectedProfileId);
+                if (p != null) _selectedProfileId = p.Id; // фолбэк на первый закрепляем
+                return p;
+            }
+        }
+
+        private void SetSelectedProfile(string id)
+        {
+            _selectedProfileId = id;
+            SessionState.SetString(Context.GetSessionKey("profileId"), id);
+        }
+
+        /// <summary>Дропдаун выбора профиля — общий для табов Config/Drift/Generate.</summary>
+        private DropdownField BuildProfileSelector(VisualElement parent, Action onChanged = null)
+        {
+            var names = _config.Profiles.ConvertAll(p => p.Name);
+            var index = Mathf.Max(0, _config.Profiles.IndexOf(SelectedProfile));
+
+            var dd = new DropdownField("Профиль", names, index);
+            dd.AddToClassList("api-field");
+            dd.RegisterValueChangedCallback(_ =>
+            {
+                if (dd.index < 0 || dd.index >= _config.Profiles.Count) return;
+                SetSelectedProfile(_config.Profiles[dd.index].Id);
+                onChanged?.Invoke();
+            });
+            parent.Add(dd);
+            return dd;
+        }
+
+        // --- UI-хелперы, общие для табов (цвета — только токены палитры) ----------
+
+        /// <summary>Секция-карточка с заголовком (Context.Ui.Card — тема хаба).</summary>
+        private VisualElement Section(string title, VisualElement parent)
+        {
+            var box = Context.Ui.Card();
+            box.AddToClassList("api-section");
+            var head = new Label(title);
+            head.AddToClassList("api-section__title");
+            head.style.color = Context.Theme.Get(NexusToken.TextNormal);
+            box.Add(head);
+            parent.Add(box);
+            return box;
+        }
+
+        /// <summary>Однострочное поле ввода с подписью (Context.Ui.Input — focus ring темы).</summary>
+        private TextField LabeledText(string label, string value, VisualElement parent,
+            Action<string> onChange = null)
+        {
+            var field = Context.Ui.Input(value, onChange);
+            field.label = label;
+            field.AddToClassList("api-field");
+            parent.Add(field);
+            return field;
+        }
+
+        /// <summary>Приглушённая подсказка (TextDim).</summary>
+        private Label Hint(string text, VisualElement parent)
+        {
+            var l = new Label(text);
+            l.AddToClassList("api-hint");
+            l.style.color = Context.Theme.Get(NexusToken.TextDim);
+            l.style.whiteSpace = WhiteSpace.Normal;
+            parent.Add(l);
+            return l;
+        }
+
+        /// <summary>Строка результата (дрейф/дифф/линт/статус файла), цвет — токеном.</summary>
+        private Label Line(string text, NexusToken color, VisualElement parent)
+        {
+            var l = new Label(text);
+            l.AddToClassList("api-change");
+            l.style.color = Context.Theme.Get(color);
+            l.style.whiteSpace = WhiteSpace.Normal;
+            parent.Add(l);
+            return l;
+        }
+
+        /// <summary>Кнопка действия через фабрику темы (Primary/Common/Alarm и т.д.).</summary>
+        private Button ActionButton(NexusRole role, string text, Action onClick, VisualElement parent)
+        {
+            var b = Context.Ui.Button(role, text, onClick);
+            b.AddToClassList("api-btn");
+            parent.Add(b);
+            return b;
+        }
+
+        /// <summary>Read-only многострочное поле под лог/предпросмотр команды.</summary>
+        private TextField LogField(VisualElement parent, string name = null, string value = "")
+        {
+            var tf = new TextField { multiline = true, isReadOnly = true, value = value };
+            if (name != null) tf.name = name;
+            tf.AddToClassList("api-log");
+
+            // Внутренний input красим токенами: «глубокий» фон под моноширинный текст.
+            var input = tf.Q(className: "unity-base-text-field__input");
+            if (input != null)
+            {
+                input.style.backgroundColor = Context.Theme.Get(NexusToken.BgHard);
+                input.style.color = Context.Theme.Get(NexusToken.TextNormal);
+                var border = Context.Theme.Get(NexusToken.Border);
+                input.style.borderTopColor = border;
+                input.style.borderBottomColor = border;
+                input.style.borderLeftColor = border;
+                input.style.borderRightColor = border;
+            }
+
+            parent.Add(tf);
+            return tf;
+        }
+    }
+}

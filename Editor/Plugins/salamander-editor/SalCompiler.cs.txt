@@ -1,0 +1,60 @@
+using System.Collections.Generic;
+using Dsl.Compilation;
+using Dsl.Semantics;
+using Dsl.Text;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Снапшот входов + результат ОДНОЙ фоновой компиляции. Создаётся на главном потоке,
+    // заполняется на пуле, применяется на главном — между потоками не разделяется
+    // (single-flight в насосе гарантирует одного владельца в каждый момент).
+    internal sealed class SalCompileJob
+    {
+        // входы (снимаются на главном потоке)
+        public HostRegistry Registry; // воркер только читает; перезагрузка манифеста
+                                      // создаёт НОВЫЙ объект реестра, старый не мутируется
+        public int ApiVersion;
+        public string ModuleName;
+        public string Execution;
+        public string Source;
+
+        // выходы (заполняет воркер)
+        public readonly List<Diagnostic> Diagnostics = new List<Diagnostic>(32);
+        public bool Success;
+        public int ErrorCount;
+    }
+
+    // Stateless-обёртка компилятора. Run зовётся С ПУЛА ПОТОКОВ:
+    // внутри только чистый Dsl.Core, никакого Unity API и никакого состояния страницы.
+    internal static class SalCompiler
+    {
+        public static void Run(SalCompileJob job)
+        {
+            var registry = job.Registry ?? new HostRegistry(); // пустой реестр: язык и Engine.* проверяются
+
+            var set = new ModuleSourceSet
+            {
+                Manifest = new ModuleManifest
+                {
+                    Name = job.ModuleName,
+                    ApiVersion = job.ApiVersion,
+                    Execution = job.Execution,     // из module.json документа — честный E0170
+                    Sources = new[] { "buffer.sal" },
+                },
+            };
+            set.Files.Add(($"{job.ModuleName}/buffer.sal", job.Source ?? ""));
+
+            var result = ScriptCompiler.Compile(registry, job.ApiVersion,
+                new List<ModuleSourceSet> { set });
+
+            job.Diagnostics.Clear();
+            job.ErrorCount = 0;
+            foreach (var d in result.Diagnostics)
+            {
+                job.Diagnostics.Add(d);
+                if (d.Severity == Severity.Error) job.ErrorCount++;
+            }
+            job.Success = result.Success;
+        }
+    }
+}

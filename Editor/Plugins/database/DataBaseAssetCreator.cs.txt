@@ -1,0 +1,72 @@
+using System;
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.DataBaseEditor
+{
+    public static class DataBaseAssetCreator
+    {
+        public static int CreateAssets(IReadOnlyList<DataBaseScanEntry> entries, AutoGenSettings config)
+        {
+            if (entries == null || entries.Count == 0) return 0;
+            if (config == null) { Debug.LogError("[DB AutoGen] Config is null."); return 0; }
+
+            int created = 0;
+            EnsureFolder(config.ResourcesFolder);
+
+            try
+            {
+                AssetDatabase.StartAssetEditing();
+                foreach (var e in entries)
+                {
+                    var path = $"{config.ResourcesFolder.TrimEnd('/')}/{e.Type.Name}.asset";
+                    if (AssetDatabase.LoadAssetAtPath<ScriptableObject>(path) != null) continue;
+
+                    try
+                    {
+                        var instance = ScriptableObject.CreateInstance(e.Type);
+                        if (instance == null)
+                        {
+                            Debug.LogError($"[DB AutoGen] Could not create instance of {e.Type.FullName}.");
+                            continue;
+                        }
+                        AssetDatabase.CreateAsset(instance, path);
+                        e.AssetPath = path;
+                        created++;
+                        if (config.LogActions)
+                            Debug.Log($"[DB AutoGen] Created asset: {path}", instance);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError($"[DB AutoGen] Failed to create asset for {e.Type.FullName}: {ex}");
+                    }
+                }
+            }
+            finally
+            {
+                AssetDatabase.StopAssetEditing();
+                AssetDatabase.SaveAssets();
+            }
+
+            return created;
+        }
+
+        private static void EnsureFolder(string folderPath)
+        {
+            if (string.IsNullOrEmpty(folderPath)) return;
+            if (AssetDatabase.IsValidFolder(folderPath)) return;
+
+            // Walk the path and create missing folders.
+            var parts = folderPath.Split('/');
+            var current = parts[0]; // typically "Assets"
+            for (int i = 1; i < parts.Length; i++)
+            {
+                var next = current + "/" + parts[i];
+                if (!AssetDatabase.IsValidFolder(next))
+                    AssetDatabase.CreateFolder(current, parts[i]);
+                current = next;
+            }
+        }
+    }
+}

@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using DB;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.DataBaseEditor
+{
+    public sealed class DataBaseScanReport
+    {
+        /// <summary>Types ready for code generation (have attribute + asset).</summary>
+        public readonly List<DataBaseScanEntry> ReadyToRegister = new();
+        /// <summary>Types with attribute but no asset; candidates for asset creation.</summary>
+        public readonly List<DataBaseScanEntry> MissingAsset = new();
+        /// <summary>Warnings collected during scan (no attribute, etc.).</summary>
+        public readonly List<string> Warnings = new();
+        /// <summary>Hard errors (duplicate aliases, etc.).</summary>
+        public readonly List<string> Errors = new();
+    }
+
+    public sealed class DataBaseScanEntry
+    {
+        public Type Type;
+        public string Alias;
+        public string AssetPath;        // null if missing
+        public bool HasAsset => !string.IsNullOrEmpty(AssetPath);
+    }
+
+    public static class DataBaseScanner
+    {
+        public static DataBaseScanReport Scan(AutoGenSettings config)
+        {
+            var report = new DataBaseScanReport();
+            if (config == null)
+            {
+                report.Errors.Add("Config is null.");
+                return report;
+            }
+
+            var dbInterface = typeof(IDataBase);
+            // TypeCache lookup is cheap (cached by Unity).
+            var candidates = TypeCache.GetTypesDerivedFrom<ScriptableObject>()
+                .Where(t => !t.IsAbstract
+                         && !t.IsGenericTypeDefinition
+                         && dbInterface.IsAssignableFrom(t));
+
+            if (config.AssemblyNameFilters != null && config.AssemblyNameFilters.Length > 0)
+            {
+                var allowed = new HashSet<string>(config.AssemblyNameFilters, StringComparer.Ordinal);
+                candidates = candidates.Where(t => allowed.Contains(t.Assembly.GetName().Name));
+            }
+
+            var ignored = new HashSet<string>(
+                config.IgnoredTypeFullNames ?? Array.Empty<string>(),
+                StringComparer.Ordinal);
+
+            var aliasMap = new Dictionary<string, Type>(StringComparer.Ordinal);
+
+            foreach (var type in candidates)
+            {
+                if (ignored.Contains(type.FullName)) continue;
+
+                var attr = (DataBaseAttribute)Attribute.GetCustomAttribute(type, typeof(DataBaseAttribute));
+                if (attr == null)
+                {
+                    if (config.WarnOnMissingAttribute)
+                        report.Warnings.Add($"{type.FullName}: implements IDataBase but has no [DataBase(\"alias\")] attribute. Skipped.");
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(attr.Alias))
+                {
+                    report.Errors.Add($"{type.FullName}: [DataBase] has empty alias.");
+                    continue;
+                }
+
+                if (!IsValidIdentifier(attr.Alias))
+                {
+                    report.Errors.Add($"{type.FullName}: alias '{attr.Alias}' is not a valid C# identifier.");
+                    continue;
+                }
+
+                if (aliasMap.TryGetValue(attr.Alias, out var owner))
+                {
+                    report.Errors.Add($"Alias '{attr.Alias}' is used by both {owner.FullName} and {type.FullName}.");
+                    continue;
+                }
+                aliasMap[attr.Alias] = type;
+
+                var expectedAssetPath = $"{config.ResourcesFolder.TrimEnd('/')}/{type.Name}.asset";
+                var assetExists = AssetDatabase.LoadAssetAtPath<ScriptableObject>(expectedAssetPath) != null;
+
+                var entry = new DataBaseScanEntry
+                {
+                    Type = type,
+                    Alias = attr.Alias,
+                    AssetPath = assetExists ? expectedAssetPath : null,
+                };
+
+                if (assetExists) report.ReadyToRegister.Add(entry);
+                else             report.MissingAsset.Add(entry);
+            }
+
+            report.ReadyToRegister.Sort((a, b) => string.Compare(a.Alias, b.Alias, StringComparison.Ordinal));
+            report.MissingAsset.Sort((a, b) => string.Compare(a.Alias, b.Alias, StringComparison.Ordinal));
+
+            return report;
+        }
+
+        private static bool IsValidIdentifier(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            if (!char.IsLetter(s[0]) && s[0] != '_') return false;
+            for (int i = 1; i < s.Length; i++)
+                if (!char.IsLetterOrDigit(s[i]) && s[i] != '_') return false;
+            return true;
+        }
+    }
+}

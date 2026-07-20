@@ -1,0 +1,319 @@
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using Newtonsoft.Json.Linq;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Раскладка версии API в Assets. CLI генерит в staging (Temp/, вне Assets),
+    /// а сюда попадает только полезное:
+    ///
+    ///  1. Deploy: из staging (src/&lt;pkg&gt;/**\/*.cs) → Assets/Api/&lt;Wrapper&gt;/Generated
+    ///     ПЛОСКО (Api/Client/Model без src/пакетных подпапок). Папка Generated
+    ///     заменяется целиком — свежий срез без залежавшихся файлов.
+    ///  2. EnsureVersionScaffold: недостающая обвязка создаётся автоматически перед
+    ///     генерацией — asmdef рантайм-клиента (без него генерённые сборки не видят
+    ///     RestClient: Assembly-CSharp из asmdef недостижим), link.xml версии и
+    ///     asmdef версии. asmdef версии лежит в КОРНЕ версии (не в Generated),
+    ///     поэтому переживает регенерацию; если в существующем нет ссылки на
+    ///     рантайм — она дочиняется, остальные правки не трогаются.
+    ///  3. RemoveVersion: снос Assets/Api/&lt;Wrapper&gt; целиком (для удаления профиля).
+    ///
+    /// Мусор генератора (api/openapi.yaml, docs/, .openapi-generator/, README)
+    /// остаётся в staging и в Assets не попадает вовсе.
+    /// </summary>
+    public static class VersionDeployer
+    {
+        public sealed class DeployResult
+        {
+            public bool Ok;
+            public int FilesDeployed;
+            public string Error;
+            public List<string> Created = new();   // созданные файлы обвязки
+            public List<string> Repaired = new();  // починенные (ссылка в asmdef и т.п.)
+            public List<string> Warnings = new();  // на что обратить внимание
+        }
+
+        // Рантайм-клиент общий для всех версий; его сборку создаём, если нет.
+        private const string RuntimeDirRel = ApiCodegenConfig.ApiRootRel + "/Runtime";
+        private const string RuntimeAsmdefName = "ProjectApi";
+
+        private static string Abs(string rel) => Path.Combine(ApiCodegenConfig.ProjectRoot, rel);
+
+        /// <summary>
+        /// Перенести .cs из staging в Assets/Api/&lt;Wrapper&gt;/Generated (плоско).
+        /// Зовётся движком после успешного CLI и ДО пост-обработки/диффа/снапшота.
+        /// </summary>
+        public static DeployResult Deploy(ApiCodegenProfile profile)
+        {
+            var result = new DeployResult();
+            var stagingRoot = Abs(profile.StagingDir);
+
+            // Генератор кладёт код в <staging>/src/<packageName>/{Api,Client,Model}.
+            // Ищем этот корень; фоллбэк — любой src/*, если packageName внезапно не совпал.
+            var srcRoot = Path.Combine(stagingRoot, "src", profile.ResolvePackageName());
+            if (!Directory.Exists(srcRoot))
+            {
+                var srcDir = Path.Combine(stagingRoot, "src");
+                srcRoot = Directory.Exists(srcDir)
+                    ? Directory.GetDirectories(srcDir).FirstOrDefault()
+                    : null;
+            }
+            if (srcRoot == null || !Directory.Exists(srcRoot))
+            {
+                result.Error = $"В staging не найден вывод генератора (src/…): {profile.StagingDir}";
+                return result;
+            }
+
+            var outRoot = Abs(profile.OutputDir);
+
+            // Полная замена Generated: свежий срез. asmdef версии живёт УРОВНЕМ ВЫШЕ
+            // (в корне версии) и замену переживает.
+            if (Directory.Exists(outRoot)) Directory.Delete(outRoot, recursive: true);
+            Directory.CreateDirectory(outRoot);
+
+            foreach (var file in Directory.GetFiles(srcRoot, "*.cs", SearchOption.AllDirectories))
+            {
+                var rel = Path.GetRelativePath(srcRoot, file); // Api/FooApi.cs, Model/Bar.cs, Client/…
+                var dst = Path.Combine(outRoot, rel);
+                Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                File.Copy(file, dst, overwrite: true);
+                result.FilesDeployed++;
+            }
+
+            result.Ok = true;
+            return result;
+        }
+
+        /// <summary>
+        /// Догенерить недостающую обвязку: asmdef рантайма (общий), затем link.xml и
+        /// asmdef версии. Существующие файлы не перезатираются; в существующем asmdef
+        /// версии только дочиняется отсутствующая ссылка на рантайм.
+        /// </summary>
+        public static void EnsureVersionScaffold(ApiCodegenProfile profile, DeployResult result)
+        {
+            // Сначала рантайм: имя его сборки нужно ссылкой в asmdef версии.
+            var runtimeAssembly = EnsureRuntimeAsmdef(result);
+
+            // Смена packageName (например, очистили явное поле → деривация из обёртки)
+            // оставляет в корне версии старый asmdef — переносим его на новое имя.
+            MigrateRenamedPackage(profile, result);
+
+            var pkg = profile.ResolvePackageName();
+
+            // --- link.xml версии: её сборка + Newtonsoft. IL2CPP собирает все
+            // link.xml под Assets, так что per-version файл легален и удобен —
+            // сносится вместе с версией. ---
+            var linkAbs = Abs(profile.LinkXmlPath);
+            if (!File.Exists(linkAbs))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(linkAbs)!);
+                File.WriteAllText(linkAbs,
+                    "<!--\n" +
+                    $"  link.xml версии {profile.ResolveWrapperClass()} (создан автоматически).\n" +
+                    "  IL2CPP-стриппинг вырезает \"неиспользуемые\" типы и ломает рефлексию Newtonsoft:\n" +
+                    "  в редакторе всё ок, а на устройстве DTO молча перестают десериализоваться.\n" +
+                    "-->\n" +
+                    "<linker>\n" +
+                    $"    <assembly fullname=\"{pkg}\" preserve=\"all\"/>\n" +
+                    "    <assembly fullname=\"Newtonsoft.Json\" preserve=\"all\"/>\n" +
+                    "</linker>\n");
+                result.Created.Add(profile.LinkXmlPath);
+            }
+
+            // --- asmdef версии: имя = packageName; ссылки: рантайм + UniTask.
+            // Newtonsoft — precompiled DLL, цепляется автоматически. ---
+            var asmdefAbs = Abs(profile.AsmdefPath);
+            if (!File.Exists(asmdefAbs))
+            {
+                var refs = new List<string> { "UniTask" };
+                if (runtimeAssembly != null) refs.Insert(0, runtimeAssembly);
+
+                Directory.CreateDirectory(Path.GetDirectoryName(asmdefAbs)!);
+                File.WriteAllText(asmdefAbs, AsmdefJson(pkg, refs));
+                result.Created.Add(profile.AsmdefPath);
+            }
+            else if (runtimeAssembly != null)
+            {
+                EnsureAsmdefReference(profile.AsmdefPath, runtimeAssembly, result);
+            }
+        }
+
+        /// <summary>
+        /// Смена packageName версии: в корне версии остаётся asmdef с прежним именем,
+        /// а две asmdef в одной папке — ошибка компиляции Unity. Старый переезжает в
+        /// новый: имя меняется, ССЫЛКИ И ФЛАГИ СОХРАНЯЮТСЯ; заодно правится имя
+        /// сборки в link.xml версии. Имена asmdef-сборок в Unity уникальны на весь
+        /// проект — одноимённые НЕ объединяются, а дают ошибку.
+        /// </summary>
+        private static void MigrateRenamedPackage(ApiCodegenProfile profile, DeployResult result)
+        {
+            var versionRoot = Abs(profile.VersionRootDir);
+            if (!Directory.Exists(versionRoot)) return;
+
+            var pkg = profile.ResolvePackageName();
+            var expected = Path.GetFullPath(Abs(profile.AsmdefPath));
+
+            foreach (var stale in Directory.GetFiles(versionRoot, "*.asmdef", SearchOption.TopDirectoryOnly))
+            {
+                if (string.Equals(Path.GetFullPath(stale), expected, System.StringComparison.OrdinalIgnoreCase))
+                    continue; // это актуальный asmdef
+
+                string oldName;
+                try
+                {
+                    var root = JObject.Parse(File.ReadAllText(stale));
+                    oldName = (string)root["name"];
+                    root["name"] = pkg;
+
+                    // Переносим содержимое (со ссылками пользователя) под новое имя,
+                    // если актуального файла ещё нет; старый файл и его .meta убираем.
+                    if (!File.Exists(expected))
+                        File.WriteAllText(expected, root.ToString(Newtonsoft.Json.Formatting.Indented));
+                    File.Delete(stale);
+                    var meta = stale + ".meta";
+                    if (File.Exists(meta)) File.Delete(meta);
+
+                    result.Repaired.Add($"{profile.VersionRootDir}/{Path.GetFileName(stale)} → " +
+                                        $"{Path.GetFileName(expected)} (packageName сменился)");
+                }
+                catch (System.Exception e)
+                {
+                    result.Warnings.Add($"Старый asmdef {Path.GetFileName(stale)} не удалось перенести: " +
+                                        $"{e.Message} — убери его руками, иначе в папке две asmdef.");
+                    continue;
+                }
+
+                // link.xml версии всё ещё хранит старую сборку — правим точечно.
+                if (string.IsNullOrEmpty(oldName)) continue;
+                var linkAbs = Abs(profile.LinkXmlPath);
+                if (!File.Exists(linkAbs)) continue;
+
+                var text = File.ReadAllText(linkAbs);
+                var patched = text.Replace($"fullname=\"{oldName}\"", $"fullname=\"{pkg}\"");
+                if (patched != text)
+                {
+                    File.WriteAllText(linkAbs, patched);
+                    result.Repaired.Add($"{profile.LinkXmlPath}: сборка {oldName} → {pkg}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Имя рантайм-сборки клиента. Если в Assets/Api/Runtime нет asmdef —
+        /// СОЗДАЁТ ProjectApi.asmdef: без своей сборки RestClient живёт в
+        /// Assembly-CSharp, на которую asmdef-сборки версий сослаться не могут,
+        /// и сгенерённый код не компилится («не видит RestClient»).
+        /// </summary>
+        private static string EnsureRuntimeAsmdef(DeployResult result)
+        {
+            var runtimeDir = Abs(RuntimeDirRel);
+            if (!Directory.Exists(runtimeDir))
+            {
+                result.Warnings.Add($"{RuntimeDirRel} не найден — asmdef версии останется без ссылки на " +
+                                    "рантайм-клиент. Разверни Шаг 1 на вкладке Generate и перегенерируй.");
+                return null;
+            }
+
+            var existing = Directory.GetFiles(runtimeDir, "*.asmdef", SearchOption.TopDirectoryOnly)
+                .FirstOrDefault();
+            if (existing != null)
+            {
+                try
+                {
+                    var name = (string)JObject.Parse(File.ReadAllText(existing))["name"];
+                    if (!string.IsNullOrWhiteSpace(name)) return name;
+                }
+                catch { /* упадём в варнинг ниже */ }
+
+                result.Warnings.Add($"Не удалось прочитать имя сборки из {Path.GetFileName(existing)} — " +
+                                    "ссылку на рантайм в asmdef версии проверь руками.");
+                return null;
+            }
+
+            var path = Path.Combine(runtimeDir, RuntimeAsmdefName + ".asmdef");
+            File.WriteAllText(path, AsmdefJson(RuntimeAsmdefName, new List<string> { "UniTask" }));
+            result.Created.Add($"{RuntimeDirRel}/{RuntimeAsmdefName}.asmdef");
+            return RuntimeAsmdefName;
+        }
+
+        /// <summary>
+        /// Дочинить существующий asmdef версии: добавить отсутствующую ссылку на
+        /// рантайм, НЕ трогая остальное содержимое (твои ссылки/флаги живут).
+        /// </summary>
+        private static void EnsureAsmdefReference(string asmdefRel, string reference, DeployResult result)
+        {
+            try
+            {
+                var abs = Abs(asmdefRel);
+                var root = JObject.Parse(File.ReadAllText(abs));
+                var refs = root["references"] as JArray;
+                if (refs == null)
+                {
+                    refs = new JArray();
+                    root["references"] = refs;
+                }
+
+                if (refs.Values<string>().Any(r => r == reference))
+                    return; // ссылка уже есть
+
+                refs.Insert(0, reference);
+                File.WriteAllText(abs, root.ToString(Newtonsoft.Json.Formatting.Indented));
+                result.Repaired.Add($"{asmdefRel}: добавлена ссылка {reference}");
+            }
+            catch (System.Exception e)
+            {
+                result.Warnings.Add($"Не удалось поправить {asmdefRel}: {e.Message}");
+            }
+        }
+
+        private static string AsmdefJson(string name, List<string> references)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine($"    \"name\": \"{name}\",");
+            sb.AppendLine("    \"references\": [");
+            for (var i = 0; i < references.Count; i++)
+                sb.AppendLine($"        \"{references[i]}\"{(i < references.Count - 1 ? "," : "")}");
+            sb.AppendLine("    ],");
+            sb.AppendLine("    \"autoReferenced\": true,");
+            sb.AppendLine("    \"overrideReferences\": false,");
+            sb.AppendLine("    \"noEngineReferences\": false");
+            sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Снести версию целиком: Assets/Api/&lt;Wrapper&gt; (Generated + link.xml + asmdef)
+        /// через AssetDatabase (уберёт и .meta). true — если удалили или уже не было.
+        /// </summary>
+        public static bool RemoveVersion(ApiCodegenProfile profile, out string error)
+        {
+            error = null;
+            var rel = profile.VersionRootDir;
+
+            if (!AssetDatabase.IsValidFolder(rel))
+                return true; // нечего сносить — тоже успех
+
+            if (AssetDatabase.DeleteAsset(rel))
+                return true;
+
+            error = $"Не удалось удалить {rel}.";
+            return false;
+        }
+
+        /// <summary>Прибрать staging профиля (Temp/ и так чистится Unity, но не мусорим).</summary>
+        public static void CleanupStaging(ApiCodegenProfile profile)
+        {
+            var staging = Abs(profile.StagingDir);
+            if (Directory.Exists(staging))
+            {
+                try { Directory.Delete(staging, recursive: true); }
+                catch { /* залоченный файл в Temp — не критично, Unity приберёт */ }
+            }
+        }
+    }
+}

@@ -1,0 +1,226 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Newtonsoft.Json;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    /// <summary>
+    /// Состояние рабочей области. Владелец — страница (инвариант #4: явный владелец, не глобал).
+    /// Данные пишутся в JSON по пути, который выдаёт <see cref="WorkspacePage"/> из
+    /// <c>Context.GetUserConfigPath(...)</c>; формат — Newtonsoft (тянет самоссылающийся
+    /// <see cref="WorkspaceEntry"/> без лимита глубины Unity-сериализатора).
+    /// </summary>
+    internal sealed class WorkspaceStore
+    {
+        public const float MinScale = 64f;
+        public const float MaxScale = 168f;
+
+        private static readonly JsonSerializerSettings JsonSettings = new()
+        {
+            Formatting = Formatting.Indented,
+            NullValueHandling = NullValueHandling.Ignore
+        };
+
+        private readonly string _path;
+        private WorkspaceData _data;
+
+        public WorkspaceStore(string path)
+        {
+            _path = path;
+            Load();
+        }
+
+        public IReadOnlyList<WorkspaceGroup> Groups => _data.groups;
+
+        public float CardScale
+        {
+            get => Mathf.Clamp(_data.cardScale, MinScale, MaxScale);
+            set { _data.cardScale = Mathf.Clamp(value, MinScale, MaxScale); Persist(); }
+        }
+
+        // --- Загрузка / запись ---
+
+        private void Load()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_path) && File.Exists(_path))
+                    _data = JsonConvert.DeserializeObject<WorkspaceData>(File.ReadAllText(_path), JsonSettings);
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[Workspace] Не удалось прочитать состояние ({_path}): {e.Message}");
+            }
+            _data ??= new WorkspaceData();
+            _data.groups ??= new List<WorkspaceGroup>();
+        }
+
+        public void Persist()
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(_path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(_path, JsonConvert.SerializeObject(_data, JsonSettings));
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[Workspace] Не удалось сохранить состояние ({_path}): {e.Message}");
+            }
+        }
+
+        // --- Группы ---
+
+        public WorkspaceGroup EnsureAtLeastOneGroup()
+        {
+            if (_data.groups.Count == 0)
+            {
+                _data.groups.Add(new WorkspaceGroup { name = "Рабочая область" });
+                Persist();
+            }
+            return _data.groups[0];
+        }
+
+        public WorkspaceGroup AddGroup(string name)
+        {
+            var g = new WorkspaceGroup { name = string.IsNullOrWhiteSpace(name) ? "Группа" : name.Trim() };
+            _data.groups.Add(g);
+            Persist();
+            return g;
+        }
+
+        public void RemoveGroup(WorkspaceGroup g)
+        {
+            if (_data.groups.Remove(g)) Persist();
+        }
+
+        public void RenameGroup(WorkspaceGroup g, string name)
+        {
+            if (!string.IsNullOrWhiteSpace(name)) { g.name = name.Trim(); Persist(); }
+        }
+
+        public void SetCollapsed(WorkspaceGroup g, bool collapsed)
+        {
+            g.collapsed = collapsed;
+            Persist();
+        }
+
+        // --- Карточки ---
+
+        public WorkspaceEntry FindByKey(string key)
+        {
+            foreach (var g in _data.groups)
+                foreach (var e in g.entries)
+                    if (e.StableKey == key)
+                        return e;
+            return null;
+        }
+
+        public void InsertEntry(WorkspaceGroup g, int index, WorkspaceEntry e)
+        {
+            index = Mathf.Clamp(index, 0, g.entries.Count);
+            g.entries.Insert(index, e);
+            Persist();
+        }
+
+        public void Remove(WorkspaceGroup g, WorkspaceEntry e)
+        {
+            if (g.entries.Remove(e)) Persist();
+        }
+
+        public void Move(WorkspaceEntry e, WorkspaceGroup from, WorkspaceGroup to, int index)
+        {
+            if (from != null) from.entries.Remove(e);
+            index = Mathf.Clamp(index, 0, to.entries.Count);
+            to.entries.Insert(index, e);
+            Persist();
+        }
+
+        public void ReplaceInPlace(WorkspaceGroup g, WorkspaceEntry oldEntry, WorkspaceEntry newEntry)
+        {
+            int i = g.entries.IndexOf(oldEntry);
+            if (i < 0) return;
+            newEntry.pinned = oldEntry.pinned;
+            g.entries[i] = newEntry;
+            Persist();
+        }
+
+        public int ClearNonPinned()
+        {
+            int removed = 0;
+            foreach (var g in _data.groups)
+                removed += g.entries.RemoveAll(e => !e.pinned);
+            if (removed > 0) Persist();
+            return removed;
+        }
+
+        public void TogglePin(WorkspaceEntry e)
+        {
+            e.pinned = !e.pinned;
+            Persist();
+        }
+
+        // --- Наборы (Bundle) ---
+
+        /// <summary>Создать набор из готовых записей (члены-наборы отбрасываются — без вложенности).</summary>
+        public WorkspaceEntry MakeBundle(string name, IEnumerable<WorkspaceEntry> members)
+        {
+            var bundle = new WorkspaceEntry
+            {
+                kind = WorkspaceEntryKind.Bundle,
+                id = Guid.NewGuid().ToString("N"),
+                bundleName = name ?? "",
+                cachedName = name ?? ""
+            };
+            foreach (var m in members)
+                if (m != null && m.kind != WorkspaceEntryKind.Bundle && !BundleContains(bundle, m.StableKey))
+                    bundle.items.Add(m);
+            return bundle;
+        }
+
+        public void SetBundleName(WorkspaceEntry bundle, string name)
+        {
+            bundle.bundleName = name?.Trim() ?? "";
+            bundle.cachedName = bundle.bundleName;
+            Persist();
+        }
+
+        public int BundleAdd(WorkspaceEntry bundle, IEnumerable<WorkspaceEntry> members)
+        {
+            int added = 0;
+            foreach (var m in members)
+            {
+                if (m == null || m.kind == WorkspaceEntryKind.Bundle) continue;
+                if (BundleContains(bundle, m.StableKey)) continue;
+                bundle.items.Add(m);
+                added++;
+            }
+            if (added > 0) Persist();
+            return added;
+        }
+
+        public void BundleRemove(WorkspaceEntry bundle, WorkspaceEntry member)
+        {
+            if (bundle.items.Remove(member)) Persist();
+        }
+
+        /// <summary>Разобрать набор обратно на отдельные карточки на его месте.</summary>
+        public void Explode(WorkspaceGroup g, WorkspaceEntry bundle)
+        {
+            int i = g.entries.IndexOf(bundle);
+            if (i < 0) return;
+            g.entries.RemoveAt(i);
+            g.entries.InsertRange(i, bundle.items);
+            Persist();
+        }
+
+        private static bool BundleContains(WorkspaceEntry bundle, string key)
+        {
+            foreach (var e in bundle.items)
+                if (e.StableKey == key) return true;
+            return false;
+        }
+    }
+}

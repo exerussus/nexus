@@ -1,0 +1,37 @@
+using Newtonsoft.Json;
+
+namespace ProjectApi
+{
+    /// <summary>
+    /// Конфиг базового REST-клиента. Read-only после создания — это просто
+    /// набор параметров соединения, не runtime-состояние.
+    /// </summary>
+    public sealed class RestClientOptions
+    {
+        /// <summary>Базовый адрес API, например "https://api.example.com". Без хвостового слэша.</summary>
+        public string BaseUrl { get; }
+
+        /// <summary>Таймаут запроса в секундах (UnityWebRequest.timeout). 0 = без таймаута.</summary>
+        public int TimeoutSeconds { get; }
+
+        /// <summary>Настройки Newtonsoft. Один экземпляр на клиент, переиспользуется.</summary>
+        public JsonSerializerSettings JsonSettings { get; }
+
+        public RestClientOptions(
+            string baseUrl,
+            int timeoutSeconds = 30,
+            JsonSerializerSettings jsonSettings = null)
+        {
+            // Убираем хвостовой слэш, чтобы склейка с path была предсказуемой.
+            BaseUrl = baseUrl.TrimEnd('/');
+            TimeoutSeconds = timeoutSeconds;
+
+            // По умолчанию — игнор null-полей и camelCase, как у большинства REST-бэкендов.
+            JsonSettings = jsonSettings ?? new JsonSerializerSettings
+            {
+                NullValueHandling = NullValueHandling.Ignore,
+                MissingMemberHandling = MissingMemberHandling.Ignore
+            };
+        }
+    }
+}

@@ -1,0 +1,417 @@
+/* ============================================================
+   AppPage.uss — LAYOUT ONLY.
+   Per the Nexus theme contract, a page must NOT carry colours (no literals,
+   no --vars): the palette is resolved in C# via Context.Theme.Get(token) and
+   applied in AppPage.Theme.cs. This sheet keeps only flex/size/spacing/border-
+   width/radius/typography. Anything colour-bearing lives in the theme pass.
+   Prefix kept as nav-.
+   ============================================================ */
+
+.nav-page {
+    flex-grow: 1;
+    font-size: 12px;
+}
+
+/* ===== Toolbar ===== */
+.nav-toolbar {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.nav-page-title {
+    -unity-font-style: bold;
+    font-size: 13px;
+}
+
+.nav-spacer {
+    flex-grow: 1;
+}
+
+.nav-btn {
+    height: 22px;
+    padding: 0 14px;
+    margin-left: 6px;
+    background-image: none;
+    border-width: 1px;
+    border-radius: 6px;
+    font-size: 11px;
+    -unity-font-style: bold;
+}
+.nav-btn:disabled {
+    opacity: 0.45;
+}
+
+.nav-btn--apply {
+    /* colour/role applied in C# (NexusRole.Primary) */
+}
+
+/* ===== Column header ===== */
+.nav-header {
+    flex-direction: row;
+    align-items: center;
+    padding: 2px 6px;
+    margin-bottom: 4px;
+    border-bottom-width: 1px;
+}
+
+.nav-col {
+    font-size: 10px;
+    -unity-font-style: bold;
+}
+.nav-col--class   { width: 45%; }
+.nav-col--page    { flex-grow: 1; }
+.nav-col--actions { width: 28px; }
+
+/* ===== Rows ===== */
+.nav-list {
+    flex-grow: 0;
+    flex-shrink: 0;
+    max-height: 300px;
+    margin-bottom: 6px;
+}
+
+.nav-row {
+    flex-direction: row;
+    align-items: center;
+    margin: 2px 0;
+    padding: 3px 6px;
+    border-radius: 8px;
+    border-width: 1px;
+}
+
+.nav-class-field {
+    width: 45%;
+    margin-right: 6px;
+}
+.nav-page-field {
+    flex-grow: 1;
+    margin-right: 6px;
+}
+
+.nav-remove {
+    width: 22px;
+    height: 20px;
+    border-radius: 6px;
+    background-image: none;
+    border-width: 1px;
+    -unity-font-style: bold;
+}
+
+/* ===== Hint ===== */
+.nav-hint {
+    margin-top: 6px;
+    font-size: 10px;
+    white-space: normal;
+}
+
+/* ===== Tab bar ===== */
+.nav-tabbar {
+    flex-direction: row;
+    margin-bottom: 8px;
+    border-bottom-width: 1px;
+}
+
+.nav-tab-btn {
+    height: 24px;
+    padding: 0 16px;
+    margin: 0 2px -1px 0;
+    background-image: none;
+    border-width: 0;
+    border-bottom-width: 2px;
+    border-radius: 0;
+    font-size: 12px;
+    -unity-font-style: bold;
+}
+
+.nav-tab {
+    flex-grow: 1;
+}
+
+/* ===== Graph legend ===== */
+.nav-graph-legend {
+    flex-direction: row;
+    align-items: center;
+    margin-left: 14px;
+}
+
+.nav-legend-item {
+    flex-direction: row;
+    align-items: center;
+    margin-right: 12px;
+}
+
+.nav-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 5px;
+    margin-right: 5px;
+    border-width: 1px;
+}
+
+.nav-legend-label {
+    font-size: 10px;
+}
+
+/* ===== Graph canvas ===== */
+.nav-graph-viewport {
+    flex-grow: 1;
+    min-height: 320px;
+    overflow: hidden;
+    border-width: 1px;
+    border-radius: 6px;
+}
+
+.nav-graph-content {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: top left;
+}
+
+.nav-graph-empty {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    -unity-text-align: middle-center;
+    white-space: normal;
+    font-size: 12px;
+}
+
+/* ===== Graph node ===== */
+.nav-graph-node {
+    border-width: 1px;
+    border-left-width: 3px;
+    border-radius: 6px;
+    padding: 6px 8px;
+    overflow: hidden;
+}
+.nav-graph-node--missing {
+    opacity: 0.85;
+}
+
+.nav-graph-node__head {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 3px;
+}
+
+.nav-graph-badge {
+    font-size: 8px;
+    -unity-font-style: bold;
+    padding: 1px 5px;
+    border-radius: 7px;
+    margin-right: 6px;
+}
+
+.nav-graph-id {
+    flex-grow: 1;
+    flex-shrink: 1;
+    font-size: 11px;
+    -unity-font-style: bold;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nav-graph-meta {
+    font-size: 9px;
+}
+
+.nav-graph-warn {
+    margin-top: 2px;
+    font-size: 9px;
+    -unity-font-style: bold;
+}
+
+/* ===== Generation tab ===== */
+.nav-gen-desc {
+    margin-bottom: 10px;
+    font-size: 11px;
+    white-space: normal;
+}
+
+.nav-gen-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+.nav-gen-actions .nav-btn {
+    margin-left: 0;
+    margin-right: 6px;
+    margin-bottom: 4px;
+    height: 24px;
+}
+
+.nav-gen-log {
+    flex-grow: 1;
+    margin-top: 2px;
+}
+.nav-gen-log .unity-text-field__input {
+    border-width: 1px;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 11px;
+    -unity-font-style: normal;
+    white-space: normal;
+}
+
+/* ===== Generation tab — templates / scaffold ===== */
+.nav-gen-subhead {
+    flex-direction: row;
+    align-items: center;
+    margin-top: 12px;
+    margin-bottom: 4px;
+    padding-top: 8px;
+    border-top-width: 1px;
+}
+.nav-gen-subhead .nav-btn {
+    margin-left: 6px;
+    height: 22px;
+}
+
+.nav-tpl-status {
+    margin-bottom: 6px;
+    font-size: 10px;
+    white-space: normal;
+}
+
+.nav-tpl-list {
+    flex-grow: 1;
+    max-height: 220px;
+    margin-bottom: 8px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+
+.nav-tpl-row {
+    flex-direction: row;
+    align-items: center;
+    padding: 4px 8px;
+    border-bottom-width: 1px;
+}
+.nav-tpl-row--pingable {
+    cursor: link;
+}
+
+.nav-tpl-id {
+    flex-shrink: 0;
+    min-width: 150px;
+    font-size: 11px;
+    -unity-font-style: bold;
+}
+
+.nav-tpl-path {
+    flex-shrink: 1;
+    margin-left: 8px;
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nav-tpl-state {
+    flex-shrink: 0;
+    margin-left: 8px;
+    margin-right: 8px;
+    font-size: 9px;
+    -unity-font-style: bold;
+    padding: 1px 6px;
+    border-radius: 7px;
+    border-width: 1px;
+}
+
+.nav-tpl-gen {
+    flex-shrink: 0;
+    height: 20px;
+    margin-left: 0;
+    font-size: 10px;
+}
+
+/* ===== Hooks tab ===== */
+.nav-hook-add-field {
+    flex-grow: 1;
+    margin: 0 6px;
+}
+.nav-hook-add-field .unity-text-field__input {
+    border-width: 1px;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
+}
+
+.nav-hook-lib {
+    max-height: 150px;
+    margin-bottom: 8px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+.nav-hook-lib-row {
+    flex-direction: row;
+    align-items: center;
+    padding: 4px 8px;
+    border-bottom-width: 1px;
+    cursor: link;
+}
+
+.nav-hook-select {
+    flex-shrink: 0;
+    margin-right: 6px;
+}
+
+/* ===== Section header / affix row / id row ===== */
+.nav-section-title {
+    -unity-font-style: bold;
+    font-size: 12px;
+}
+
+.nav-affix-row {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 4px;
+}
+.nav-affix-field {
+    flex-grow: 1;
+    flex-shrink: 1;
+    flex-basis: 0;
+    max-width: 320px;
+    margin-right: 10px;
+}
+.nav-affix-field .unity-base-field__label {
+    min-width: 54px;
+    font-size: 11px;
+}
+.nav-affix-field .unity-base-text-field__input {
+    border-width: 1px;
+    border-radius: 6px;
+    padding: 2px 8px;
+}
+
+.nav-page-row {
+    min-height: 26px;
+}
+
+.nav-page-id-field .unity-base-text-field__input {
+    border-width: 1px;
+    border-radius: 6px;
+    padding: 2px 8px;
+}
+
+.nav-page-class {
+    flex-grow: 1;
+    flex-shrink: 1;
+    -unity-text-align: middle-left;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.nav-page-hash {
+    flex-shrink: 0;
+    margin-left: 8px;
+    margin-right: 8px;
+    -unity-text-align: middle-left;
+    font-size: 10px;
+}

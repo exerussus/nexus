@@ -1,0 +1,321 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Signals;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+using PopupWindow = UnityEditor.PopupWindow;
+
+namespace Exerussus.Nexus.Pages.SignalTimeline
+{
+    /// <summary>
+    /// PopupWindow shown when user clicks a clustered marker on the
+    /// signal timeline. Lists every event collapsed into the cluster.
+    /// Clicking a row fires <see cref="_onChosen"/> (page uses that to
+    /// jump to the source line).
+    /// <para>
+    /// Has a "multi" mode (see <see cref="ShowMulti"/>) that lists events
+    /// from many signals at once and prepends a signal-name column.
+    /// </para>
+    /// </summary>
+    public sealed class SignalClusterPopup : PopupWindowContent
+    {
+        /// <summary>
+        /// One row of the popup: an event together with the signal track
+        /// it belongs to. Bundled so the multi-signal mode can keep the
+        /// owning track for each row without a parallel list.
+        /// </summary>
+        public readonly struct ClusterEntry
+        {
+            public readonly SignalTrackData Track;
+            public readonly TimelineEvent   Ev;
+            public ClusterEntry(SignalTrackData track, TimelineEvent ev)
+            {
+                Track = track;
+                Ev    = ev;
+            }
+        }
+
+        /// <summary>
+        /// Снимок цветов из активной палитры Nexus. У попапа
+        /// (<see cref="PopupWindowContent"/>) нет своего Context, а скилл
+        /// запрещает цветовые литералы, поэтому страница резолвит токены
+        /// (Accent / TextDim / TextFaint) и передаёт их сюда значениями.
+        /// </summary>
+        public readonly struct PopupPalette
+        {
+            public readonly Color Accent;
+            public readonly Color TextDim;
+            public readonly Color TextFaint;
+            public PopupPalette(Color accent, Color textDim, Color textFaint)
+            {
+                Accent    = accent;
+                TextDim   = textDim;
+                TextFaint = textFaint;
+            }
+        }
+
+        /// <summary>
+        /// Default suffix appearing after the event count in the header
+        /// (e.g. "events in one frame"). The "show all events" entry point
+        /// passes a shorter form like "events".
+        /// </summary>
+        public const string DefaultHeaderCountNoun = "events in one frame";
+
+        /// <summary>
+        /// Single-signal popup — used by cluster markers and by the
+        /// per-track "show all events" button. Header is built from the
+        /// track id/name and the supplied count noun.
+        /// </summary>
+        public static void Show(Rect activator, SignalTrackData track,
+                                List<TimelineEvent> events,
+                                Action<SignalTrackData, TimelineEvent> onChosen,
+                                StyleSheet styleSheet, in PopupPalette palette,
+                                string headerCountNoun = DefaultHeaderCountNoun)
+        {
+            var entries = new List<ClusterEntry>(events.Count);
+            for (int i = 0; i < events.Count; i++)
+                entries.Add(new ClusterEntry(track, events[i]));
+            string suffix = string.IsNullOrEmpty(headerCountNoun)
+                ? DefaultHeaderCountNoun
+                : headerCountNoun;
+            string headerLabel = $"#{track.Id} {track.Name}  —  {events.Count} {suffix}";
+            var content = new SignalClusterPopup(entries, onChosen, headerLabel,
+                                                 showSignalColumn: false,
+                                                 styleSheet, palette);
+            PopupWindow.Show(activator, content);
+        }
+
+        /// <summary>
+        /// Multi-signal popup — used by the top "All events" button. Events
+        /// from different tracks are listed in one scroll view, with an
+        /// extra leading column showing the owning signal. Caller supplies
+        /// the full header text.
+        /// </summary>
+        public static void ShowMulti(Rect activator,
+                                     List<ClusterEntry> entries,
+                                     Action<SignalTrackData, TimelineEvent> onChosen,
+                                     StyleSheet styleSheet, in PopupPalette palette,
+                                     string headerLabel)
+        {
+            var content = new SignalClusterPopup(entries, onChosen,
+                                                 string.IsNullOrEmpty(headerLabel)
+                                                     ? $"All events  —  {entries.Count}"
+                                                     : headerLabel,
+                                                 showSignalColumn: true,
+                                                 styleSheet, palette);
+            PopupWindow.Show(activator, content);
+        }
+
+        private readonly List<ClusterEntry> _entries;
+        private readonly Action<SignalTrackData, TimelineEvent> _onChosen;
+        private readonly string       _headerLabel;
+        private readonly bool         _showSignalColumn;
+        private readonly StyleSheet   _styleSheet;   // companion-USS, отдан страницей
+        private readonly PopupPalette _palette;      // цвета из активной палитры
+
+        private SignalClusterPopup(List<ClusterEntry> entries,
+                                   Action<SignalTrackData, TimelineEvent> onChosen,
+                                   string headerLabel,
+                                   bool showSignalColumn,
+                                   StyleSheet styleSheet,
+                                   in PopupPalette palette)
+        {
+            _entries          = entries;
+            _onChosen         = onChosen;
+            _headerLabel      = headerLabel;
+            _showSignalColumn = showSignalColumn;
+            _styleSheet       = styleSheet;
+            _palette          = palette;
+        }
+
+        /// <summary>
+        /// Максимальная высота popup-окна. По умолчанию 480 px. Можно
+        /// поменять снаружи (например, под маленький монитор).
+        /// </summary>
+        public static float MaxWindowHeight = 480f;
+
+        /// <summary>Фиксированная ширина popup-окна для single-signal режима.</summary>
+        public static float WindowWidth = 720f;
+
+        /// <summary>Ширина popup-окна в multi-signal режиме (там есть лишняя
+        /// колонка с именем сигнала, single-режим её не имеет).</summary>
+        public static float WindowWidthWide = 880f;
+
+        // Внутренние размеры — должны соответствовать USS (.stp-popup,
+        // .stp-popup-header, .stp-popup-row). Если правишь там — поправь и тут.
+        private const float PopupPaddingV  = 8f;   // top + bottom padding of .stp-popup
+        private const float HeaderHeight   = 36f;  // header label + its bottom border + margin
+        private const float RowHeight      = 24f;  // .stp-popup-row height
+        private const float RowSpacing     = 2f;   // .stp-popup-row margin-bottom
+        private const float RowBorder      = 2f;   // top+bottom 1px borders per row
+
+        public override Vector2 GetWindowSize()
+        {
+            float rowFull   = RowHeight + RowSpacing + RowBorder;
+            float contentH  = PopupPaddingV * 2 + HeaderHeight + _entries.Count * rowFull;
+            float height    = Mathf.Min(MaxWindowHeight, Mathf.Ceil(contentH));
+            float width     = _showSignalColumn ? WindowWidthWide : WindowWidth;
+            return new Vector2(width, height);
+        }
+
+        public override void OnGUI(Rect rect) { /* using UI Toolkit instead */ }
+
+        public override void OnOpen()
+        {
+            var root = editorWindow.rootVisualElement;
+            root.AddToClassList("stp-popup");
+
+            // Тот же companion-USS, что и у страницы — она грузит его через
+            // Context.LoadDeployedAsset и передаёт сюда. Путь к State/<id>/ мы
+            // не знаем и знать не должны: раскладкой владеет хаб (инвариант #7).
+            if (_styleSheet != null) root.styleSheets.Add(_styleSheet);
+
+            var header = new Label(_headerLabel);
+            header.AddToClassList("stp-popup-header");
+            root.Add(header);
+
+            var list = new ScrollView(ScrollViewMode.Vertical);
+            list.AddToClassList("stp-popup-list");
+            list.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
+            root.Add(list);
+
+            for (int i = 0; i < _entries.Count; i++)
+                list.Add(BuildRow(_entries[i]));
+        }
+
+        private VisualElement BuildRow(ClusterEntry entry)
+        {
+            var tr = entry.Track;
+            var e  = entry.Ev;
+
+            var row = new VisualElement();
+            row.AddToClassList("stp-popup-row");
+
+            bool errored = e.Errors != null && e.Errors.Count > 0;
+            if (errored) row.AddToClassList("stp-popup-row--errored");
+
+            // Multi-signal mode prepends a "which signal?" cell so users
+            // can disambiguate rows that share a time/kind across tracks.
+            if (_showSignalColumn)
+            {
+                var sigLab = MakeCell($"#{tr.Id} {tr.Name}", width: 140, bold: true);
+                sigLab.style.color = _palette.Accent; // акцент из активной палитры
+                row.Add(sigLab);
+            }
+
+            // Color dot for kind — фиксированный размер, не сжимается.
+            var dot = new VisualElement();
+            dot.AddToClassList("stp-swatch");
+            dot.AddToClassList("stp-swatch--" + KindClass((SignalEventKind)e.Kind));
+            if ((SignalEventKind)e.Kind == SignalEventKind.Invoked && e.SubscriberCountAtMoment == 0)
+                dot.AddToClassList("stp-swatch--unheard");
+            if (errored) dot.AddToClassList("stp-swatch--errored");
+            dot.style.width        = 10;
+            dot.style.height       = 10;
+            dot.style.marginRight  = 6;
+            dot.style.flexShrink   = 0;
+            row.Add(dot);
+
+            // Маленький красный значок-индикатор перед Kind для errored строк.
+            if (errored)
+            {
+                var badge = new VisualElement();
+                badge.AddToClassList("stp-error-badge");
+                badge.style.position = Position.Relative; // inline, не overlay
+                badge.style.marginRight = 6;
+                row.Add(badge);
+            }
+
+            var kindLab = MakeCell(((SignalEventKind)e.Kind).ToString(), width: 96, bold: true);
+            row.Add(kindLab);
+
+            // Time column — seconds since the recording origin. Same formula
+            // as the detail panel timestamp so values match what the user
+            // sees there after picking a row.
+            double origin = Signals.SignalRegistry.Model.RecordingStartTime;
+            string timeText = $"{e.Time - origin:F2}s";
+            var timeLab = MakeCell(timeText, width: 76);
+            timeLab.style.color = _palette.TextDim;
+            timeLab.style.unityTextAlign = TextAnchor.MiddleRight;
+            row.Add(timeLab);
+
+            var typeLab = MakeCell(string.IsNullOrEmpty(e.PayloadType) ? "" : $"<{e.PayloadType}>",
+                                   width: 130);
+            row.Add(typeLab);
+
+            // Payload/summary — единственная растягивающаяся ячейка с ellipsis.
+            string payloadText = errored
+                ? ((SignalEventKind)e.Kind == SignalEventKind.Invoked && !string.IsNullOrEmpty(e.PayloadSummary)
+                    ? $"{e.PayloadSummary}   ⚠ {e.Errors.Count} error(s)"
+                    : $"⚠ {e.Errors.Count} error(s)")
+                : ((SignalEventKind)e.Kind == SignalEventKind.Invoked && !string.IsNullOrEmpty(e.PayloadSummary)
+                    ? e.PayloadSummary
+                    : $"subs={e.SubscriberCountAtMoment}");
+            var payloadLab = new Label(payloadText);
+            payloadLab.style.flexGrow     = 1;
+            payloadLab.style.flexShrink   = 1;
+            payloadLab.style.minWidth     = 0;
+            payloadLab.style.overflow     = Overflow.Hidden;
+            payloadLab.style.textOverflow = TextOverflow.Ellipsis;
+            payloadLab.style.whiteSpace   = WhiteSpace.NoWrap;
+            payloadLab.style.marginRight  = 8;
+            payloadLab.tooltip            = payloadText;
+            row.Add(payloadLab);
+
+            // Location — фикс-ширина, ellipsis, в тултипе полный путь.
+            string locText = string.IsNullOrEmpty(e.FilePath)
+                ? "?"
+                : $"{Path.GetFileName(e.FilePath)}:{e.LineNumber}";
+            var locLab = new Label(locText);
+            locLab.style.width          = 180;
+            locLab.style.flexShrink     = 0;
+            locLab.style.overflow       = Overflow.Hidden;
+            locLab.style.textOverflow   = TextOverflow.Ellipsis;
+            locLab.style.whiteSpace     = WhiteSpace.NoWrap;
+            locLab.style.unityTextAlign = TextAnchor.MiddleRight;
+            locLab.style.color          = _palette.TextFaint;
+            locLab.tooltip              = string.IsNullOrEmpty(e.FilePath) ? "" : $"{e.FilePath}:{e.LineNumber}";
+            row.Add(locLab);
+
+            // Hover handled in USS (`.stp-popup-row:hover`).
+
+            var capturedTrack = tr;
+            var capturedEvent = e;
+            row.RegisterCallback<ClickEvent>(_ =>
+            {
+                // Popup НЕ закрывается — закроется только при клике вне него
+                // (стандартное поведение PopupWindow). Это позволяет быстро
+                // переключаться между событиями кластера, видя обновления
+                // detail-панели сразу.
+                _onChosen?.Invoke(capturedTrack, capturedEvent);
+            });
+            return row;
+        }
+
+        private static Label MakeCell(string text, float width, bool bold = false)
+        {
+            var l = new Label(text);
+            l.style.width        = width;
+            l.style.flexShrink   = 0;
+            l.style.overflow     = Overflow.Hidden;
+            l.style.textOverflow = TextOverflow.Ellipsis;
+            l.style.whiteSpace   = WhiteSpace.NoWrap;
+            l.style.marginRight  = 8;
+            l.tooltip            = text;
+            if (bold) l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            return l;
+        }
+
+        private static string KindClass(SignalEventKind k) => k switch
+        {
+            SignalEventKind.Created      => "created",
+            SignalEventKind.Subscribed   => "subscribed",
+            SignalEventKind.Invoked      => "invoked",
+            SignalEventKind.Unsubscribed => "unsubscribed",
+            SignalEventKind.Disposed     => "disposed",
+            _                            => "created",
+        };
+    }
+}

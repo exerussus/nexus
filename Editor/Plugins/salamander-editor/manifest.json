@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "guid": "b7e4c2f1-9a53-4d68-8e0b-6f1d2c9a4e75",
+  "id": "salamander-editor",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.SalamanderEditor.SalamanderEditorPage",
+  "kind": "servicing",
+  "display": { "name": "Salamander", "category": "Game", "order": 30, "icon": null },
+  "requires": [],
+  "packageRequires": [
+    { "name": "dsl.core", "assembly": "Dsl.Core" }
+  ],
+  "deploy": [
+    { "from": "Exerussus.Nexus.Pages.SalamanderEditor.asmdef.txt", "to": "Exerussus.Nexus.Pages.SalamanderEditor.asmdef" },
+    { "from": "SalamanderEditorPage.cs.txt",   "to": "SalamanderEditorPage.cs" },
+    { "from": "PagePrefs.cs.txt",              "to": "PagePrefs.cs" },
+    { "from": "ApiManifestStore.cs.txt",       "to": "ApiManifestStore.cs" },
+    { "from": "SalApiModel.cs.txt",            "to": "SalApiModel.cs" },
+    { "from": "SalDocument.cs.txt",            "to": "SalDocument.cs" },
+    { "from": "CompileScheduler.cs.txt",       "to": "CompileScheduler.cs" },
+    { "from": "SalCompiler.cs.txt",            "to": "SalCompiler.cs" },
+    { "from": "SalTokenizer.cs.txt",           "to": "SalTokenizer.cs" },
+    { "from": "SalHighlighter.cs.txt",         "to": "SalHighlighter.cs" },
+    { "from": "CodeEditorElement.cs.txt",      "to": "CodeEditorElement.cs" },
+    { "from": "UndoHistory.cs.txt",            "to": "UndoHistory.cs" },
+    { "from": "AutocompleteEngine.cs.txt",     "to": "AutocompleteEngine.cs" },
+    { "from": "BufferSymbols.cs.txt",          "to": "BufferSymbols.cs" },
+    { "from": "AutocompleteController.cs.txt", "to": "AutocompleteController.cs" },
+    { "from": "AutocompletePopup.cs.txt",      "to": "AutocompletePopup.cs" },
+    { "from": "DiagnosticsView.cs.txt",        "to": "DiagnosticsView.cs" },
+    { "from": "FileDropController.cs.txt",     "to": "FileDropController.cs" },
+    { "from": "SalamanderCode.uss.txt",        "to": "SalamanderCode.uss" }
+  ]
+}

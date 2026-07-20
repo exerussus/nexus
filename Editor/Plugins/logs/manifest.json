@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "guid": "0b6c4f9e-2d71-4a3e-9b8c-1f2a3c4d5e6f",
+  "id": "logs",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.Logs.LogsPage",
+  "display": {
+    "name": "Logs",
+    "category": "Infrastructure",
+    "order": 20,
+    "icon": "d_UnityEditor.ConsoleWindow"
+  },
+  "kind": "constitutive",
+  "requires": [
+    { "service": "logformat", "range": "1.0" }
+  ],
+  "deploy": [
+    { "from": "Exerussus.Nexus.Pages.Logs.asmdef.txt", "to": "Exerussus.Nexus.Pages.Logs.asmdef" },
+    { "from": "LogsPage.cs.txt", "to": "LogsPage.cs" },
+    { "from": "LogsPage.uxml.txt", "to": "LogsPage.uxml" }
+  ]
+}

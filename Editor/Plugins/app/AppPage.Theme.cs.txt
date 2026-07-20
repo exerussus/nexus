@@ -1,0 +1,283 @@
+// ============================================================
+//  AppPage.Theme.cs — покраска страницы из палитры Nexus (в C#).
+//
+//  Контракт темы Nexus: страница НЕ несёт цветов в USS (ни литералов, ни --vars).
+//  Палитра автономна и резолвится в коде через Context.Theme.Get(NexusToken) /
+//  GetRole(NexusRole). USS даёт только layout; здесь — все цвета и интерактив-состояния.
+//
+//  Используем расширенный набор токенов (depth & state), чтобы вернуть «нарядный» вид
+//  честно из темы: SurfaceHover, Divider, Accent{Hover,Pressed,Soft}, OnAccent,
+//  {Ok,Warning,Error}Soft, TextFaint, Focus, и role.Soft.
+//
+//  ApplyTheme() идемпотентен (повторная покраска безопасна; подвеска событий — один раз
+//  через класс-маркер nx-wired). Зовётся в конце BuildUI и после каждого ребилда динамики.
+//  Состояние conflict-строк красится отдельно в MarkRows (тогглится на каждый ввод).
+//
+//  Ссылок на Exerussus.Nexus.Theme нет — только Abstractions через Context.
+// ============================================================
+
+using Exerussus.Nexus.Abstractions;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        private const string WiredMark = "nx-wired";   // класс-маркер: события уже подвешены
+        private static readonly Color Clear = new(0, 0, 0, 0);
+
+        private Color Tok(NexusToken t) => Context.Theme.Get(t);
+
+        // Полная покраска дерева. Безопасно вызывать сколько угодно раз.
+        private void ApplyTheme()
+        {
+            if (_root == null || Context == null) return;
+
+            _root.style.color = Tok(NexusToken.TextNormal);
+
+            // ----- текст -----
+            Each("nav-page-title",    e => e.style.color = Tok(NexusToken.Accent));
+            Each("nav-section-title", e => e.style.color = Tok(NexusToken.TextNormal));
+
+            ColorEach(NexusToken.TextDim,
+                "nav-hint", "nav-gen-desc", "nav-tpl-status", "nav-tpl-path",
+                "nav-col", "nav-legend-label", "nav-graph-empty");
+
+            ColorEach(NexusToken.TextNormal,
+                "nav-tpl-id", "nav-graph-id", "nav-page-class");
+
+            // мета/хеши/счётчики — тир ниже dim
+            ColorEach(NexusToken.TextFaint, "nav-page-hash", "nav-graph-meta");
+
+            // ----- строки редактора (карточки) -----
+            Each("nav-row", e =>
+            {
+                ApplyRowState(e, e.ClassListContains("nav-row--conflict"));
+                WireRowHover(e);
+            });
+
+            // ----- контейнеры-списки / вьюпорт (обводка Border) -----
+            BorderBg(NexusToken.BgHard, NexusToken.Border,
+                "nav-tpl-list", "nav-hook-lib", "nav-graph-viewport");
+
+            // ----- тонкие разделители (Divider, не Border) -----
+            DividerEach(DividerSide.Bottom, "nav-header", "nav-tabbar", "nav-tpl-row", "nav-hook-lib-row");
+            DividerEach(DividerSide.Top, "nav-gen-subhead");
+
+            // ----- ховер list-строк (tpl/hook) -----
+            Each("nav-tpl-row",      e => WireSurfaceHover(e, Clear));
+            Each("nav-hook-lib-row", e => WireSurfaceHover(e, Clear));
+            // выбранная строка хука — мягкая акцентная заливка
+            Each("nav-hook-lib-row--selected", e => e.style.backgroundColor = Tok(NexusToken.AccentSoft));
+
+            // ----- инпуты -----
+            var bgHard = Tok(NexusToken.BgHard);
+            var bord   = Tok(NexusToken.Border);
+            var txt    = Tok(NexusToken.TextNormal);
+            void PaintInput(VisualElement input)
+            {
+                input.style.backgroundColor = bgHard;
+                input.style.color = txt;
+                SetBorder(input, bord);
+                WireFocus(input);
+            }
+            _root.Query<VisualElement>(className: "unity-base-text-field__input").ForEach(PaintInput);
+            _root.Query<VisualElement>(className: "unity-text-field__input").ForEach(PaintInput);
+            _root.Query<VisualElement>(className: "unity-base-field__label").ForEach(l =>
+                l.style.color = Tok(NexusToken.TextDim));
+
+            // ----- state-бейджи -----
+            Each("nav-tpl-state--ok", e =>
+            {
+                e.style.backgroundColor = Tok(NexusToken.Ok);
+                e.style.color = Tok(NexusToken.OnAccent);
+                SetBorder(e, Tok(NexusToken.Ok));
+            });
+            Each("nav-tpl-state--missing", e =>
+            {
+                e.style.backgroundColor = Tok(NexusToken.ErrorSoft);
+                e.style.color = Tok(NexusToken.Error);
+                SetBorder(e, Tok(NexusToken.Error));
+            });
+
+            // ----- легенда-точки -----
+            DotColor("nav-dot--page",   NexusToken.Accent,  false);
+            DotColor("nav-dot--popup",  NexusToken.Warning, false);
+            DotColor("nav-dot--back",   NexusToken.Accent,  true);
+            DotColor("nav-dot--orphan", NexusToken.Error,   true);
+
+            // ----- узлы графа -----
+            Each("nav-graph-node", e =>
+            {
+                e.style.backgroundColor = Tok(NexusToken.BgRaised);
+                SetBorder(e, Tok(NexusToken.Border));
+            });
+            Each("nav-graph-node--page",  e => e.style.borderLeftColor = Tok(NexusToken.Accent));
+            Each("nav-graph-node--popup", e => e.style.borderLeftColor = Tok(NexusToken.Warning));
+            Each("nav-graph-node--orphan", e => SetBorder(e, Tok(NexusToken.Error)));
+            Each("nav-graph-badge", e =>
+            {
+                e.style.backgroundColor = Tok(NexusToken.Accent);
+                e.style.color = Tok(NexusToken.OnAccent);
+            });
+            _root.Query<VisualElement>(className: "nav-graph-node--popup").ForEach(node =>
+                node.Query<VisualElement>(className: "nav-graph-badge").ForEach(b =>
+                    b.style.backgroundColor = Tok(NexusToken.Warning)));
+            Each("nav-graph-warn", e => e.style.color = Tok(NexusToken.Error));
+
+            // ----- таб-кнопки -----
+            _root.Query<Button>(className: "nav-tab-btn").ForEach(b =>
+            {
+                bool active = b.ClassListContains("nav-tab-btn--active");
+                b.style.color = active ? Tok(NexusToken.Accent) : Tok(NexusToken.TextDim);
+                b.style.backgroundColor = active ? Tok(NexusToken.AccentSoft) : Clear;
+                b.style.borderBottomColor = active ? Tok(NexusToken.Accent) : Clear;
+                WireTabHover(b);
+            });
+
+            // ----- кнопки действий по ролям -----
+            _root.Query<Button>(className: "nav-btn").ForEach(b =>
+                Pressable(b, b.ClassListContains("nav-btn--apply") ? NexusRole.Primary : NexusRole.Common));
+
+            // remove (✕) — ghost с опасным hover
+            _root.Query<Button>(className: "nav-remove").ForEach(PressableRemove);
+        }
+
+        // Состояние строки редактора: нормальная карточка vs conflict-wash. Зовётся и из MarkRows.
+        private void ApplyRowState(VisualElement row, bool conflict)
+        {
+            if (row == null) return;
+            row.style.backgroundColor = conflict ? Tok(NexusToken.ErrorSoft) : Tok(NexusToken.BgRaised);
+            SetBorder(row, conflict ? Tok(NexusToken.Error) : Tok(NexusToken.Border));
+        }
+
+        // ----- helpers -----
+
+        private void Each(string className, System.Action<VisualElement> paint) =>
+            _root.Query<VisualElement>(className: className).ForEach(paint);
+
+        private void ColorEach(NexusToken token, params string[] classes)
+        {
+            var c = Tok(token);
+            foreach (var cls in classes)
+                _root.Query<VisualElement>(className: cls).ForEach(e => e.style.color = c);
+        }
+
+        private void BorderBg(NexusToken bg, NexusToken border, params string[] classes)
+        {
+            var b = Tok(bg);
+            var br = Tok(border);
+            foreach (var cls in classes)
+                _root.Query<VisualElement>(className: cls).ForEach(e =>
+                {
+                    e.style.backgroundColor = b;
+                    SetBorder(e, br);
+                });
+        }
+
+        private enum DividerSide { Top, Bottom }
+
+        private void DividerEach(DividerSide side, params string[] classes)
+        {
+            var d = Tok(NexusToken.Divider);
+            foreach (var cls in classes)
+                _root.Query<VisualElement>(className: cls).ForEach(e =>
+                {
+                    if (side == DividerSide.Bottom) e.style.borderBottomColor = d;
+                    else                            e.style.borderTopColor = d;
+                });
+        }
+
+        private void DotColor(string className, NexusToken token, bool outline)
+        {
+            var c = Tok(token);
+            _root.Query<VisualElement>(className: className).ForEach(d =>
+            {
+                if (outline) { d.style.backgroundColor = Clear; SetBorder(d, c); }
+                else d.style.backgroundColor = c;
+            });
+        }
+
+        // Красит кнопку по роли и (один раз) подвешивает hover/pressed.
+        private void Pressable(Button b, NexusRole role)
+        {
+            if (b == null) return;
+            var rc = Context.Theme.GetRole(role);
+
+            b.style.backgroundColor = rc.Bg;
+            b.style.color = rc.Fg;
+            SetBorder(b, rc.Border);
+
+            if (b.ClassListContains(WiredMark)) return;
+            b.AddToClassList(WiredMark);
+            b.RegisterCallback<PointerEnterEvent>(_ => b.style.backgroundColor = rc.Hover);
+            b.RegisterCallback<PointerLeaveEvent>(_ => b.style.backgroundColor = rc.Bg);
+            b.RegisterCallback<PointerDownEvent>(_ => b.style.backgroundColor = rc.Pressed);
+            b.RegisterCallback<PointerUpEvent>(_   => b.style.backgroundColor = rc.Hover);
+        }
+
+        private void PressableRemove(Button b)
+        {
+            if (b == null) return;
+            var rc    = Context.Theme.GetRole(NexusRole.Ghost);
+            var err   = Tok(NexusToken.Error);
+
+            b.style.backgroundColor = rc.Bg;
+            b.style.color = rc.Fg;
+            SetBorder(b, rc.Border);
+
+            if (b.ClassListContains(WiredMark)) return;
+            b.AddToClassList(WiredMark);
+            b.RegisterCallback<PointerEnterEvent>(_ => { b.style.color = err; b.style.backgroundColor = rc.Soft; SetBorder(b, err); });
+            b.RegisterCallback<PointerLeaveEvent>(_ => { b.style.color = rc.Fg; b.style.backgroundColor = rc.Bg; SetBorder(b, rc.Border); });
+        }
+
+        // Ховер строки редактора: меняем только фон; на выходе восстанавливаем по conflict-состоянию.
+        private void WireRowHover(VisualElement row)
+        {
+            if (row == null || row.ClassListContains(WiredMark)) return;
+            row.AddToClassList(WiredMark);
+            row.RegisterCallback<PointerEnterEvent>(_ => row.style.backgroundColor = Tok(NexusToken.SurfaceHover));
+            row.RegisterCallback<PointerLeaveEvent>(_ =>
+                row.style.backgroundColor = row.ClassListContains("nav-row--conflict")
+                    ? Tok(NexusToken.ErrorSoft) : Tok(NexusToken.BgRaised));
+        }
+
+        // Ховер list-строки (tpl/hook): на входе SurfaceHover, на выходе — базовый фон leaveColor.
+        private void WireSurfaceHover(VisualElement row, Color leaveColor)
+        {
+            if (row == null || row.ClassListContains(WiredMark)) return;
+            row.AddToClassList(WiredMark);
+            row.RegisterCallback<PointerEnterEvent>(_ => row.style.backgroundColor = Tok(NexusToken.SurfaceHover));
+            row.RegisterCallback<PointerLeaveEvent>(_ =>
+                row.style.backgroundColor = row.ClassListContains("nav-hook-lib-row--selected")
+                    ? Tok(NexusToken.AccentSoft) : leaveColor);
+        }
+
+        private void WireTabHover(Button b)
+        {
+            if (b == null || b.ClassListContains(WiredMark)) return;
+            b.AddToClassList(WiredMark);
+            b.RegisterCallback<PointerEnterEvent>(_ =>
+            {
+                if (!b.ClassListContains("nav-tab-btn--active")) b.style.backgroundColor = Tok(NexusToken.SurfaceHover);
+            });
+            b.RegisterCallback<PointerLeaveEvent>(_ =>
+                b.style.backgroundColor = b.ClassListContains("nav-tab-btn--active") ? Tok(NexusToken.AccentSoft) : Clear);
+        }
+
+        // Кольцо фокуса на инпуте: Focus при фокусе, Border при потере.
+        private void WireFocus(VisualElement input)
+        {
+            if (input == null || input.ClassListContains(WiredMark)) return;
+            input.AddToClassList(WiredMark);
+            input.RegisterCallback<FocusInEvent>(_  => SetBorder(input, Tok(NexusToken.Focus)));
+            input.RegisterCallback<FocusOutEvent>(_ => SetBorder(input, Tok(NexusToken.Border)));
+        }
+
+        private static void SetBorder(VisualElement e, Color c) =>
+            e.style.borderTopColor = e.style.borderBottomColor =
+                e.style.borderLeftColor = e.style.borderRightColor = c;
+    }
+}

@@ -1,0 +1,85 @@
+using System;
+using System.Diagnostics;
+using System.Text;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Тонкая обёртка над System.Diagnostics.Process для запуска CLI генератора.
+    /// Гоняет команду через системный шелл — так корректно подхватываются
+    /// script-shim'ы (openapi-generator-cli, npx) на всех ОС.
+    /// Чтение stdout/stderr асинхронными хендлерами — чтобы не словить
+    /// дедлок на переполнении буфера при многословном выводе генератора.
+    /// </summary>
+    public static class GeneratorRunner
+    {
+        public sealed class RunOutput
+        {
+            public bool Started;     // процесс вообще удалось запустить (java/CLI на месте)
+            public int ExitCode;
+            public string StdOut;
+            public string StdErr;
+            public string Error;     // если не стартанул — почему
+            public bool Success => Started && ExitCode == 0;
+        }
+
+        public static RunOutput Run(string commandLine, string workingDir)
+        {
+            var result = new RunOutput();
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+
+            var (shell, shellArgs) = BuildShellInvocation(commandLine);
+
+            try
+            {
+                using var proc = new Process();
+                proc.StartInfo = new ProcessStartInfo
+                {
+                    FileName = shell,
+                    Arguments = shellArgs,
+                    WorkingDirectory = workingDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                proc.OutputDataReceived += (_, e) => { if (e.Data != null) stdout.AppendLine(e.Data); };
+                proc.ErrorDataReceived += (_, e) => { if (e.Data != null) stderr.AppendLine(e.Data); };
+
+                proc.Start();
+                result.Started = true;
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.WaitForExit();
+
+                result.ExitCode = proc.ExitCode;
+                result.StdOut = stdout.ToString();
+                result.StdErr = stderr.ToString();
+            }
+            catch (Exception e)
+            {
+                // Типовая причина: не установлен java/CLI, или команда не найдена в PATH.
+                result.Error = $"Не удалось запустить генератор: {e.Message}";
+                UnityEngine.Debug.LogWarning($"[ApiCodegen] {result.Error}");
+            }
+
+            return result;
+        }
+
+        /// <summary>Прогон команды через шелл целевой ОС.</summary>
+        private static (string shell, string args) BuildShellInvocation(string commandLine)
+        {
+            // Экранируем кавычки внутри командной строки под конкретный шелл.
+            if (Application.platform == RuntimePlatform.WindowsEditor)
+            {
+                // cmd.exe /c "<command>"
+                return ("cmd.exe", $"/c \"{commandLine}\"");
+            }
+            // /bin/sh -c '<command>'  (одинарные кавычки → экранируем апострофы)
+            var escaped = commandLine.Replace("'", "'\\''");
+            return ("/bin/sh", $"-c '{escaped}'");
+        }
+    }
+}

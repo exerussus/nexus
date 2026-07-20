@@ -1,0 +1,364 @@
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    public sealed partial class WorkspacePage
+    {
+        // ---------- Одиночный клик: пинг + выделение ----------
+
+        private void ActivatePing(WorkspaceGroup group, WorkspaceEntry entry)
+        {
+            switch (entry.kind)
+            {
+                case WorkspaceEntryKind.Asset:
+                {
+                    var obj = ResolveObject(entry);
+                    if (obj == null) { Context.SetStatus($"Ассет отсутствует: {entry.cachedName}", StatusKind.Error); return; }
+                    Selection.activeObject = obj;
+                    EditorGUIUtility.PingObject(obj);
+                    Context.SetStatus(entry.cachedName, StatusKind.Info);
+                    break;
+                }
+                case WorkspaceEntryKind.SceneObject:
+                {
+                    var obj = ResolveObject(entry);
+                    if (obj != null) { PingScene(entry, obj); return; }
+                    // Объект не найден среди загруженных сцен → предложить открыть его сцену.
+                    OfferOpenScene(entry, pingAfter: true);
+                    break;
+                }
+                case WorkspaceEntryKind.ExternalFile:
+                {
+                    RevealEntry(entry); // пинговать вне-проектный файл нельзя — показываем в проводнике
+                    break;
+                }
+                case WorkspaceEntryKind.Bundle:
+                {
+                    PingBundle(entry);
+                    break;
+                }
+            }
+        }
+
+        private void PingBundle(WorkspaceEntry entry)
+        {
+            if (entry.items.Count == 0) { Context.SetStatus("Набор пуст", StatusKind.Info); return; }
+
+            // Есть объекты сцены в закрытых сценах → предложить переход, затем выделить всё.
+            if (HasClosedSceneMembers(entry)) { GoToBundleScenes(entry, selectAfter: true); return; }
+
+            SelectAndPingBundle(entry);
+        }
+
+        private void SelectAndPingBundle(WorkspaceEntry entry)
+        {
+            var objs = ResolveBundleObjects(entry);
+            if (objs.Count == 0)
+            {
+                Context.SetStatus("Нет доступных элементов (сцены закрыты или элементы удалены)", StatusKind.Warning);
+                return;
+            }
+            Selection.objects = objs.ToArray();
+            EditorGUIUtility.PingObject(objs[0]);
+            Context.SetStatus($"Выделено {objs.Count}/{entry.items.Count} из «{BundleDisplayName(entry)}»", StatusKind.Info);
+        }
+
+        /// <summary>
+        /// Открыть сцены, которым принадлежат объекты набора. Одна сцена → Single («переход»),
+        /// несколько → недостающие догружаем Additive, чтобы выделить элементы из всех сцен сразу.
+        /// </summary>
+        private void GoToBundleScenes(WorkspaceEntry entry, bool selectAfter)
+        {
+            var memberScenes = new List<string>();
+            foreach (var m in entry.items)
+            {
+                if (m.kind != WorkspaceEntryKind.SceneObject) continue;
+                string sp = ScenePathOf(m);
+                if (!string.IsNullOrEmpty(sp) && !memberScenes.Contains(sp)) memberScenes.Add(sp);
+            }
+            if (memberScenes.Count == 0) { if (selectAfter) SelectAndPingBundle(entry); return; }
+
+            var notLoaded = new List<string>();
+            foreach (var sp in memberScenes)
+                if (!IsSceneLoaded(sp)) notLoaded.Add(sp);
+
+            if (notLoaded.Count == 0) { if (selectAfter) SelectAndPingBundle(entry); return; }
+
+            bool single = memberScenes.Count == 1; // весь сценовый контент набора в одной сцене → настоящий переход
+            string name = BundleDisplayName(entry);
+            string msg = single
+                ? $"«{name}» содержит объекты в сцене:\n{notLoaded[0]}\n\nПерейти в неё?"
+                : $"«{name}» ссылается на {memberScenes.Count} сцен; {notLoaded.Count} не открыто.\n\nОткрыть недостающие сцены аддитивно?";
+
+            if (!EditorUtility.DisplayDialog("Открыть сцены?", msg, "Открыть", "Отмена"))
+            {
+                if (selectAfter) SelectAndPingBundle(entry); // отказ от перехода — но доступное выделим
+                return;
+            }
+
+            if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;
+
+            if (single)
+                EditorSceneManager.OpenScene(notLoaded[0], OpenSceneMode.Single);
+            else
+                foreach (var sp in notLoaded)
+                    EditorSceneManager.OpenScene(sp, OpenSceneMode.Additive);
+
+            if (selectAfter) SelectAndPingBundle(entry);
+        }
+
+        private bool HasClosedSceneMembers(WorkspaceEntry entry)
+        {
+            foreach (var m in entry.items)
+            {
+                if (m.kind != WorkspaceEntryKind.SceneObject) continue;
+                if (ResolveObject(m) != null) continue; // уже доступен — его сцена открыта
+                string sp = ScenePathOf(m);
+                if (!string.IsNullOrEmpty(sp) && !IsSceneLoaded(sp)) return true;
+            }
+            return false;
+        }
+
+        private string ScenePathOf(WorkspaceEntry m) =>
+            !string.IsNullOrEmpty(m.sceneGuid) ? AssetDatabase.GUIDToAssetPath(m.sceneGuid) : m.cachedScenePath;
+
+        private void PingScene(WorkspaceEntry entry, Object obj)
+        {
+            // Обновим кэш пути иерархии «вживую».
+            if (obj is GameObject go) entry.cachedHierarchyPath = HierarchyPath(go);
+            Selection.activeObject = obj;
+            EditorGUIUtility.PingObject(obj);
+            Context.SetStatus(entry.cachedHierarchyPath, StatusKind.Info);
+        }
+
+        // ---------- Двойной клик: открыть / редактировать ----------
+
+        private void ActivateOpen(WorkspaceEntry entry)
+        {
+            switch (entry.kind)
+            {
+                case WorkspaceEntryKind.Asset:
+                {
+                    string path = AssetDatabase.GUIDToAssetPath(entry.assetGuid);
+                    if (string.IsNullOrEmpty(path)) { Context.SetStatus("Ассет отсутствует", StatusKind.Error); return; }
+
+                    if (IsPrefabAsset(path)) { OpenPrefabFlow(path); return; }
+
+                    var obj = ResolveObject(entry);
+                    if (obj != null) AssetDatabase.OpenAsset(obj);
+                    break;
+                }
+                case WorkspaceEntryKind.SceneObject:
+                    OfferOpenScene(entry, pingAfter: true);
+                    break;
+
+                case WorkspaceEntryKind.ExternalFile:
+                    RevealEntry(entry);
+                    break;
+
+                case WorkspaceEntryKind.Bundle:
+                    OpenBundle(entry);
+                    break;
+            }
+        }
+
+        private void OpenBundle(WorkspaceEntry entry)
+        {
+            int count = entry.items.Count;
+            if (count == 0) { Context.SetStatus("Набор пуст", StatusKind.Info); return; }
+            if (count > 8 && !EditorUtility.DisplayDialog("Открыть все",
+                    $"Открыть все {count} элемент(ов) из «{BundleDisplayName(entry)}»?", "Открыть", "Отмена"))
+                return;
+
+            // Сначала открыть сцены объектов набора, чтобы они тоже зарезолвились.
+            if (HasClosedSceneMembers(entry)) GoToBundleScenes(entry, selectAfter: false);
+
+            var selected = new List<Object>();
+            int opened = 0;
+            foreach (var m in entry.items)
+            {
+                var obj = ResolveObject(m);
+                if (obj != null) selected.Add(obj);
+
+                if (m.kind == WorkspaceEntryKind.Asset)
+                {
+                    string path = AssetDatabase.GUIDToAssetPath(m.assetGuid);
+                    if (string.IsNullOrEmpty(path)) continue;
+                    if (IsPrefabAsset(path)) { OpenPrefabFlow(path); opened++; }
+                    else if (obj != null) { AssetDatabase.OpenAsset(obj); opened++; }
+                }
+                // Объекты сцены не «открываем» массово — только добавляем в выделение.
+            }
+            if (selected.Count > 0) Selection.objects = selected.ToArray();
+            Context.SetStatus($"Открыто {opened}, выделено {selected.Count} из «{BundleDisplayName(entry)}»", StatusKind.Info);
+        }
+
+        private static bool IsPrefabAsset(string path)
+        {
+            var type = PrefabUtility.GetPrefabAssetType(AssetDatabase.LoadMainAssetAtPath(path));
+            // Model-префабы (fbx и т.п.) нельзя редактировать в prefab stage — их откроем как обычный ассет.
+            return type == PrefabAssetType.Regular || type == PrefabAssetType.Variant;
+        }
+
+        /// <summary>
+        /// Открыть префаб в режиме редактирования. Если уже редактируем другой префаб с
+        /// несохранёнными изменениями — спросить. Discard — best-effort (Unity не гарантирует отмену).
+        /// </summary>
+        private void OpenPrefabFlow(string path)
+        {
+            var stage = PrefabStageUtility.GetCurrentPrefabStage();
+            if (stage != null && stage.assetPath != path && stage.scene.isDirty)
+            {
+                int r = EditorUtility.DisplayDialogComplex(
+                    "Несохранённые изменения префаба",
+                    $"Вы редактируете «{stage.assetPath}» с несохранёнными изменениями.\nОткрыть «{path}»?",
+                    "Сохранить и открыть", "Отмена", "Отменить изменения и открыть");
+
+                if (r == 1) return; // Отмена
+                if (r == 0) PrefabUtility.SaveAsPrefabAsset(stage.prefabContentsRoot, stage.assetPath);
+                // r == 2 → Discard: просто открываем новый (несохранённое теряется).
+            }
+
+            PrefabStageUtility.OpenPrefab(path);
+            Context.SetStatus($"Редактирование префаба: {System.IO.Path.GetFileName(path)}", StatusKind.Ok);
+        }
+
+        // ---------- Переход в сцену объекта ----------
+
+        private void OfferOpenScene(WorkspaceEntry entry, bool pingAfter)
+        {
+            string scenePath = !string.IsNullOrEmpty(entry.sceneGuid)
+                ? AssetDatabase.GUIDToAssetPath(entry.sceneGuid)
+                : entry.cachedScenePath;
+
+            if (string.IsNullOrEmpty(scenePath))
+            {
+                Context.SetStatus("Исходная сцена неизвестна или удалена", StatusKind.Error);
+                return;
+            }
+
+            // Если сцена уже загружена — объект должен резолвиться, просто пингуем.
+            if (IsSceneLoaded(scenePath))
+            {
+                var live = ResolveObject(entry);
+                if (live != null) { PingScene(entry, live); return; }
+                Context.SetStatus("Объект не найден в открытой сцене (перемещён или удалён)", StatusKind.Warning);
+                return;
+            }
+
+            if (!EditorUtility.DisplayDialog(
+                    "Сменить сцену?",
+                    $"«{entry.cachedName}» находится в:\n{scenePath}\n\nЭта сцена не открыта. Открыть сейчас?",
+                    "Открыть сцену", "Отмена"))
+                return;
+
+            // Дать пользователю сохранить текущие изменения сцен.
+            if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;
+
+            EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Single);
+
+            if (!pingAfter) return;
+            var obj = ResolveObject(entry);
+            if (obj != null) PingScene(entry, obj);
+            else Context.SetStatus("Сцена открыта, но объект не найден (возможно, удалён)", StatusKind.Warning);
+        }
+
+        private static bool IsSceneLoaded(string scenePath)
+        {
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                var s = SceneManager.GetSceneAt(i);
+                if (s.path == scenePath && s.isLoaded) return true;
+            }
+            return false;
+        }
+
+        // ---------- Тулбар-действия ----------
+
+        private void AddSelection()
+        {
+            var group = _store.EnsureAtLeastOneGroup();
+            int added = 0, dup = 0;
+            foreach (var obj in Selection.objects)
+            {
+                var entry = BuildEntryFromObject(obj);
+                if (entry == null) continue;
+                if (_store.FindByKey(entry.StableKey) is { } existing) { _flashKey = existing.StableKey; dup++; continue; }
+                _store.InsertEntry(group, group.entries.Count, entry);
+                added++;
+            }
+            RebuildGroups();
+            if (added > 0) Context.SetStatus($"Добавлено {added} из выделения", StatusKind.Ok);
+            else if (dup > 0) Context.SetStatus("Выделение уже в рабочей области", StatusKind.Warning);
+            else Context.SetStatus("В выделении нечего добавить", StatusKind.Info);
+        }
+
+        /// <summary>Свернуть текущее выделение в один набор-карточку.</summary>
+        private void CreateSetFromSelection()
+        {
+            var members = new List<WorkspaceEntry>();
+            foreach (var obj in Selection.objects)
+            {
+                var entry = BuildEntryFromObject(obj);
+                if (entry != null) members.Add(entry);
+            }
+            if (members.Count == 0) { Context.SetStatus("В выделении нечего добавить", StatusKind.Info); return; }
+
+            var group = _store.EnsureAtLeastOneGroup();
+            var bundle = _store.MakeBundle("", members);
+            _store.InsertEntry(group, group.entries.Count, bundle);
+            _flashKey = bundle.StableKey;
+            RebuildGroups();
+            Context.SetStatus($"Создан набор из {bundle.items.Count} элемент(ов)", StatusKind.Ok);
+        }
+
+        /// <summary>Добавить текущее выделение в существующий набор.</summary>
+        private void AddSelectionToBundle(WorkspaceEntry bundle)
+        {
+            var members = new List<WorkspaceEntry>();
+            foreach (var obj in Selection.objects)
+            {
+                var entry = BuildEntryFromObject(obj);
+                if (entry != null) members.Add(entry);
+            }
+            int added = _store.BundleAdd(bundle, members);
+            RebuildGroups();
+            Context.SetStatus(added > 0 ? $"Добавлено {added} в набор" : "Нечего добавить", added > 0 ? StatusKind.Ok : StatusKind.Info);
+        }
+
+        private void ClearWorkspace()
+        {
+            if (!EditorUtility.DisplayDialog("Очистить рабочую область",
+                    "Убрать все незакреплённые карточки из всех групп?", "Очистить", "Отмена"))
+                return;
+            int removed = _store.ClearNonPinned();
+            RebuildGroups();
+            Context.SetStatus($"Убрано {removed} карточек (закреплённые сохранены)", StatusKind.Info);
+        }
+
+        // ---------- Прочее ----------
+
+        private void RevealEntry(WorkspaceEntry entry)
+        {
+            string p = EntryPath(entry);
+            if (string.IsNullOrEmpty(p)) { Context.SetStatus("Путь недоступен", StatusKind.Error); return; }
+            EditorUtility.RevealInFinder(p);
+        }
+
+        private void RelinkToSelection(WorkspaceGroup group, WorkspaceEntry oldEntry)
+        {
+            var sel = Selection.activeObject;
+            if (sel == null) return;
+            var fresh = BuildEntryFromObject(sel);
+            if (fresh == null) { Context.SetStatus("Выделение нельзя привязать", StatusKind.Warning); return; }
+            _store.ReplaceInPlace(group, oldEntry, fresh);
+            RebuildGroups();
+            Context.SetStatus($"Перепривязано к «{fresh.cachedName}»", StatusKind.Ok);
+        }
+    }
+}

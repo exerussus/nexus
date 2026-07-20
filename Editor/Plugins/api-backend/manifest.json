@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "guid": "b6f526108b414e59bd2ac04ea08ed832",
+  "id": "api-backend",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.ApiBackend.ApiBackendPage",
+  "kind": "servicing",
+  "display": {
+    "name": "API / Backend",
+    "category": "Infrastructure",
+    "order": 20,
+    "icon": null
+  },
+  "requires": [],
+  "packageRequires": [
+    {
+      "name": "com.unity.nuget.newtonsoft-json",
+      "gitUrl": null,
+      "assembly": "Newtonsoft.Json"
+    }
+  ],
+  "deploy": [
+    { "from": "ApiBackendPage.cs.txt", "to": "ApiBackendPage.cs" },
+    { "from": "ApiBackendPage.Config.cs.txt", "to": "ApiBackendPage.Config.cs" },
+    { "from": "ApiBackendPage.Profiles.cs.txt", "to": "ApiBackendPage.Profiles.cs" },
+    { "from": "ApiBackendPage.Drift.cs.txt", "to": "ApiBackendPage.Drift.cs" },
+    { "from": "ApiBackendPage.Generate.cs.txt", "to": "ApiBackendPage.Generate.cs" },
+    { "from": "ApiBackendPage.uss.txt", "to": "ApiBackendPage.uss" },
+    { "from": "ApiCodegenConfig.cs.txt", "to": "ApiCodegenConfig.cs" },
+    { "from": "ApiCodegenEngine.cs.txt", "to": "ApiCodegenEngine.cs" },
+    { "from": "ApiCodegenBatch.cs.txt", "to": "ApiCodegenBatch.cs" },
+    { "from": "SpecFetcher.cs.txt", "to": "SpecFetcher.cs" },
+    { "from": "SpecLinter.cs.txt", "to": "SpecLinter.cs" },
+    { "from": "DriftAnalyzer.cs.txt", "to": "DriftAnalyzer.cs" },
+    { "from": "CodeDiffer.cs.txt", "to": "CodeDiffer.cs" },
+    { "from": "CodegenSnapshot.cs.txt", "to": "CodegenSnapshot.cs" },
+    { "from": "OutputGuard.cs.txt", "to": "OutputGuard.cs" },
+    { "from": "OutputPostProcessor.cs.txt", "to": "OutputPostProcessor.cs" },
+    { "from": "GeneratorRunner.cs.txt", "to": "GeneratorRunner.cs" },
+    { "from": "VersionDeployer.cs.txt", "to": "VersionDeployer.cs" },
+    { "from": "ProjectScaffolder.cs.txt", "to": "ProjectScaffolder.cs" },
+    { "from": "Exerussus.Nexus.Pages.ApiBackend.asmdef.txt", "to": "Exerussus.Nexus.Pages.ApiBackend.asmdef" },
+    { "from": "Templates/api.mustache.txt", "to": "Templates/api.mustache.txt" },
+    { "from": "Templates/RestClient.cs.txt", "to": "Templates/RestClient.cs.txt" },
+    { "from": "Templates/RestClientOptions.cs.txt", "to": "Templates/RestClientOptions.cs.txt" },
+    { "from": "Templates/ApiException.cs.txt", "to": "Templates/ApiException.cs.txt" }
+  ]
+}

@@ -1,0 +1,58 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Drag&drop на страницу: .sal → открыть в редакторе, .json → API-манифест.
+    // Принимает и ассеты из Project-окна, и файлы из ОС (DragAndDrop.paths работает для обоих).
+    // Можно бросить пару файлов разом: сначала применится манифест, затем откроется код.
+    public sealed class FileDropController
+    {
+        public event Action<string> SalDropped;   // абсолютный путь к .sal
+        public event Action<string> JsonDropped;  // абсолютный путь к .json
+        public event Action DragEntered;          // подходящий файл занесли над страницей
+
+        public FileDropController(VisualElement target)
+        {
+            target.RegisterCallback<DragEnterEvent>(_ =>
+            {
+                // параметр лямбды назван "_", поэтому голый out _ ссылается на него и не
+                // компилируется — нужен out var _ (discard-объявление)
+                if (Scan(out var _, out var _)) DragEntered?.Invoke();
+            });
+            // visualMode обязан выставляться на КАЖДОМ Update, иначе редактор покажет «запрещено»
+            target.RegisterCallback<DragUpdatedEvent>(_ =>
+            {
+                DragAndDrop.visualMode = Scan(out var _, out var _)
+                    ? DragAndDropVisualMode.Copy
+                    : DragAndDropVisualMode.Rejected;
+            });
+            target.RegisterCallback<DragPerformEvent>(_ =>
+            {
+                if (!Scan(out string sal, out string json)) return;
+                DragAndDrop.AcceptDrag();
+                // порядок важен: сначала манифест — .sal сразу компилируется против нового API
+                if (json != null) JsonDropped?.Invoke(Path.GetFullPath(json));
+                if (sal != null) SalDropped?.Invoke(Path.GetFullPath(sal));
+            });
+        }
+
+        // Первый .sal и первый .json из набора (пути Project-окна относительные — нормализуем выше).
+        private static bool Scan(out string sal, out string json)
+        {
+            sal = null;
+            json = null;
+            var paths = DragAndDrop.paths;
+            if (paths == null) return false;
+            foreach (var p in paths)
+            {
+                if (string.IsNullOrEmpty(p)) continue;
+                if (sal == null && p.EndsWith(".sal", StringComparison.OrdinalIgnoreCase)) sal = p;
+                else if (json == null && p.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) json = p;
+            }
+            return sal != null || json != null;
+        }
+    }
+}

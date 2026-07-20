@@ -1,0 +1,429 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.Logs
+{
+    public sealed partial class LogsPage
+    {
+        private const int MaxRows = 500;   // ограничиваем число отрисованных строк ради отзывчивости
+
+        private readonly List<int> _tmpIndices = new();
+        // (индекс представителя, длина серии) после необязательного прохода схлопывания
+        private readonly List<(int idx, int count)> _rows = new();
+
+        // ------------------------------------------------------------- list build
+
+        private void RebuildList()
+        {
+            if (_list == null) return;
+
+            bool atBottom = WasAtBottom();   // замер ДО очистки контента
+
+            _list.Clear();
+
+            _tmpIndices.Clear();
+            for (int i = 0; i < _all.Count; i++)
+                if (Passes(_all[i])) _tmpIndices.Add(i);
+
+            if (_tmpIndices.Count == 0)
+            {
+                var empty = new Label(_all.Count == 0
+                    ? "Логи ещё не собраны."
+                    : "Под текущий фильтр логи не подходят.");
+                empty.AddToClassList("logc-empty");
+                empty.style.color = Tok(NexusToken.TextDim);
+                _list.Add(empty);
+                return;
+            }
+
+            // Схлопывание: сворачиваем серии одинаковых записей, СОСЕДНИХ в видимом списке, в
+            // одну строку со счётчиком ×N (как Collapse в Console, но только подряд идущие).
+            // Представитель = последний элемент серии.
+            _rows.Clear();
+            if (_collapse)
+            {
+                int run = 1;
+                for (int k = 0; k < _tmpIndices.Count; k++)
+                {
+                    bool sameAsNext = k + 1 < _tmpIndices.Count
+                        && SameForCollapse(_all[_tmpIndices[k]], _all[_tmpIndices[k + 1]]);
+                    if (sameAsNext) { run++; continue; }
+                    _rows.Add((_tmpIndices[k], run));
+                    run = 1;
+                }
+            }
+            else
+            {
+                for (int k = 0; k < _tmpIndices.Count; k++)
+                    _rows.Add((_tmpIndices[k], 1));
+            }
+
+            int start = Mathf.Max(0, _rows.Count - MaxRows);
+            if (start > 0)
+            {
+                var more = new Label(
+                    $"… скрыто {start} {(_collapse ? "групп" : "записей")} ранее (показаны последние {MaxRows})");
+                more.AddToClassList("logc-more");
+                more.style.color = Tok(NexusToken.TextDim);
+                _list.Add(more);
+            }
+
+            for (int k = start; k < _rows.Count; k++)
+            {
+                // Первая строка сессии = её session отличается от session предыдущей строки.
+                // Сравниваем с _rows[k-1], даже если та выше видимого окна, чтобы сессия,
+                // реально начавшаяся раньше (срезанная лимитом), НЕ была помечена ошибочно.
+                bool sessionFirst = k == 0
+                    || _all[_rows[k].idx].session != _all[_rows[k - 1].idx].session;
+                _list.Add(MakeRow(_all[_rows[k].idx], _rows[k].count, sessionFirst));
+            }
+
+            if (_autoScroll && atBottom) ScrollToBottom();
+        }
+
+        /// <summary>Две записи схлопываются вместе, только если совпали их session, уровень,
+        /// сырое сообщение и стек — так разные логи не сольются, а первая строка нового
+        /// прогона не свернётся в предыдущий.</summary>
+        private static bool SameForCollapse(LogEntry a, LogEntry b) =>
+            a.group == b.group
+            && a.session == b.session
+            && string.Equals(a.raw, b.raw, StringComparison.Ordinal)
+            && string.Equals(a.stackTrace, b.stackTrace, StringComparison.Ordinal);
+
+        // --------------------------------------------------------------- scrolling
+
+        /// <summary>true, если вид сейчас у (или около) низа — чтобы «умная» автопрокрутка
+        /// прилипала только когда пользователь не отлистнул вверх читать.</summary>
+        private bool WasAtBottom()
+        {
+            if (_list == null) return true;
+            float content  = _list.contentContainer.layout.height;
+            float viewport = _list.layout.height;
+            if (float.IsNaN(content) || float.IsNaN(viewport)) return true;
+            float max = content - viewport;
+            if (max <= 1f) return true;                 // прокручивать пока нечего
+            return _list.scrollOffset.y >= max - 24f;   // в пределах ~одной строки от конца
+        }
+
+        private void OnListGeometryScroll(GeometryChangedEvent _)
+        {
+            if (_list == null) return;
+            _list.contentContainer.UnregisterCallback<GeometryChangedEvent>(OnListGeometryScroll);
+            _list.scrollOffset = new Vector2(_list.scrollOffset.x, _list.contentContainer.layout.height);
+        }
+
+        private void ScrollToBottom()
+        {
+            if (_list == null) return;
+            // Свежедобавленные строки ещё не разложены, поэтому установка scrollOffset сейчас
+            // зажмётся в СТАРУЮ (меньшую) высоту — это был исходный баг «не прокручивается на
+            // новых логах». Переприменяем, когда геометрия контента устоится.
+            _list.contentContainer.UnregisterCallback<GeometryChangedEvent>(OnListGeometryScroll);
+            _list.contentContainer.RegisterCallback<GeometryChangedEvent>(OnListGeometryScroll);
+            _list.scrollOffset = new Vector2(_list.scrollOffset.x, float.MaxValue); // best-effort сейчас
+        }
+
+        // ------------------------------------------------------------------- row
+
+        private VisualElement MakeRow(LogEntry e, int count, bool sessionFirst)
+        {
+            float fMsg  = _fontPx;
+            float fTime = Mathf.Max(MinFont, _fontPx - 1);
+            float fSub  = Mathf.Max(MinFont, _fontPx - 2);
+
+            var group     = e.Group;
+            var cls       = GroupClass(group);
+            var lvlColor  = Tok(LevelToken(group));
+
+            var row = new VisualElement();
+            row.AddToClassList("logc-row");
+            row.AddToClassList("logc-row--" + cls);
+            if (sessionFirst) row.AddToClassList("logc-row--session-start");
+
+            // покраска строки: фон/рамка зависят от наведения и раскрытия; левая полоса = уровень.
+            bool over = false, open = false;
+            void Repaint()
+            {
+                SetBg(row, open ? Tok(NexusToken.Hover)
+                         : sessionFirst ? Tok(NexusToken.Selection)
+                         : Tok(NexusToken.BgRaised));
+                SetBorder(row, open ? Tok(NexusToken.Selection)
+                            : over ? Tok(NexusToken.Border)
+                            : Color.clear);
+                row.style.borderLeftColor = lvlColor;
+                if (sessionFirst) row.style.borderTopColor = Tok(NexusToken.Accent);
+            }
+            Repaint();
+            row.RegisterCallback<PointerEnterEvent>(_ => { over = true;  Repaint(); });
+            row.RegisterCallback<PointerLeaveEvent>(_ => { over = false; Repaint(); });
+
+            // ---- шапка (всегда видна, клик раскрывает) ----
+            var head = new VisualElement();
+            head.AddToClassList("logc-row-head");
+
+            var time = new Label(e.Time.ToString("HH:mm:ss"));
+            time.AddToClassList("logc-time");
+            time.style.fontSize = fTime;
+            time.style.color = Tok(NexusToken.TextDim);
+            head.Add(time);
+
+            var badge = new Label(GroupLabel(group));
+            badge.AddToClassList("logc-badge");
+            badge.style.fontSize = fSub;
+            SetBg(badge, lvlColor);
+            badge.style.color = Tok(NexusToken.BgHard);
+            head.Add(badge);
+
+            if (count > 1)
+            {
+                var cnt = new Label("×" + count);
+                cnt.AddToClassList("logc-count-chip");
+                cnt.style.fontSize = fSub;
+                SetBg(cnt, Tok(NexusToken.Accent));
+                cnt.style.color = Tok(NexusToken.BgHard);
+                cnt.tooltip = count + " одинаковых подряд записей";
+                head.Add(cnt);
+            }
+
+            if (e.tags != null)
+            {
+                foreach (var t in e.tags)
+                {
+                    var chip = new Label(t);
+                    chip.AddToClassList("logc-rowtag");
+                    chip.style.fontSize = fSub;
+                    SetBg(chip, Tok(NexusToken.BgHard));
+                    SetBorder(chip, Tok(NexusToken.Border));
+                    chip.style.color = Tok(NexusToken.TextDim);
+                    head.Add(chip);
+                }
+            }
+
+            var msg = new Label(string.IsNullOrEmpty(e.message) ? "(нет сообщения)" : e.message);
+            msg.AddToClassList("logc-msg");
+            msg.style.fontSize = fMsg;
+            msg.style.color = Tok(NexusToken.TextNormal);
+            head.Add(msg);
+
+            row.Add(head);
+
+            // ---- детали (строятся лениво при первом раскрытии) ----
+            var detail = new VisualElement();
+            detail.AddToClassList("logc-detail");
+            detail.style.display = DisplayStyle.None;
+            SetBg(detail, Tok(NexusToken.BgHard));
+            SetBorder(detail, Tok(NexusToken.Border));
+            row.Add(detail);
+
+            bool built = false;
+            head.RegisterCallback<ClickEvent>(evt =>
+            {
+                if (evt.button != 0) return;          // правый клик оставляем контекстному меню
+                open = !open;
+                detail.style.display = open ? DisplayStyle.Flex : DisplayStyle.None;
+                Repaint();
+                if (open && !built) { BuildDetail(detail, e); built = true; }
+            });
+
+            head.AddManipulator(new ContextualMenuManipulator(evt => BuildRowMenu(evt, e)));
+
+            return row;
+        }
+
+        private void BuildRowMenu(ContextualMenuPopulateEvent evt, LogEntry e)
+        {
+            evt.menu.AppendAction("Копировать сообщение", _ =>
+            {
+                EditorGUIUtility.systemCopyBuffer = e.raw ?? string.Empty;
+                Context.SetStatus("Сообщение скопировано.", StatusKind.Info);
+            });
+
+            evt.menu.AppendAction("Копировать стек", _ =>
+            {
+                EditorGUIUtility.systemCopyBuffer = e.stackTrace ?? string.Empty;
+                Context.SetStatus("Стек скопирован.", StatusKind.Info);
+            }, string.IsNullOrEmpty(e.stackTrace)
+                ? DropdownMenuAction.Status.Disabled
+                : DropdownMenuAction.Status.Normal);
+
+            StackFrameInfo? firstFile = null;
+            foreach (var f in StackTraceUtil.Parse(e.stackTrace))
+                if (f.HasFile) { firstFile = f; break; }
+
+            evt.menu.AppendAction("Открыть исходник", _ =>
+            {
+                if (firstFile.HasValue) OpenFrame(firstFile.Value);
+            }, firstFile.HasValue
+                ? DropdownMenuAction.Status.Normal
+                : DropdownMenuAction.Status.Disabled);
+
+            if (e.tags != null && e.tags.Length > 0)
+            {
+                evt.menu.AppendSeparator();
+                foreach (var t in e.tags)
+                {
+                    var captured = t;
+                    var on = _activeTags.Contains(t);
+                    evt.menu.AppendAction($"Фильтр по тегу/{t}", _ => ToggleTag(captured),
+                        on ? DropdownMenuAction.Status.Checked : DropdownMenuAction.Status.Normal);
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- detail
+
+        private void BuildDetail(VisualElement detail, LogEntry e)
+        {
+            float fBody  = _fontPx;
+            float fTrace = Mathf.Max(MinFont, _fontPx - 1);
+
+            if (!string.IsNullOrEmpty(e.raw))
+            {
+                var full = new Label(e.raw);
+                full.AddToClassList("logc-detail-msg");
+                full.style.fontSize = fBody;
+                full.style.color = Tok(NexusToken.TextNormal);
+                detail.Add(full);
+            }
+
+            var frames = StackTraceUtil.Parse(e.stackTrace);
+            if (frames.Count == 0)
+            {
+                if (!string.IsNullOrEmpty(e.stackTrace))
+                {
+                    var raw = new Label(e.stackTrace.TrimEnd());
+                    raw.AddToClassList("logc-trace-raw");
+                    raw.style.fontSize = fTrace;
+                    raw.style.color = Tok(NexusToken.TextDim);
+                    detail.Add(raw);
+                }
+                else
+                {
+                    var none = new Label("Нет стека вызовов.");
+                    none.AddToClassList("logc-trace-none");
+                    none.style.fontSize = fTrace;
+                    none.style.color = Tok(NexusToken.TextDim);
+                    detail.Add(none);
+                }
+            }
+            else
+            {
+                var trace = new VisualElement();
+                trace.AddToClassList("logc-trace");
+                foreach (var f in frames)
+                    trace.Add(MakeFrame(f, fTrace));
+                detail.Add(trace);
+            }
+
+            var actions = new VisualElement();
+            actions.AddToClassList("logc-detail-actions");
+            var copy = new Button(() => CopyEntry(e)) { text = "Копировать" };
+            copy.AddToClassList("logc-btn");
+            RegisterThemed(copy, ThemeRole.Button, track: false);   // LogsPage.Theme.cs
+            actions.Add(copy);
+            detail.Add(actions);
+        }
+
+        private VisualElement MakeFrame(StackFrameInfo f, float fontSize)
+        {
+            var line = new Label(f.Display);
+            line.AddToClassList("logc-frame");
+            line.style.fontSize = fontSize;
+            line.style.color = Tok(NexusToken.TextDim);
+
+            if (f.HasFile)
+            {
+                line.AddToClassList("logc-frame--link");
+                line.style.color = Tok(NexusToken.Accent);
+                line.tooltip = $"Открыть {f.AssetPath}:{f.Line}";
+                var captured = f;
+                line.RegisterCallback<ClickEvent>(_ => OpenFrame(captured));
+                // hover: подсветка жирным (нет более яркого токена — оставляем цвет Accent)
+                line.RegisterCallback<PointerEnterEvent>(_ => line.style.unityFontStyleAndWeight = FontStyle.Bold);
+                line.RegisterCallback<PointerLeaveEvent>(_ => line.style.unityFontStyleAndWeight = FontStyle.Normal);
+            }
+
+            return line;
+        }
+
+        private void OpenFrame(StackFrameInfo f)
+        {
+            var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(f.AssetPath);
+            if (obj != null)
+            {
+                AssetDatabase.OpenAsset(obj, f.Line);
+                Context.SetStatus($"Открыто {f.AssetPath}:{f.Line}", StatusKind.Info);
+            }
+            else
+            {
+                Context.SetStatus($"Исходник не найден в проекте: {f.AssetPath}", StatusKind.Warning);
+            }
+        }
+
+        private void CopyEntry(LogEntry e)
+        {
+            var text = string.IsNullOrEmpty(e.stackTrace)
+                ? e.raw
+                : e.raw + "\n" + e.stackTrace;
+            EditorGUIUtility.systemCopyBuffer = text ?? string.Empty;
+            Context.SetStatus("Лог скопирован в буфер обмена.", StatusKind.Info);
+        }
+
+        // ---------------------------------------------------------------- export
+
+        private void ExportLogs()
+        {
+            var sb = new StringBuilder();
+            sb.Append("# Экспорт логов — ")
+              .Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))
+              .Append('\n');
+
+            int shown = 0;
+            for (int i = 0; i < _all.Count; i++)
+            {
+                var e = _all[i];
+                if (!Passes(e)) continue;   // экспорт уважает текущие фильтры
+                shown++;
+
+                sb.Append('[').Append(e.Time.ToString("HH:mm:ss")).Append("] [")
+                  .Append(GroupLabel(e.Group).ToUpperInvariant()).Append("] ")
+                  .Append(e.raw).Append('\n');
+
+                if (!string.IsNullOrEmpty(e.stackTrace))
+                    foreach (var ln in e.stackTrace.Split('\n'))
+                    {
+                        var l = ln.TrimEnd();
+                        if (l.Length > 0) sb.Append("    ").Append(l).Append('\n');
+                    }
+                sb.Append('\n');
+            }
+
+            if (shown == 0)
+            {
+                Context.SetStatus("Нечего экспортировать — под фильтр ничего не попало.", StatusKind.Warning);
+                return;
+            }
+
+            var path = EditorUtility.SaveFilePanel(
+                "Экспорт логов", string.Empty,
+                $"logs_{DateTime.Now:yyyyMMdd_HHmmss}.txt", "txt");
+            if (string.IsNullOrEmpty(path)) return;   // пользователь отменил диалог
+
+            try
+            {
+                File.WriteAllText(path, sb.ToString());
+                Context.SetStatus($"Экспортировано {shown} логов в {path}", StatusKind.Info);
+            }
+            catch (Exception ex)
+            {
+                Context.SetStatus($"Ошибка экспорта: {ex.Message}", StatusKind.Error);
+            }
+        }
+    }
+}

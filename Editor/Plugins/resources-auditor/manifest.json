@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "guid": "b7e4c9d2-1f6a-4e8b-9a3c-5d0e2f7a8c41",
+  "id": "resources-auditor",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.ResourcesAuditor.ResourcesAuditorPage",
+  "kind": "constitutive",
+  "display": { "name": "Resources Auditor", "category": "Infrastructure", "order": 40, "icon": null },
+  "requires": [],
+  "packageRequires": [],
+  "deploy": [
+    { "from": "Exerussus.Nexus.Pages.ResourcesAuditor.asmdef.txt", "to": "Exerussus.Nexus.Pages.ResourcesAuditor.asmdef" },
+    { "from": "ResourcesAuditorPage.cs.txt", "to": "ResourcesAuditorPage.cs" },
+    { "from": "AuditModel.cs.txt", "to": "AuditModel.cs" },
+    { "from": "InventoryScanner.cs.txt", "to": "InventoryScanner.cs" },
+    { "from": "CodeUsageScanner.cs.txt", "to": "CodeUsageScanner.cs" },
+    { "from": "ReferenceScanner.cs.txt", "to": "ReferenceScanner.cs" },
+    { "from": "BuildReportReader.cs.txt", "to": "BuildReportReader.cs" },
+    { "from": "AddressablesProbe.cs.txt", "to": "AddressablesProbe.cs" },
+    { "from": "VerdictSolver.cs.txt", "to": "VerdictSolver.cs" },
+    { "from": "ReportExporter.cs.txt", "to": "ReportExporter.cs" }
+  ]
+}

@@ -1,0 +1,165 @@
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Пост-обработка развёрнутого вывода ПРОФИЛЯ (после деплоя из staging в
+    /// Assets/Api/&lt;Wrapper&gt;/Generated). Два шага:
+    ///
+    /// 1. ОБЁРТКА — теперь ОБЯЗАТЕЛЬНА (тумблера нет). Кастомный model.mustache
+    ///    писать нельзя (стоковый шаблон моделей огромен, а csharp-генератор
+    ///    experimental), поэтому обёртка целиком здесь: у каждого .cs выкидываются
+    ///    usings на packageName версии (обычные и alias), под-неймспейсы
+    ///    .Model/.Api/.Client объединяются в общий packageName, и всё содержимое
+    ///    вкладывается в public static partial class версии. Все типы версии —
+    ///    соседи внутри одной обёртки: кросс-ссылки (модель → OpenAPIDateConverter)
+    ///    резолвятся сами, а обращение снаружи — ApiV10.User, ApiV10.AuthApi.
+    ///    Известное ограничение: если генератор начнёт эмитить ПОЛНОСТЬЮ
+    ///    квалифицированные ссылки вида global::{pkg}.Client.X в коде (не в
+    ///    doc-crefs) — они сломаются; у стокового csharp-шаблона таких нет
+    ///    (он ходит через using-alias).
+    ///
+    /// 2. ПРЕФИКСЫ ИМЁН (per-profile флаг). Срезает версионный префикс из имён
+    ///    методов (ApiV10FooGetAsync → FooGetAsync): его лепит сам генератор из
+    ///    пути /api/v1.0/…, когда в спеке нет operationId.
+    ///
+    /// Порядок в движке важен: шаг идёт ПОСЛЕ деплоя, но ДО диффа и снапшота.
+    /// Тогда зеркало снимка хранит уже обработанный код, гард ручных правок это
+    /// не считает правкой, а CI через тот же движок даёт идентичный результат.
+    /// </summary>
+    public static class OutputPostProcessor
+    {
+        public sealed class Result
+        {
+            public bool StripApplied;                   // срезка префиксов включена у профиля
+            public int WrappedFiles;
+            public List<string> WrapSkipped = new();    // rel-путь + причина пропуска
+            public int FilesTouched;                    // файлов реально записано на диск
+            public int MethodsRenamed;
+            public List<string> Collisions = new();     // где срезка дала бы дубль — пропущено
+        }
+
+        // Версионный префикс от генератора: (Api)?V<digits> в начале имени. Имя
+        // метода-обёртки в нашем шаблоне всегда оканчивается на "Async" и стоит
+        // перед "(". Заглавная сразу после префикса — режем строго по границе
+        // PascalCase (v-с-цифрой в середине слова не заденем).
+        private static readonly Regex MethodDecl =
+            new(@"\b(?:Api)?V\d+(?=[A-Z])([A-Za-z_]\w*Async)(\s*\()", RegexOptions.Compiled);
+
+        // Любой идентификатор "...Async(" в файле — для детекта коллизий имён.
+        private static readonly Regex AnyAsyncDecl =
+            new(@"\b([A-Za-z_]\w*Async)\s*\(", RegexOptions.Compiled);
+
+        // Блочный namespace (file-scoped `namespace X;` генератор не эмитит; если
+        // встретится — файл честно пропускается с причиной).
+        private static readonly Regex BlockNamespace =
+            new(@"namespace\s+[A-Za-z_][\w.]*\s*(?:\r?\n)?\s*\{", RegexOptions.Compiled);
+
+        public static Result Apply(ApiCodegenProfile profile)
+        {
+            var result = new Result { StripApplied = profile.StripVersionPrefixInMethods };
+
+            var outRoot = Path.Combine(ApiCodegenConfig.ProjectRoot, profile.OutputDir);
+            if (!Directory.Exists(outRoot)) return result;
+
+            var wrapper = profile.ResolveWrapperClass();
+            var pkg = profile.ResolvePackageName();
+
+            foreach (var file in Directory.GetFiles(outRoot, "*.cs", SearchOption.AllDirectories))
+            {
+                var text = File.ReadAllText(file);
+                var original = text;
+                var rel = Path.GetRelativePath(outRoot, file);
+
+                WrapFile(ref text, pkg, wrapper, rel, result);
+
+                if (result.StripApplied)
+                    StripVersionPrefixes(ref text, result);
+
+                if (text != original)
+                {
+                    File.WriteAllText(file, text);
+                    result.FilesTouched++;
+                }
+            }
+            return result;
+        }
+
+        private static void WrapFile(ref string text, string pkg, string wrapper, string rel, Result result)
+        {
+            // Идемпотентность: повторный прогон по уже обёрнутому файлу — no-op.
+            if (Regex.IsMatch(text, $@"\bstatic\s+partial\s+class\s+{Regex.Escape(wrapper)}\b"))
+                return;
+
+            var pkgEsc = Regex.Escape(pkg);
+
+            // 1. Выкинуть usings на packageName (обычные и alias): после объединения
+            //    namespace и вложения все типы — соседи внутри обёртки, ссылки
+            //    резолвятся без них, а сами usings стали бы висячими.
+            text = Regex.Replace(text,
+                $@"^[ \t]*using\s+(?:[A-Za-z_]\w*\s*=\s*)?{pkgEsc}(?:\.[A-Za-z0-9_.]*)?\s*;[ \t]*\r?\n",
+                "", RegexOptions.Multiline);
+
+            // 2. Объединить под-неймспейсы (.Model/.Api/.Client) в общий packageName версии.
+            text = Regex.Replace(text,
+                $@"namespace\s+{pkgEsc}(?:\.[A-Za-z0-9_.]+)?",
+                "namespace " + pkg);
+
+            // 3. Вложить содержимое namespace в static partial class версии.
+            var m = BlockNamespace.Match(text);
+            if (!m.Success)
+            {
+                result.WrapSkipped.Add($"{rel} — не найден блочный namespace");
+                return;
+            }
+            var open = m.Index + m.Length;
+            var close = text.LastIndexOf('}');
+            if (close <= open)
+            {
+                result.WrapSkipped.Add($"{rel} — не найдена закрывающая скобка namespace");
+                return;
+            }
+
+            text = text.Substring(0, open)
+                 + "\n    // Обёртка версии (пост-обработка): все типы вложены в " + wrapper + "."
+                 + "\n    public static partial class " + wrapper + "\n    {"
+                 + text.Substring(open, close - open)
+                 + "    }\n" + text.Substring(close);
+            result.WrappedFiles++;
+        }
+
+        private static void StripVersionPrefixes(ref string text, Result result)
+        {
+            // Все имена "...Async(" ДО правки — чтобы поймать коллизию с уже
+            // существующим (например, если бэк местами задаёт operationId сам).
+            var existing = new HashSet<string>();
+            foreach (Match m in AnyAsyncDecl.Matches(text))
+                existing.Add(m.Groups[1].Value);
+
+            var planned = new HashSet<string>(); // цели переименований в пределах файла
+            var renamed = 0;
+
+            text = MethodDecl.Replace(text, m =>
+            {
+                var stripped = m.Groups[1].Value; // FooGetAsync
+                var tail = m.Groups[2].Value;     // "("
+
+                // Коллизия: цель уже занята существующим методом ИЛИ два разных
+                // префиксных метода схлопываются в одно имя в этом же файле.
+                // Тогда не трогаем — сломанная компиляция хуже, чем префикс.
+                if (existing.Contains(stripped) || !planned.Add(stripped))
+                {
+                    result.Collisions.Add(m.Value.TrimEnd('(', ' ', '\t'));
+                    return m.Value;
+                }
+
+                renamed++;
+                return stripped + tail;
+            });
+
+            result.MethodsRenamed += renamed;
+        }
+    }
+}

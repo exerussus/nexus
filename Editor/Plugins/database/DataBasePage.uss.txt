@@ -1,0 +1,246 @@
+/* ============================================================
+   DataBasePage — LAYOUT ONLY.
+   No colour literals and no --vars here: under Nexus the palette
+   is resolved in C# via Context.Theme.Get(NexusToken). This sheet
+   carries structure (flex, spacing, radius, sizes, font styles)
+   only; DataBasePage.ApplyTheme paints colours from the token set.
+   ============================================================ */
+
+.db-page { flex-grow: 1; }
+
+/* ----- Top toolbar ----- */
+.db-toolbar {
+    flex-direction: row;
+    align-items: center;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+
+.db-toolbar-button {
+    height: 22px;
+    margin-right: 6px;
+    padding: 0 12px;
+    border-width: 1px;
+    border-radius: 11px;
+    font-size: 11px;
+    -unity-font-style: bold;
+}
+.db-toolbar-button:disabled { opacity: 0.4; }
+
+.db-spacer { flex-grow: 1; }
+
+.db-summary {
+    -unity-text-align: middle-right;
+    font-size: 11px;
+}
+
+/* ----- Search row ----- */
+.db-search-row {
+    margin-bottom: 6px;
+    padding: 4px 8px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+.db-search { flex-grow: 1; }
+.db-search > .unity-text-field__input {
+    border-radius: 4px;
+}
+
+/* ----- DB list ----- */
+.db-list {
+    min-height: 220px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+
+.db-row {
+    padding: 6px 10px;
+    margin: 3px 4px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+
+.db-row-header {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 4px;
+}
+.db-row-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+    margin-right: 8px;
+    border-width: 1px;
+}
+
+.db-row-name {
+    -unity-font-style: bold;
+    font-size: 12px;
+}
+.db-row-type {
+    font-size: 10px;
+    -unity-font-style: italic;
+}
+
+/* Per-row action pills */
+.db-row-actions {
+    flex-direction: row;
+    margin-top: 2px;
+}
+.db-row-button {
+    height: 20px;
+    margin-right: 4px;
+    padding: 0 10px;
+    border-width: 1px;
+    border-radius: 10px;
+    font-size: 10px;
+    -unity-font-style: bold;
+}
+.db-row-button:disabled { opacity: 0.35; }
+
+/* ----- External target card ----- */
+.db-external {
+    margin-top: 10px;
+    padding: 10px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+.db-external-title {
+    -unity-font-style: bold;
+    font-size: 10px;
+    margin-bottom: 6px;
+}
+.db-external-buttons {
+    flex-direction: row;
+    margin-top: 6px;
+}
+.db-external-buttons Button {
+    height: 22px;
+    margin-right: 6px;
+    padding: 0 12px;
+    border-width: 1px;
+    border-radius: 11px;
+    font-size: 11px;
+    -unity-font-style: bold;
+}
+.db-external-buttons Button:disabled { opacity: 0.35; }
+.db-external-help {
+    font-size: 11px;
+    margin-top: 6px;
+    white-space: normal;
+}
+
+/* ================================================================
+   Auto-Generation
+   ================================================================ */
+.autogen-foldout {
+    margin-top: 12px;
+    padding: 8px 10px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+.autogen-foldout > Toggle > .unity-toggle__input {
+    -unity-font-style: bold;
+}
+
+.autogen-config-row {
+    flex-direction: row;
+    align-items: center;
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+.autogen-config-info {
+    flex-direction: column;
+    flex-grow: 0;
+}
+.autogen-config-label {
+    -unity-font-style: bold;
+    font-size: 10px;
+}
+.autogen-config-path {
+    font-size: 10px;
+    -unity-font-style: italic;
+}
+.autogen-config-button {
+    margin-left: 6px;
+    height: 22px;
+    padding: 0 12px;
+    border-radius: 11px;
+    border-width: 1px;
+    -unity-font-style: bold;
+}
+
+.autogen-body { /* disabled state controlled from code */ }
+
+.autogen-toggles {
+    flex-direction: column;
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+.autogen-toggles Toggle {
+    margin-bottom: 2px;
+}
+
+.autogen-action-row {
+    flex-direction: row;
+    margin-bottom: 6px;
+}
+.autogen-action-row Button {
+    height: 22px;
+    margin-right: 6px;
+    padding: 0 14px;
+    border-width: 1px;
+    border-radius: 11px;
+    font-size: 11px;
+    -unity-font-style: bold;
+}
+
+.autogen-summary {
+    font-size: 11px;
+    margin-bottom: 6px;
+    padding: 3px 6px;
+    border-left-width: 2px;
+    border-radius: 3px;
+}
+
+.autogen-list-title {
+    -unity-font-style: bold;
+    font-size: 10px;
+    margin-top: 8px;
+    margin-bottom: 3px;
+}
+
+.autogen-list {
+    min-height: 80px;
+    border-width: 1px;
+    border-radius: 6px;
+}
+
+.autogen-row {
+    flex-direction: row;
+    align-items: center;
+    padding: 3px 8px;
+    margin: 1px 2px;
+    border-radius: 4px;
+}
+.autogen-row-alias {
+    -unity-font-style: bold;
+    min-width: 110px;
+    font-size: 11px;
+}
+.autogen-row-sep {
+    margin: 0 6px;
+}
+.autogen-row-type {
+    font-size: 11px;
+}
+.autogen-row-asset {
+    font-size: 10px;
+    -unity-font-style: italic;
+}

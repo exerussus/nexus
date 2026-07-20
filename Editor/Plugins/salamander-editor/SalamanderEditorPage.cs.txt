@@ -1,0 +1,297 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Dsl.Compilation;
+using Dsl.Semantics;
+using Dsl.Text;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Страница-композит: вся логика в компонентах, здесь только сборка, проводка и жизненный цикл.
+    // Оболочка темизируется ТОЛЬКО через Context.Ui / Context.Theme (ни одного цветового литерала);
+    // кодовая область — автономный островок SalamanderCode.uss (сознательное решение).
+    [EditorPage("salamander-editor", "Salamander", PageCategory.Game, order: 30)]
+    public sealed class SalamanderEditorPage : EditorPageBase
+    {
+        private PagePrefs _prefs;
+        private ApiManifestStore _api;
+        private SalDocument _doc;
+        private CompileScheduler _scheduler;
+
+        private CodeEditorElement _editor;
+        private AutocompleteController _autocomplete;
+        private DiagnosticsView _diagnostics;
+        private Label _fileLabel;
+        private Label _apiLabel;
+
+        private string PrefsPath   => Context.GetUserConfigPath("prefs.json");
+        private string ApiCopyPath => Context.GetUserConfigPath("salamander-api.json");
+
+        protected override void OnInitialize()
+        {
+            // Дёшево: только объекты, без чтения файлов и UI (файлы — в OnEnter).
+            _doc = new SalDocument();
+            _api = new ApiManifestStore(ApiCopyPath);
+            _api.Changed += OnApiChanged;
+            _scheduler = new CompileScheduler
+            {
+                Snapshot = SnapshotCompile,                 // главный поток
+                Work = WorkCompile,                         // пул потоков
+                Apply = ApplyCompile,                       // главный поток
+                Poll = () => _api.PollExternalChange(),     // исключения гасит сам насос
+                Aborted = () => _api.RebuildRegistry(),     // реестр после Thread.Abort подозрителен
+                Report = (msg, isError) =>
+                    Context.SetStatus(msg, isError ? StatusKind.Error : StatusKind.Warning),
+            };
+        }
+
+        public override VisualElement BuildUI()
+        {
+            var root = new VisualElement { style = { flexGrow = 1 } };
+
+            // ── тулбар (оболочка) ──
+            var toolbar = new VisualElement
+            {
+                style = { flexDirection = FlexDirection.Row, alignItems = Align.Center, marginBottom = 4 }
+            };
+            toolbar.Add(Context.Ui.Button(NexusRole.Common,  "Открыть…",      OpenFileDialog));
+            toolbar.Add(Context.Ui.Button(NexusRole.Primary, "Сохранить",     SaveFile));
+            toolbar.Add(Context.Ui.Button(NexusRole.Common,  "Компилировать", () => _scheduler.Request(now: true)));
+            toolbar.Add(Context.Ui.Button(NexusRole.Common,  "API-манифест…", PickManifestDialog));
+            _fileLabel = new Label
+            {
+                style = { marginLeft = 8, color = Context.Theme.Get(NexusToken.TextNormal),
+                          unityTextAlign = TextAnchor.MiddleLeft }
+            };
+            _apiLabel = new Label
+            {
+                // marginLeft: auto прижимает подпись манифеста к правому краю тулбара
+                style = { marginLeft = new StyleLength(StyleKeyword.Auto), marginRight = 4,
+                          color = Context.Theme.Get(NexusToken.TextDim),
+                          unityTextAlign = TextAnchor.MiddleRight }
+            };
+            toolbar.Add(_fileLabel);
+            toolbar.Add(_apiLabel);
+            root.Add(toolbar);
+            root.Add(Context.Ui.Divider());
+
+            // ── кодовая область (свой USS-островок; загрузка companion-ассета только через Context) ──
+            var codeUss = Context.LoadDeployedAsset<StyleSheet>("SalamanderCode.uss");
+            _editor = new CodeEditorElement(codeUss) { style = { flexGrow = 1 } };
+            _editor.TextChanged += OnEditorTextChanged;
+            _autocomplete = new AutocompleteController(_editor, new AutocompletePopup());
+            root.Add(_editor);
+
+            root.Add(Context.Ui.Divider());
+
+            // ── диагностика (оболочка — токены темы через IPageTheme) ──
+            _diagnostics = new DiagnosticsView(Context.Theme);
+            _diagnostics.Selected += d => _editor.SetCaret(d.Line, d.Column);
+            root.Add(_diagnostics);
+
+            // drag&drop: .sal — открыть, .json — API-манифест (Project-окно и файлы ОС)
+            var drop = new FileDropController(root);
+            drop.DragEntered += () =>
+                Context.SetStatus("Отпустите: .sal — открыть файл, .json — API-манифест.", StatusKind.Info);
+            drop.JsonDropped += ImportManifest;
+            drop.SalDropped += p => { if (ConfirmDiscard()) OpenFile(p); };
+
+            UpdateLabels();
+            return root;
+        }
+
+        public override void OnEnter()
+        {
+            _prefs ??= PagePrefs.Load(PrefsPath);
+            if (!_api.HasManifest)
+            {
+                _api.SourcePath = _prefs.ApiSourcePath;  // до Load — чтобы штамп источника был честным
+                _api.LoadFromUserSettings();
+            }
+            // Повторный вход в таб не перечитывает файл — инстанс кэширован, правки живут в _doc.
+            if (!_doc.HasFile && !string.IsNullOrEmpty(_prefs.LastFilePath) && File.Exists(_prefs.LastFilePath))
+                OpenFile(_prefs.LastFilePath);
+            else
+                _scheduler.Request(now: true);
+            UpdateLabels();
+        }
+
+        public override void OnFocus()   => _scheduler.Attach();
+        public override void OnUnfocus() => _scheduler.Detach();
+        public override void OnExit()    => SavePrefs();
+        public override void OnPrePack() => SavePrefs();
+
+        public override void OnRefresh()
+        {
+            // Явный Refresh: перечитать копию манифеста и оригинал, перекомпилировать.
+            try { _api.LoadFromUserSettings(); _api.PollExternalChange(); } catch { }
+            _scheduler.Request(now: true);
+        }
+
+        public override bool CanClose() => ConfirmDiscard();
+
+        protected override void OnDisposing() => _scheduler?.Dispose(); // отписки + аборт in-flight компиляции
+
+        // ── проводка ────────────────────────────────────────────────────────────
+
+        private void OnEditorTextChanged()
+        {
+            _doc.SetText(_editor.Text);
+            _scheduler.Request();
+            UpdateLabels();
+        }
+
+        private void OnApiChanged()
+        {
+            if (_autocomplete != null) _autocomplete.Model = _api.Model;
+            _editor?.SetApiModel(_api.Model);
+            UpdateLabels();
+            if (_editor != null) _scheduler.Request(now: true);
+        }
+
+        private void UpdateLabels()
+        {
+            if (_fileLabel != null)
+                _fileLabel.text = _doc.FileName + (_doc.Dirty ? " *" : "");
+            if (_apiLabel != null)
+                _apiLabel.text = _api.HasManifest
+                    ? $"API v{_api.ApiVersion}: {Path.GetFileName(_api.SourcePath ?? "salamander-api.json")}"
+                    : "API-манифест не выбран";
+        }
+
+        // ── файлы ───────────────────────────────────────────────────────────────
+
+        private void OpenFileDialog()
+        {
+            if (!ConfirmDiscard()) return;
+            string p = EditorUtility.OpenFilePanel("Открыть .sal", Application.dataPath, "sal");
+            if (!string.IsNullOrEmpty(p)) OpenFile(p);
+        }
+
+        private void OpenFile(string path)
+        {
+            if (!_doc.Open(path, out string err))
+            {
+                Context.SetStatus($"Не удалось открыть: {err}", StatusKind.Error);
+                return;
+            }
+            _prefs.LastFilePath = path;
+            SavePrefs();
+            _editor.Text = _doc.Text; // TextChanged придёт с тем же текстом → Dirty не взводится
+            _scheduler.Request(now: true);
+            UpdateLabels();
+            Context.SetStatus($"Открыт {_doc.FileName} (модуль «{_doc.ModuleName}», {_doc.Execution}).",
+                StatusKind.Info);
+        }
+
+        private void SaveFile()
+        {
+            if (!_doc.HasFile)
+            {
+                string p = EditorUtility.SaveFilePanel("Сохранить .sal", Application.dataPath, "script", "sal");
+                if (string.IsNullOrEmpty(p)) return;
+                if (!_doc.SaveAs(p, out string e1))
+                {
+                    Context.SetStatus($"Не удалось сохранить: {e1}", StatusKind.Error);
+                    return;
+                }
+                _prefs.LastFilePath = p;
+                SavePrefs();
+            }
+            else if (!_doc.Save(out string err))
+            {
+                Context.SetStatus($"Не удалось сохранить: {err}", StatusKind.Error);
+                return;
+            }
+            UpdateLabels();
+            Context.SetStatus($"Сохранено: {_doc.Path}", StatusKind.Ok);
+        }
+
+        // true = можно продолжать (сохранили или сознательно отбросили правки)
+        private bool ConfirmDiscard()
+        {
+            if (_doc == null || !_doc.Dirty) return true;
+            int r = EditorUtility.DisplayDialogComplex("Salamander",
+                $"В «{_doc.FileName}» есть несохранённые изменения.",
+                "Сохранить", "Отмена", "Не сохранять");
+            if (r == 1) return false;
+            if (r == 0) SaveFile();
+            return true;
+        }
+
+        private void PickManifestDialog()
+        {
+            string p = EditorUtility.OpenFilePanel("salamander-api.json", Application.streamingAssetsPath, "json");
+            if (!string.IsNullOrEmpty(p)) ImportManifest(p);
+        }
+
+        // общий вход для диалога и drag&drop
+        private void ImportManifest(string path)
+        {
+            if (_api.ImportExternal(path, out string err))
+            {
+                _prefs.ApiSourcePath = path;
+                SavePrefs();
+                Context.SetStatus("API-манифест загружен и скопирован в UserSettings.", StatusKind.Ok);
+            }
+            else
+            {
+                Context.SetStatus($"Битый API-манифест: {err}", StatusKind.Error);
+            }
+        }
+
+        // ── компиляция ──────────────────────────────────────────────────────────
+
+        // ── фоновая компиляция: Snapshot и Apply — главный поток, Work — пул потоков ──
+
+        private object SnapshotCompile()
+        {
+            if (_editor == null) return null;
+            return new SalCompileJob
+            {
+                Registry = _api.Registry,
+                ApiVersion = _api.ApiVersion,
+                ModuleName = _doc.ModuleName,
+                Execution = _doc.Execution,
+                Source = _editor.Text,
+            };
+        }
+
+        // Пул потоков: НИКАКОГО Unity API и полей страницы — только данные job.
+        private static object WorkCompile(object o)
+        {
+            var job = (SalCompileJob)o;
+            SalCompiler.Run(job);
+            return job;
+        }
+
+        private void ApplyCompile(object o)
+        {
+            var job = (SalCompileJob)o;
+            _diagnostics.SetDiagnostics(job.Diagnostics);
+            // метки в коде — только если буфер не менялся за время компиляции: иначе позиции
+            // врут, а свежая компиляция уже в очереди и перерисует их сама
+            if (string.Equals(job.Source, _editor.Text, StringComparison.Ordinal))
+            {
+                var marks = new List<SalErrorMark>(job.ErrorCount);
+                foreach (var d in job.Diagnostics)
+                    if (d.Severity == Severity.Error)
+                        marks.Add(new SalErrorMark
+                        {
+                            Line = d.Line,
+                            Column = d.Column,
+                            Message = $"{d.Code}: {d.Message}",
+                        });
+                _editor.SetErrorMarks(marks);
+            }
+            Context.SetStatus(job.Success ? "OK — компилируется." : $"Ошибок: {job.ErrorCount}.",
+                job.Success ? StatusKind.Ok : StatusKind.Error);
+        }
+
+        private void SavePrefs() => _prefs?.Save(PrefsPath);
+    }
+}

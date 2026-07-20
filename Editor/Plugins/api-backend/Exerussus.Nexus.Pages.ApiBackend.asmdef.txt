@@ -1,0 +1,18 @@
+{
+    "name": "Exerussus.Nexus.Pages.ApiBackend",
+    "rootNamespace": "Exerussus.Nexus.Pages.ApiBackend",
+    "references": [
+        "Exerussus.Nexus.Abstractions"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

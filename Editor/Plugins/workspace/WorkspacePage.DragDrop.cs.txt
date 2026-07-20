@@ -1,0 +1,198 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    public sealed partial class WorkspacePage
+    {
+        // ---------- Старт перетаскивания карточки (наружу + внутренний перенос) ----------
+
+        private void StartCardDrag(WorkspaceGroup group, WorkspaceEntry entry)
+        {
+            DragAndDrop.PrepareStartDrag();
+
+            if (entry.kind == WorkspaceEntryKind.Bundle)
+            {
+                // Тащим весь набор: все резолвящиеся объекты + все asset/внешние пути.
+                DragAndDrop.objectReferences = ResolveBundleObjects(entry).ToArray();
+                var paths = BundlePaths(entry);
+                if (paths.Count > 0) DragAndDrop.paths = paths.ToArray();
+            }
+            else
+            {
+                var obj = ResolveObject(entry);
+                // Для drag наружу (в инспектор/поле ссылки/Hierarchy) кладём живой объект:
+                //  - ассет → ссылка в поле; объект сцены → репарент при дропе в Hierarchy.
+                DragAndDrop.objectReferences = obj != null ? new[] { obj } : Array.Empty<UnityEngine.Object>();
+
+                // paths включает «родное» перемещение: Project-браузер двигает файл по asset-пути,
+                // а внешний файл показывается/переносится по абсолютному пути.
+                string dragPath = entry.kind switch
+                {
+                    WorkspaceEntryKind.Asset => AssetDatabase.GUIDToAssetPath(entry.assetGuid),
+                    WorkspaceEntryKind.ExternalFile when File.Exists(entry.externalPath) => entry.externalPath,
+                    _ => null
+                };
+                if (!string.IsNullOrEmpty(dragPath))
+                    DragAndDrop.paths = new[] { dragPath };
+            }
+
+            // Для внутреннего переноса между группами.
+            DragAndDrop.SetGenericData(MoveEntryKey, entry);
+            DragAndDrop.SetGenericData(MoveFromKey, group);
+
+            string title = entry.kind == WorkspaceEntryKind.Bundle
+                ? BundleDisplayName(entry)
+                : (string.IsNullOrEmpty(entry.cachedName) ? "Элемент рабочей области" : entry.cachedName);
+            DragAndDrop.StartDrag(title);
+        }
+
+        // ---------- Приём дропа ----------
+
+        /// <summary>Дроп в тело группы (или в свободную область списка). insertIndex&lt;0 = в конец.</summary>
+        private void RegisterGroupDrop(VisualElement target, Func<WorkspaceGroup> groupGetter, Func<int> indexGetter)
+        {
+            target.RegisterCallback<DragUpdatedEvent>(evt =>
+            {
+                DragAndDrop.visualMode = IsInternalMove()
+                    ? DragAndDropVisualMode.Move
+                    : DragAndDropVisualMode.Copy;
+                evt.StopPropagation();
+            });
+
+            target.RegisterCallback<DragPerformEvent>(evt =>
+            {
+                DragAndDrop.AcceptDrag();
+                var group = groupGetter();
+                int idx = indexGetter();
+                if (idx < 0) idx = group.entries.Count;
+                HandleDrop(group, idx, asBundle: evt.shiftKey);
+                evt.StopPropagation();
+            });
+        }
+
+        /// <summary>Дроп на конкретную карточку → вставить перед ней (или добавить в набор).</summary>
+        private void RegisterCardDrop(VisualElement card, WorkspaceGroup group, WorkspaceEntry entry)
+        {
+            card.RegisterCallback<DragUpdatedEvent>(evt =>
+            {
+                DragAndDrop.visualMode = IsInternalMove()
+                    ? DragAndDropVisualMode.Move
+                    : DragAndDropVisualMode.Copy;
+                evt.StopPropagation();
+            });
+
+            card.RegisterCallback<DragPerformEvent>(evt =>
+            {
+                DragAndDrop.AcceptDrag();
+
+                // Внешний дроп на карточку-набор → добавить элементы внутрь набора.
+                if (entry.kind == WorkspaceEntryKind.Bundle && !IsInternalMove())
+                {
+                    AddExternalToBundle(entry);
+                    RebuildGroups();
+                    evt.StopPropagation();
+                    return;
+                }
+
+                int idx = group.entries.IndexOf(entry);
+                if (idx < 0) idx = group.entries.Count;
+                HandleDrop(group, idx, asBundle: evt.shiftKey);
+                evt.StopPropagation();
+            });
+        }
+
+        private static bool IsInternalMove() => DragAndDrop.GetGenericData(MoveEntryKey) is WorkspaceEntry;
+
+        private void HandleDrop(WorkspaceGroup targetGroup, int insertIndex, bool asBundle)
+        {
+            if (DragAndDrop.GetGenericData(MoveEntryKey) is WorkspaceEntry moveEntry)
+            {
+                var from = DragAndDrop.GetGenericData(MoveFromKey) as WorkspaceGroup;
+                // Корректируем индекс, если внутри той же группы убираем элемент левее точки вставки.
+                if (from == targetGroup)
+                {
+                    int old = targetGroup.entries.IndexOf(moveEntry);
+                    if (old >= 0 && old < insertIndex) insertIndex--;
+                }
+                _store.Move(moveEntry, from, targetGroup, insertIndex);
+            }
+            else
+            {
+                AddDroppedPayload(targetGroup, insertIndex, asBundle);
+            }
+
+            RebuildGroups();
+        }
+
+        /// <summary>Собрать записи из текущего DragAndDrop (объекты проекта/сцены + внешние файлы).</summary>
+        private List<WorkspaceEntry> CollectDroppedEntries()
+        {
+            var built = new List<WorkspaceEntry>();
+
+            foreach (var obj in DragAndDrop.objectReferences)
+            {
+                var entry = BuildEntryFromObject(obj);
+                if (entry != null) built.Add(entry);
+            }
+
+            // Файлы вне проекта приходят абсолютными путями в DragAndDrop.paths.
+            foreach (var p in DragAndDrop.paths)
+            {
+                if (string.IsNullOrEmpty(p) || !Path.IsPathRooted(p)) continue;
+                var norm = p.Replace('\\', '/');
+                if (norm.Contains("/Assets/") || norm.EndsWith("/Assets")) continue; // это ассет, уже учтён
+                built.Add(BuildExternalEntry(p));
+            }
+
+            return built;
+        }
+
+        /// <summary>Внешний дроп. asBundle (Shift) → собрать в один набор, иначе — отдельными карточками.</summary>
+        private void AddDroppedPayload(WorkspaceGroup group, int insertIndex, bool asBundle)
+        {
+            var built = CollectDroppedEntries();
+            if (built.Count == 0) return;
+            if (insertIndex < 0) insertIndex = group.entries.Count;
+
+            if (asBundle)
+            {
+                var bundle = _store.MakeBundle("", built);
+                if (bundle.items.Count == 0) return;
+                _store.InsertEntry(group, insertIndex, bundle);
+                _flashKey = bundle.StableKey;
+                Context.SetStatus($"Создан набор из {bundle.items.Count} элемент(ов)", StatusKind.Ok);
+                return;
+            }
+
+            int i = insertIndex, added = 0, dup = 0;
+            foreach (var entry in built)
+            {
+                if (_store.FindByKey(entry.StableKey) is { } existing) { _flashKey = existing.StableKey; dup++; continue; }
+                _store.InsertEntry(group, i++, entry);
+                added++;
+            }
+
+            if (added > 0)
+                Context.SetStatus($"Добавлено {added} элемент(ов){(dup > 0 ? $", пропущено дубликатов: {dup}" : "")}", StatusKind.Ok);
+            else if (dup > 0)
+                Context.SetStatus($"Уже в рабочей области: {dup}", StatusKind.Warning);
+        }
+
+        /// <summary>Добавить перетащенные объекты внутрь существующего набора.</summary>
+        private void AddExternalToBundle(WorkspaceEntry bundle)
+        {
+            var built = CollectDroppedEntries();
+            if (built.Count == 0) return;
+            int added = _store.BundleAdd(bundle, built);
+            Context.SetStatus(
+                added > 0 ? $"Добавлено {added} в набор «{BundleDisplayName(bundle)}»" : "Уже в наборе",
+                added > 0 ? StatusKind.Ok : StatusKind.Warning);
+        }
+    }
+}

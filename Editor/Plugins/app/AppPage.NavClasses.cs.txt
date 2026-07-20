@@ -1,0 +1,115 @@
+// ============================================================
+//  AppPage.NavClasses.cs — вкладка «Nav classes».
+//
+//  Стандартные навигационные классы пишутся в Navigation.uss (внутри RegenerateUss,
+//  поэтому переживают Apply). Один класс есть всегда: to-back-page__navigation.
+//
+//  Список «стандартных» целей — static readonly массив ниже: при необходимости
+//  допиши новые id, для каждого появится класс <prefix><id><postfix>.
+//
+//  Семантика back-класса: если страница содержит элемент с этим классом — из неё
+//  можно вернуться назад (граф рисует обратные рёбра, см. AppPage.Graph.cs).
+// ============================================================
+
+using Exerussus.Nexus.Abstractions;
+using System.Collections.Generic;
+using System.Text;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        // обязательная цель «назад» — присутствует всегда
+        private const string BackTargetId = "back-page";
+
+        // стандартные навигационные цели. Порядок сохраняется; BackTargetId гарантированно есть.
+        private static readonly string[] StandardNavTargets =
+        {
+            BackTargetId,
+            // "close-app",
+            // "main-menu",
+        };
+
+        // ----------------------------------------------------- UI поля
+        private Label _navClassesInfo;
+
+        // Класс «назад» (для desc и для графа). Аффиксы берём из page-реестра.
+        private string BackNavClass() => Compose(_pageReg.Prefix, _pageReg.Postfix, BackTargetId);
+
+        private void BuildNavClassesTab()
+        {
+            var toolbar = new VisualElement();
+            toolbar.AddToClassList("nav-toolbar");
+
+            var title = new Label("Standard nav classes");
+            title.AddToClassList("nav-page-title");
+            toolbar.Add(title);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+            toolbar.Add(spacer);
+
+            var writeBtn = new Button(RegenerateUssFromData) { text = "Write to Navigation.uss" };
+            writeBtn.AddToClassList("nav-btn");
+            writeBtn.AddToClassList("nav-btn--apply");
+            toolbar.Add(writeBtn);
+
+            _navClassesRoot.Add(toolbar);
+
+            var desc = new Label(
+                "These classes are written into " + AppPaths.NavUssPath + " together with the per-page/popup classes " +
+                "and are rebuilt on every Apply, so they always exist. " +
+                "\"" + BackNavClass() + "\" marks a page as having a back action — the graph then draws reverse edges " +
+                "from it to every page that navigates to it. Add more targets in the StandardNavTargets array.");
+            desc.AddToClassList("nav-gen-desc");
+            _navClassesRoot.Add(desc);
+
+            _navClassesInfo = new Label(string.Empty);
+            _navClassesInfo.AddToClassList("nav-tpl-status");
+            _navClassesRoot.Add(_navClassesInfo);
+
+            RefreshNavClasses();
+        }
+
+        private void RefreshNavClasses()
+        {
+            if (_navClassesInfo == null) return;
+            var sb = new StringBuilder();
+            sb.Append("Standard classes: ");
+            for (int i = 0; i < StandardNavTargets.Length; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append('.').Append(Compose(_pageReg.Prefix, _pageReg.Postfix, StandardNavTargets[i]));
+            }
+            _navClassesInfo.text = sb.ToString();
+        }
+
+        // Перегенерировать Navigation.uss из текущего NavigationData (без полного Apply).
+        private void RegenerateUssFromData()
+        {
+            var idsPages  = Distinct(_pageReg.ReadStored());
+            var idsPopups = Distinct(_popupReg.ReadStored());
+
+            RegenerateUss(idsPages, idsPopups);
+            AssetDatabase.SaveAssets();
+            RefreshNavClasses();
+            Context.SetStatus($"Navigation.uss rewritten ({StandardNavTargets.Length} standard + " +
+                              $"{idsPages.Count} page + {idsPopups.Count} popup class(es)).", StatusKind.Ok);
+        }
+
+        // Дописывает секцию стандартных классов в Navigation.uss (вызывается из RegenerateUss).
+        private void AppendStandardNavSection(StringBuilder sb)
+        {
+            sb.AppendLine();
+            sb.AppendLine("/* ----- standard navigation classes (always present) ----- */");
+            foreach (var target in StandardNavTargets)
+            {
+                var cls = Compose(_pageReg.Prefix, _pageReg.Postfix, target);
+                sb.Append('.').Append(cls).AppendLine(" {");
+                sb.AppendLine("}");
+            }
+        }
+    }
+}

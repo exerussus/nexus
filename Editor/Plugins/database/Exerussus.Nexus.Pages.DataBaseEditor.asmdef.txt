@@ -1,0 +1,21 @@
+{
+    "name": "Exerussus.Nexus.DataBaseEditor",
+    "rootNamespace": "Exerussus.Nexus.DataBaseEditor",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "exerussus.db",
+        "project.settings",
+        "db.generated"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,19 @@
+{
+    "name": "Exerussus.Nexus.Pages.SignalTimeline",
+    "rootNamespace": "Exerussus.Nexus.Pages.SignalTimeline",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "exerussus.signals"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

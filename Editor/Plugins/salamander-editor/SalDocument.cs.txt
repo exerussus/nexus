@@ -1,0 +1,99 @@
+using System;
+using System.IO;
+using Newtonsoft.Json.Linq;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Открытый .sal: путь, буфер, dirty-флаг, save + контекст модуля из module.json.
+    public sealed class SalDocument
+    {
+        public string Path { get; private set; }
+        public string Text { get; private set; } = "";
+        public bool Dirty { get; private set; }
+        public string ModuleName { get; private set; } = "editor";
+        public string Execution { get; private set; } = "cooperative";
+        public bool HasFile => !string.IsNullOrEmpty(Path);
+        public string FileName => HasFile ? System.IO.Path.GetFileName(Path) : "без файла";
+
+        public void SetText(string text)
+        {
+            text ??= "";
+            if (string.Equals(Text, text, StringComparison.Ordinal)) return;
+            Text = text;
+            Dirty = true;
+        }
+
+        public bool Open(string path, out string error)
+        {
+            try
+            {
+                Text = File.ReadAllText(path);
+                Path = path;
+                Dirty = false;
+                DiscoverModule(path);
+                error = null;
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
+        }
+
+        public bool Save(out string error)
+        {
+            error = null;
+            if (!HasFile) { error = "путь не задан"; return false; }
+            try
+            {
+                File.WriteAllText(Path, Text);
+                Dirty = false;
+                // Внутри проекта: импортер переимпортит .sal, folder-mode бутстрап сделает hot-reload.
+                if (IsInsideProject(Path)) AssetDatabase.Refresh();
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
+        }
+
+        public bool SaveAs(string path, out string error)
+        {
+            Path = path;
+            DiscoverModule(path);
+            return Save(out error);
+        }
+
+        // Ищем module.json вверх по папкам (до 6 уровней): честные name/execution для компиляции.
+        private void DiscoverModule(string salPath)
+        {
+            ModuleName = "editor";
+            Execution = "cooperative";
+            try
+            {
+                var dir = new DirectoryInfo(System.IO.Path.GetDirectoryName(salPath) ?? "");
+                for (int depth = 0; dir != null && depth < 6; depth++, dir = dir.Parent)
+                {
+                    string mj = System.IO.Path.Combine(dir.FullName, "module.json");
+                    if (!File.Exists(mj)) continue;
+                    var jo = JObject.Parse(File.ReadAllText(mj));
+                    ModuleName = (string)jo["name"] ?? ModuleName;
+                    Execution  = (string)jo["execution"] ?? Execution;
+                    break;
+                }
+            }
+            catch { /* нет module.json или он битый — остаёмся на дефолтах */ }
+        }
+
+        private static bool IsInsideProject(string path)
+        {
+            string project = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, ".."));
+            return System.IO.Path.GetFullPath(path).StartsWith(project, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+}

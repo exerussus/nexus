@@ -1,0 +1,186 @@
+using System;
+using System.IO;
+using Newtonsoft.Json;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.DataBaseEditor
+{
+    // Конфигурация авто-генерации разнесена по двум владельцам с разными
+    // жизненными циклами (см. инвариант "у состояния есть явный владелец"):
+    //
+    //  • ProjectGenConfig — настройка ПРОЕКТА. Определяет форму общего
+    //    генерируемого контракта (куда писать .cs, где Resources, namespace,
+    //    префикс полей, фильтры). Должна быть одинаковой у всей команды,
+    //    поэтому это коммитимый JSON во внешнем следе фичи
+    //    (Assets/DataBase/Configs/DataBaseGen.json), а не личные настройки.
+    //
+    //  • UserGenPrefs — ЛИЧНОЕ "решение каждого по обновлению": поведенческие
+    //    тоглы (авто-регистрация, авто-создание ассетов, авто-режим, логи,
+    //    предупреждения). Живёт в UserSettings/Exerussus.Nexus/<id>/autogen.json
+    //    через Context, git-ignored, переживает restore/disable; затирается
+    //    действием "Clear cache" из окна управления.
+    //
+    // AutoGenSettings — объединённый read-only вью, который собирается на момент
+    // вызова и передаётся в Scanner/CodeGenerator/AssetCreator. Сами хелперы не
+    // знают про раскол на два файла — они видят один контракт.
+
+    /// <summary>Project-level config (committed to git). Shapes the shared generated contract.</summary>
+    [Serializable]
+    public sealed class ProjectGenConfig
+    {
+        // Пути и форма генерируемого кода — общие для команды.
+        public string GeneratedFilePath = "Assets/DataBase/Scripts/Generated/DataBase.Generated.cs";
+        public string ResourcesFolder   = "Assets/DataBase/Resources";
+        public string GeneratedNamespace = "";
+        public string FieldPrefix        = "_";
+        public bool   UseUnityEditorGuard = true;
+        public bool   DebuggerStepThrough = false;
+
+        // Фильтры сканера.
+        public string[] AssemblyNameFilters;
+        public string[] IgnoredTypeFullNames;
+
+        /// <summary>Asset-путь коммитимого конфига во внешнем следе фичи.</summary>
+        public const string DefaultPath = "Assets/DataBase/Configs/DataBaseGen.json";
+
+        public static bool Exists(string assetPath) => File.Exists(assetPath);
+
+        /// <summary>Читает конфиг с диска; если файла нет — возвращает дефолты БЕЗ записи.</summary>
+        public static ProjectGenConfig LoadOrDefault(string assetPath)
+        {
+            try
+            {
+                if (File.Exists(assetPath))
+                {
+                    var json = File.ReadAllText(assetPath);
+                    var cfg = JsonConvert.DeserializeObject<ProjectGenConfig>(json);
+                    if (cfg != null) return cfg;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[DB AutoGen] Не удалось прочитать {assetPath}: {ex.Message}");
+            }
+            return new ProjectGenConfig();
+        }
+
+        /// <summary>Идемпотентно записывает конфиг во внешний след и импортирует ассет.</summary>
+        public void Save(string assetPath)
+        {
+            var dir = Path.GetDirectoryName(assetPath)?.Replace("\\", "/");
+            if (!string.IsNullOrEmpty(dir)) EnsureProjectFolder(dir);
+
+            var json = JsonConvert.SerializeObject(this, Formatting.Indented);
+            File.WriteAllText(assetPath, json);
+            AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+        }
+
+        // Пошагово создаёт недостающие папки внутри Assets/.
+        private static void EnsureProjectFolder(string folderPath)
+        {
+            if (AssetDatabase.IsValidFolder(folderPath)) return;
+            var parts = folderPath.Split('/');
+            var current = parts[0];
+            for (int i = 1; i < parts.Length; i++)
+            {
+                var next = current + "/" + parts[i];
+                if (!AssetDatabase.IsValidFolder(next))
+                    AssetDatabase.CreateFolder(current, parts[i]);
+                current = next;
+            }
+        }
+    }
+
+    /// <summary>Personal behaviour prefs (UserSettings, git-ignored). Each dev's own "how I update".</summary>
+    [Serializable]
+    public sealed class UserGenPrefs
+    {
+        public bool AutoRegisterEnabled     = true;   // авто-регистрация при регенерации
+        public bool AutoCreateAssetsEnabled = false;  // авто-создание недостающих .asset
+        public bool RescanOnFocus           = true;   // пере-скан при возврате фокуса (заменяет старый watcher)
+        public bool FullAutoMode            = false;  // полностью автоматический прогон без кнопок
+        public bool LogActions              = true;   // логировать действия в консоль
+        public bool WarnOnMissingAttribute  = true;   // предупреждать о IDataBase без [DataBase]
+
+        /// <summary>Имя личного файла настроек (резолвится Context.GetUserConfigPath).</summary>
+        public const string FileName = "autogen.json";
+
+        public static UserGenPrefs Load(string absolutePath)
+        {
+            try
+            {
+                if (File.Exists(absolutePath))
+                {
+                    var json = File.ReadAllText(absolutePath);
+                    var p = JsonConvert.DeserializeObject<UserGenPrefs>(json);
+                    if (p != null) return p;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[DB AutoGen] Не удалось прочитать личные настройки: {ex.Message}");
+            }
+            return new UserGenPrefs();
+        }
+
+        public void Save(string absolutePath)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(absolutePath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(absolutePath, JsonConvert.SerializeObject(this, Formatting.Indented));
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[DB AutoGen] Не удалось сохранить личные настройки: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Merged read-only view over project + user config, assembled at call time.
+    /// Scanner / CodeGenerator / AssetCreator consume this single contract.
+    /// </summary>
+    public sealed class AutoGenSettings
+    {
+        // --- из ProjectGenConfig (общее, в гите) ---
+        public string GeneratedFilePath    { get; }
+        public string ResourcesFolder      { get; }
+        public string GeneratedNamespace   { get; }
+        public string FieldPrefix          { get; }
+        public bool   UseUnityEditorGuard  { get; }
+        public bool   DebuggerStepThrough  { get; }
+        public string[] AssemblyNameFilters   { get; }
+        public string[] IgnoredTypeFullNames  { get; }
+
+        // --- из UserGenPrefs (личное) ---
+        public bool AutoRegisterEnabled     { get; }
+        public bool AutoCreateAssetsEnabled { get; }
+        public bool FullAutoMode            { get; }
+        public bool LogActions              { get; }
+        public bool WarnOnMissingAttribute  { get; }
+
+        public AutoGenSettings(ProjectGenConfig project, UserGenPrefs user)
+        {
+            project ??= new ProjectGenConfig();
+            user    ??= new UserGenPrefs();
+
+            GeneratedFilePath   = project.GeneratedFilePath;
+            ResourcesFolder     = project.ResourcesFolder;
+            GeneratedNamespace  = project.GeneratedNamespace;
+            FieldPrefix         = project.FieldPrefix;
+            UseUnityEditorGuard = project.UseUnityEditorGuard;
+            DebuggerStepThrough = project.DebuggerStepThrough;
+            AssemblyNameFilters   = project.AssemblyNameFilters;
+            IgnoredTypeFullNames  = project.IgnoredTypeFullNames;
+
+            AutoRegisterEnabled     = user.AutoRegisterEnabled;
+            AutoCreateAssetsEnabled = user.AutoCreateAssetsEnabled;
+            FullAutoMode            = user.FullAutoMode;
+            LogActions              = user.LogActions;
+            WarnOnMissingAttribute  = user.WarnOnMissingAttribute;
+        }
+    }
+}

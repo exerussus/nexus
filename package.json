@@ -1,0 +1,8 @@
+{
+  "name": "com.exerussus.nexus",
+  "version": "0.1.0",
+  "displayName": "Nexus",
+  "description": "Editor-feature engine: deployable plugin pages, static services, theme. All mutable data lives OUTSIDE this folder — deployed code in Assets/NexusStates, project config in ProjectSettings/Nexus.json, personal data in UserSettings/Exerussus.Nexus — so the package can be read-only / updated cleanly.",
+  "unity": "6000.4",
+  "author": { "name": "Exerussus" }
+}

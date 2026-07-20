@@ -1,0 +1,181 @@
+using System.Collections.Generic;
+using System.Text;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Фасад пайплайна кодогена. UI-независимый: его одинаково зовёт и страница
+    /// хаба, и CI (через ApiCodegenBatch -executeMethod). Все операции — над
+    /// конкретным ПРОФИЛЕМ (версией API); GenerateAll гонит все профили подряд.
+    ///
+    /// Конвейер генерации версии:
+    ///   фетч → гарды → CLI в staging (Temp/) → деплой .cs в Assets/Api/&lt;Wrapper&gt;/Generated
+    ///   → авто-скаффолд версии (link.xml, asmdef) → пост-обработка (обёртка, префиксы)
+    ///   → дифф кода → снапшот.
+    /// </summary>
+    public static class ApiCodegenEngine
+    {
+        /// <summary>Анализ без генерации: фетч + health + линт + дрейф спеки профиля.</summary>
+        public sealed class AnalysisResult
+        {
+            public ApiCodegenProfile Profile;
+            public SpecFetcher.Result Fetch;
+            public List<SpecLinter.Finding> Lint = new();
+            public DriftAnalyzer.Report Drift;
+            public bool Ok => Fetch != null && Fetch.Ok;
+        }
+
+        /// <summary>Результат генерации профиля со всеми под-шагами и собранным логом.</summary>
+        public sealed class GenerationResult
+        {
+            public ApiCodegenProfile Profile;
+            public SpecFetcher.Result Fetch;
+            public OutputGuard.ManualEdits ManualEdits;
+            public OutputGuard.LinkXmlStatus LinkXml;
+            public GeneratorRunner.RunOutput Run;
+            public VersionDeployer.DeployResult Deploy;
+            public OutputPostProcessor.Result PostProcess;
+            public List<CodeDiffer.FileChange> CodeChanges = new();
+            public bool Generated;           // весь конвейер прошёл и снапшот зафиксирован
+            public string Log;               // человекочитаемый лог всего прогона
+        }
+
+        public static AnalysisResult Analyze(ApiCodegenProfile profile)
+        {
+            var result = new AnalysisResult
+            {
+                Profile = profile,
+                Fetch = SpecFetcher.Fetch(profile)
+            };
+            if (!result.Fetch.Ok) return result;
+
+            result.Lint = SpecLinter.Lint(result.Fetch.RawJson);
+
+            var snapshot = CodegenSnapshot.Load(profile.Id);
+            result.Drift = DriftAnalyzer.Compare(snapshot.SpecText, result.Fetch.RawJson);
+            return result;
+        }
+
+        /// <summary>Полный прогон генерации всех профилей по порядку.</summary>
+        public static List<GenerationResult> GenerateAll(ApiCodegenConfig config, bool force)
+        {
+            var results = new List<GenerationResult>();
+            foreach (var profile in config.Profiles)
+                results.Add(Generate(profile, force));
+            return results;
+        }
+
+        /// <summary>
+        /// Полный прогон генерации профиля. <paramref name="force"/> = игнорировать
+        /// предупреждения гардов (ручные правки) и генерить всё равно.
+        /// </summary>
+        public static GenerationResult Generate(ApiCodegenProfile profile, bool force)
+        {
+            var log = new StringBuilder();
+            var result = new GenerationResult { Profile = profile };
+            var snapshot = CodegenSnapshot.Load(profile.Id);
+
+            log.AppendLine($"Профиль: {profile.Name} · обёртка {profile.ResolveWrapperClass()} · " +
+                           $"пакет {profile.ResolvePackageName()} · вывод {profile.OutputDir}");
+
+            // 1. Фетч + health.
+            result.Fetch = SpecFetcher.Fetch(profile);
+            log.AppendLine($"Спека: {(result.Fetch.Ok ? "OK" : "ОШИБКА")} " +
+                           $"({profile.SpecSource}, openapi={result.Fetch.OpenApiVersion})");
+            if (!result.Fetch.Ok)
+            {
+                log.AppendLine($"  {result.Fetch.Error} {result.Fetch.Diagnosis}");
+                result.Log = log.ToString();
+                return result;
+            }
+
+            // 2. Гарды.
+            result.ManualEdits = OutputGuard.DetectManualEdits(profile, snapshot);
+            if (result.ManualEdits.Any)
+            {
+                log.AppendLine($"Ручные правки в выводе ({result.ManualEdits.EditedFiles.Count} файл(ов)) — regen их затрёт:");
+                foreach (var f in result.ManualEdits.EditedFiles) log.AppendLine($"  • {f}");
+                if (!force)
+                {
+                    log.AppendLine("Прервано. Запусти с Force, если правки можно потерять.");
+                    result.Log = log.ToString();
+                    return result;
+                }
+                log.AppendLine("Force включён — продолжаю, правки будут потеряны.");
+            }
+
+            result.LinkXml = OutputGuard.CheckLinkXml(profile);
+            if (!result.LinkXml.Ok)
+                log.AppendLine($"link.xml: {result.LinkXml.Hint}");
+
+            // 3. Запуск CLI в staging (Temp/, вне Assets — мусор генератора не импортится).
+            var commandLine = profile.BuildCommandLinePreview();
+            log.AppendLine($"Команда: {commandLine}");
+            result.Run = GeneratorRunner.Run(commandLine, ApiCodegenConfig.ProjectRoot);
+
+            if (!result.Run.Started)
+            {
+                log.AppendLine($"  {result.Run.Error}");
+                log.AppendLine("  Проверь, что установлен генератор (и Java, если это openapi-generator-cli) и он в PATH.");
+                result.Log = log.ToString();
+                return result;
+            }
+
+            log.AppendLine($"Генератор завершился с кодом {result.Run.ExitCode}.");
+            if (!string.IsNullOrWhiteSpace(result.Run.StdErr))
+                log.AppendLine($"stderr:\n{result.Run.StdErr.Trim()}");
+
+            if (!result.Run.Success)
+            {
+                result.Log = log.ToString();
+                return result;
+            }
+
+            // 4. Деплой: только .cs из staging → Assets/Api/<Wrapper>/Generated (плоско),
+            //    затем авто-скаффолд недостающей обвязки версии (link.xml, asmdef).
+            result.Deploy = VersionDeployer.Deploy(profile);
+            if (!result.Deploy.Ok)
+            {
+                log.AppendLine($"Деплой: ОШИБКА — {result.Deploy.Error}");
+                result.Log = log.ToString();
+                return result;
+            }
+            VersionDeployer.EnsureVersionScaffold(profile, result.Deploy);
+            log.AppendLine($"Деплой: {result.Deploy.FilesDeployed} файл(ов) → {profile.OutputDir}.");
+            foreach (var c in result.Deploy.Created)
+                log.AppendLine($"  + создано: {c}");
+            foreach (var r in result.Deploy.Repaired)
+                log.AppendLine($"  ~ починено: {r}");
+            foreach (var w in result.Deploy.Warnings)
+                log.AppendLine($"  ⚠ {w}");
+
+            // 5. Пост-обработка (обёртка версии — всегда; срезка префиксов — по флагу
+            //    профиля) — ДО диффа и снапшота, чтобы зеркало хранило уже обработанный
+            //    код и это не считалось ручной правкой на следующем прогоне.
+            result.PostProcess = OutputPostProcessor.Apply(profile);
+            log.AppendLine($"Обёртка: {result.PostProcess.WrappedFiles} файл(ов) вложено в " +
+                           $"{profile.ResolveWrapperClass()}.");
+            foreach (var s in result.PostProcess.WrapSkipped)
+                log.AppendLine($"  ⚠ не обёрнут: {s}");
+            if (result.PostProcess.StripApplied)
+            {
+                log.AppendLine($"Префиксы имён: переименовано {result.PostProcess.MethodsRenamed} метод(ов).");
+                foreach (var c in result.PostProcess.Collisions)
+                    log.AppendLine($"  ⚠ пропущено (коллизия имени): {c}");
+            }
+
+            // 6. Дифф кода (до фиксации нового снапшота — сравнение с прошлой генерацией).
+            result.CodeChanges = CodeDiffer.Diff(profile.OutputDir, snapshot);
+            log.AppendLine($"Изменения в коде: {result.CodeChanges.Count} файл(ов).");
+
+            // 7. Фиксируем новый снапшот профиля (спека + зеркало вывода) и прибираем staging.
+            CodegenSnapshot.Commit(profile.Id, result.Fetch.RawJson, profile.OutputDir);
+            VersionDeployer.CleanupStaging(profile);
+            result.Generated = true;
+            log.AppendLine("Снапшот обновлён.");
+
+            result.Log = log.ToString();
+            return result;
+        }
+    }
+}

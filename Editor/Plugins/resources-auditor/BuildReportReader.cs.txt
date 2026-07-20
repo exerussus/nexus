@@ -1,0 +1,72 @@
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEditor.Build.Reporting;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Фактические упакованные размеры из отчёта последнего билда.
+    // Официального API получения "последнего отчёта" нет, поэтому два пути:
+    // 1) internal BuildReport.GetLatestReport() через рефлексию (чисто, без мусора в Assets);
+    // 2) fallback — импорт Library/LastBuild.buildreport во временный ассет, чтение, удаление.
+    public static class BuildReportReader
+    {
+        public static bool Read(AuditReport report, out string error)
+        {
+            error = null;
+
+            var mi = typeof(BuildReport).GetMethod("GetLatestReport",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            var direct = mi != null ? mi.Invoke(null, null) as BuildReport : null;
+            if (direct != null) { Extract(report, direct); return true; }
+
+            const string src = "Library/LastBuild.buildreport";
+            const string tmp = "Assets/__NexusResourcesAuditor.buildreport";
+            if (!File.Exists(src))
+            {
+                error = "Отчёт последнего билда не найден (Library/LastBuild.buildreport). Соберите билд хотя бы один раз.";
+                return false;
+            }
+            try
+            {
+                File.Copy(src, tmp, true);
+                AssetDatabase.ImportAsset(tmp, ImportAssetOptions.ForceSynchronousImport);
+                var br = AssetDatabase.LoadAssetAtPath<BuildReport>(tmp);
+                if (br == null) { error = "Не удалось прочитать BuildReport."; return false; }
+                Extract(report, br); // данные извлекаем ДО удаления временного ассета
+                return true;
+            }
+            finally
+            {
+                AssetDatabase.DeleteAsset(tmp); // временный файл живёт ровно на время чтения
+            }
+        }
+
+        static void Extract(AuditReport report, BuildReport br)
+        {
+            // один исходный ассет может быть разложен по нескольким packed-файлам — суммируем
+            var sizes = new Dictionary<string, long>();
+            foreach (var pa in br.packedAssets)
+                foreach (var info in pa.contents)
+                {
+                    if (string.IsNullOrEmpty(info.sourceAssetPath)) continue;
+                    long s;
+                    sizes.TryGetValue(info.sourceAssetPath, out s);
+                    sizes[info.sourceAssetPath] = s + (long)info.packedSize;
+                }
+
+            long total = 0;
+            foreach (var e in report.resources)
+            {
+                long s;
+                e.sizePacked = sizes.TryGetValue(e.assetPath, out s) ? s : -1;
+                if (e.sizePacked > 0) total += e.sizePacked;
+            }
+            report.buildPackedTotal = total;
+            report.buildReportInfo = br.summary.platform + ", " +
+                br.summary.buildEndedAt.ToString("yyyy-MM-dd HH:mm");
+            report.buildReportAt = Stamp.Now();
+        }
+    }
+}

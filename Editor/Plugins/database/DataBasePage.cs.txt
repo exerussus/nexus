@@ -1,0 +1,631 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using DB;
+using Exerussus.Nexus.Abstractions;
+using ProjectSettings.Abstractions;
+using UnityEditor;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.DataBaseEditor
+{
+    // Servicing-страница: обслуживает игровую DB-фичу (инспектирует, генерит, создаёт
+    // ассеты), но сама фича существует без неё. Весь генерируемый ВНЕШНИЙ след
+    // (DataBase.Generated.cs, Resources/*.asset, проектный конфиг) живёт ВНЕ Nexus,
+    // в Assets/DataBase/..., и НЕ стирается при отключении страницы.
+    //
+    // UI строится в C# и идёт через санкционированную фабрику Context.Ui (роли),
+    // тема — через Context.Theme.Get (токены для фонов/текста/разделителей). Страница
+    // ссылается только на Abstractions: NexusStyles/NexusTheme/Theme-asmdef вне досягаемости.
+    [EditorPage("database", "DB", PageCategory.Infrastructure, order: 0, icon: "d_ScriptableObject Icon")]
+    public sealed class DataBasePage : EditorPageBase
+    {
+        // ---- DB list state ----
+        private readonly List<DbEntry> _entries = new();
+        private ListView _list;
+        private TextField _searchField;
+        private ObjectField _externalSlot;
+        private Button _externalPing, _externalInit, _externalCollect;
+        private Label _summary;
+        private Button _reinit;
+        private string _searchKey;
+
+        // ---- autogen state ----
+        private ProjectGenConfig _project;   // настройка проекта (в гите)
+        private UserGenPrefs _prefs;         // личные тоглы (UserSettings)
+        private bool _loadingPrefs;          // защита от рекурсии при программной установке value
+        private Label _configPathLabel;
+        private Button _createConfigButton, _revealConfigButton;
+        private Toggle _toggleAutoRegister, _toggleAutoCreate, _toggleRescanOnFocus, _toggleFullAuto, _toggleLog, _toggleWarnNoAttr;
+        private VisualElement _scanSummaryHost;
+        private ListView _readyList;
+        private ListView _missingList;
+        private DataBaseScanReport _lastReport;
+
+        private VisualElement _root;
+        private Action<PlayModeStateChange> _playModeHandler;
+
+        // =================================================================
+        // ===== Lifecycle =================================================
+        // =================================================================
+
+        public override VisualElement BuildUI()
+        {
+            _searchKey = Context.GetSessionKey("search");
+
+            _root = new VisualElement();
+            _root.style.flexGrow = 1;
+            _root.style.backgroundColor = T(NexusToken.BgHard);
+
+            var scroll = new ScrollView();
+            _root.Add(scroll);
+
+            scroll.Add(BuildToolbar());
+            scroll.Add(BuildSearchRow());
+            scroll.Add(BuildDbList());
+            scroll.Add(Context.Ui.Divider());
+            scroll.Add(BuildExternalCard());
+            scroll.Add(Context.Ui.Divider());
+            scroll.Add(BuildAutoGenFoldout());
+
+            return _root;
+        }
+
+        public override void OnEnter()
+        {
+            // Подписку ставим только пока вкладка активна; снимаем в OnExit.
+            _playModeHandler = _ => RefreshEntries();
+            EditorApplication.playModeStateChanged += _playModeHandler;
+
+            _reinit?.SetEnabled(Application.isPlaying);
+
+            RefreshEntries();
+            RunScan();
+        }
+
+        public override void OnFocus()
+        {
+            // Окно получило фокус поверх активной вкладки — перепроверяем внешние изменения.
+            if (_prefs != null && _prefs.RescanOnFocus)
+            {
+                RunScan();
+                if (_prefs.FullAutoMode)
+                {
+                    RegenerateNow();
+                    if (_prefs.AutoCreateAssetsEnabled) CreateMissingAssets();
+                }
+            }
+        }
+
+        public override void OnUnfocus()
+        {
+            // Высокочастотной работы нет — снимать нечего.
+        }
+
+        public override void OnExit()
+        {
+            if (_playModeHandler != null)
+            {
+                EditorApplication.playModeStateChanged -= _playModeHandler;
+                _playModeHandler = null;
+            }
+        }
+
+        public override void OnRefresh()
+        {
+            RefreshEntries();
+            RunScan();
+            Context.SetStatus(
+                $"DB refreshed: {_entries.Count(e => e.Asset != null)}/{_entries.Count} loaded.",
+                StatusKind.Info);
+        }
+
+        public override bool CanClose() => true;
+
+        public override void OnPrePack()
+        {
+            // Последний шанс перед упаковкой в Preserve — флашим личные настройки.
+            SaveUserPrefs();
+        }
+
+        protected override void OnDisposing()
+        {
+            // Защитно (на случай закрытия окна без OnExit).
+            if (_playModeHandler != null)
+            {
+                EditorApplication.playModeStateChanged -= _playModeHandler;
+                _playModeHandler = null;
+            }
+        }
+
+        // =================================================================
+        // ===== DB list section ===========================================
+        // =================================================================
+
+        private VisualElement BuildToolbar()
+        {
+            var bar = new VisualElement();
+            Row(bar); Pad(bar, 6f); Margin(bar, 0, 0, 0, 8f);
+            bar.style.backgroundColor = T(NexusToken.BgSoft);
+            Border(bar, T(NexusToken.Border), 1f, 6f);
+
+            bar.Add(Context.Ui.Button(NexusRole.Common, "Initialize All", () => RunOnAll(InvokeInit, "Initialize")));
+            bar.Add(Context.Ui.Button(NexusRole.Common, "Collect All",    () => RunOnAll(InvokeCollect, "Collect")));
+
+            _reinit = Context.Ui.Button(NexusRole.Common, "Reinitialize", () =>
+            {
+                DataBase.Initialize();
+                RefreshEntries();
+                Context.SetStatus("Reinitialized.", StatusKind.Ok);
+            });
+            _reinit.SetEnabled(Application.isPlaying);
+            bar.Add(_reinit);
+
+            var spacer = new VisualElement(); spacer.style.flexGrow = 1; bar.Add(spacer);
+
+            _summary = MakeLabel("", NexusToken.TextDim);
+            _summary.style.unityTextAlign = TextAnchor.MiddleRight;
+            bar.Add(_summary);
+
+            foreach (var b in bar.Children().OfType<Button>()) b.style.marginRight = 6f;
+            return bar;
+        }
+
+        private VisualElement BuildSearchRow()
+        {
+            var row = new VisualElement();
+            Row(row); Margin(row, 0, 0, 0, 6f);
+
+            row.Add(MakeLabel("Filter", NexusToken.TextDim));
+
+            _searchField = Context.Ui.Input(SessionState.GetString(_searchKey, string.Empty), v =>
+            {
+                SessionState.SetString(_searchKey, v);
+                RebuildList();
+            });
+            _searchField.style.flexGrow = 1;
+            _searchField.style.marginLeft = 6f;
+            row.Add(_searchField);
+            return row;
+        }
+
+        private VisualElement BuildDbList()
+        {
+            _list = new ListView { fixedItemHeight = 64 };
+            _list.style.minHeight = 220f;
+            _list.style.backgroundColor = T(NexusToken.BgHard);
+            Border(_list, T(NexusToken.Border), 1f, 6f);
+            _list.makeItem = MakeRow;
+            _list.bindItem = BindRow;
+            return _list;
+        }
+
+        private void RefreshEntries()
+        {
+            _entries.Clear();
+            var props = typeof(DataBase).GetProperties(BindingFlags.Public | BindingFlags.Static);
+            foreach (var p in props)
+            {
+                if (!typeof(ScriptableObject).IsAssignableFrom(p.PropertyType)) continue;
+                ScriptableObject value = null;
+                try { value = p.GetValue(null) as ScriptableObject; }
+                catch (Exception e) { Debug.LogWarning($"[DataBasePage] {p.Name}: {e.Message}"); }
+                _entries.Add(new DbEntry
+                {
+                    Display = ObjectNames.NicifyVariableName(p.Name),
+                    PropertyName = p.Name,
+                    Type = p.PropertyType,
+                    Asset = value,
+                });
+            }
+            _entries.Sort((a, b) => string.Compare(a.Display, b.Display, StringComparison.Ordinal));
+            RebuildList();
+        }
+
+        private void RebuildList()
+        {
+            if (_list == null) return;
+            var filter = _searchField?.value ?? string.Empty;
+            var filtered = string.IsNullOrEmpty(filter)
+                ? _entries
+                : _entries.Where(e => e.Display.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
+
+            _list.itemsSource = filtered;
+            _list.RefreshItems();
+            if (_summary != null)
+                _summary.text = $"{_entries.Count(e => e.Asset != null)}/{_entries.Count} loaded";
+        }
+
+        private VisualElement MakeRow()
+        {
+            var row = new VisualElement();
+            Pad(row, 6f); Margin(row, 4f, 4f, 3f, 3f);
+            row.style.backgroundColor = T(NexusToken.BgRaised);
+            Border(row, T(NexusToken.Border), 1f, 6f);
+
+            var header = new VisualElement(); Row(header); Margin(header, 0, 0, 0, 4f);
+            var dot = new VisualElement { name = "dot" };
+            dot.style.width = 10f; dot.style.height = 10f;
+            dot.style.borderTopLeftRadius = dot.style.borderTopRightRadius = 5f;
+            dot.style.borderBottomLeftRadius = dot.style.borderBottomRightRadius = 5f;
+            dot.style.marginRight = 8f;
+            var name = MakeLabel("", NexusToken.TextNormal); name.name = "name"; name.style.unityFontStyleAndWeight = FontStyle.Bold;
+            header.Add(dot); header.Add(name);
+            var sp1 = new VisualElement(); sp1.style.flexGrow = 1; header.Add(sp1);
+            var type = MakeLabel("", NexusToken.TextDim); type.name = "type";
+            header.Add(type);
+            row.Add(header);
+
+            var actions = new VisualElement(); Row(actions);
+            actions.Add(RowBtn(row, NexusRole.Common, "ping",   "Ping",   e => { if (e.Asset) EditorGUIUtility.PingObject(e.Asset); }));
+            actions.Add(RowBtn(row, NexusRole.Common, "select", "Select", e => { if (e.Asset) { Selection.activeObject = e.Asset; EditorGUIUtility.PingObject(e.Asset); } }));
+            actions.Add(RowBtn(row, NexusRole.Common, "open",   "Open",   e => { if (e.Asset) AssetDatabase.OpenAsset(e.Asset); }));
+            var sp2 = new VisualElement(); sp2.style.flexGrow = 1; actions.Add(sp2);
+            actions.Add(RowBtn(row, NexusRole.Common, "init",    "Initialize", e => InvokeInit(e.Asset)));
+            actions.Add(RowBtn(row, NexusRole.Common, "collect", "Collect",    e => InvokeCollect(e.Asset)));
+            row.Add(actions);
+
+            return row;
+        }
+
+        // Кнопка строки списка: создаётся один раз (MakeRow), действует на элемент,
+        // привязанный к строке на момент клика (row.userData ставится в BindRow).
+        private Button RowBtn(VisualElement row, NexusRole role, string name, string text, Action<DbEntry> act)
+        {
+            var b = Context.Ui.Button(role, text, () => { if (row.userData is DbEntry e) act(e); });
+            b.name = name;
+            b.style.marginRight = 4f;
+            return b;
+        }
+
+        private void BindRow(VisualElement row, int i)
+        {
+            var src = (IList<DbEntry>)_list.itemsSource;
+            var e = src[i];
+            row.userData = e;
+
+            row.Q<Label>("name").text = e.Display;
+            row.Q<Label>("type").text = e.Type.Name;
+            row.Q<VisualElement>("dot").style.backgroundColor = T(e.Asset != null ? NexusToken.Ok : NexusToken.Error);
+
+            row.Q<Button>("ping")?.SetEnabled(e.Asset != null);
+            row.Q<Button>("select")?.SetEnabled(e.Asset != null);
+            row.Q<Button>("open")?.SetEnabled(e.Asset != null);
+            row.Q<Button>("init")?.SetEnabled(e.Asset is IInitializable);
+            row.Q<Button>("collect")?.SetEnabled(e.Asset is ICollector);
+        }
+
+        private VisualElement BuildExternalCard()
+        {
+            var card = Context.Ui.Card();
+            Pad(card, 10f); Margin(card, 0, 0, 10f, 0);
+
+            card.Add(MakeLabel("External Target", NexusToken.TextDim));
+
+            _externalSlot = new ObjectField("Drop ScriptableObject")
+            {
+                objectType = typeof(ScriptableObject),
+                allowSceneObjects = false,
+            };
+            _externalSlot.RegisterValueChangedCallback(_ => UpdateExternalButtons());
+            card.Add(_externalSlot);
+
+            var buttons = new VisualElement(); Row(buttons); Margin(buttons, 0, 0, 6f, 0);
+            _externalPing    = Context.Ui.Button(NexusRole.Common, "Ping",       () => { if (_externalSlot.value) EditorGUIUtility.PingObject(_externalSlot.value); });
+            _externalInit    = Context.Ui.Button(NexusRole.Common, "Initialize", () => InvokeInit(_externalSlot.value as ScriptableObject));
+            _externalCollect = Context.Ui.Button(NexusRole.Common, "Collect",    () => InvokeCollect(_externalSlot.value as ScriptableObject));
+            foreach (var b in new[] { _externalPing, _externalInit, _externalCollect }) { b.style.marginRight = 6f; buttons.Add(b); }
+            card.Add(buttons);
+
+            card.Add(MakeLabel("Drop any ScriptableObject implementing IInitializable / ICollector.", NexusToken.TextDim));
+
+            UpdateExternalButtons();
+            return card;
+        }
+
+        private void UpdateExternalButtons()
+        {
+            var so = _externalSlot.value as ScriptableObject;
+            _externalPing.SetEnabled(so != null);
+            _externalInit.SetEnabled(so is IInitializable);
+            _externalCollect.SetEnabled(so is ICollector);
+        }
+
+        private void RunOnAll(Action<ScriptableObject> action, string label)
+        {
+            int n = 0;
+            foreach (var e in _entries)
+            {
+                if (e.Asset == null) continue;
+                action(e.Asset);
+                n++;
+            }
+            Context.SetStatus($"{label} called on {n} databases.", StatusKind.Ok);
+        }
+
+        private void InvokeInit(ScriptableObject so)
+        {
+            if (so is not IDataBase init) return;
+            try { init.Initialize(); Context.SetStatus($"Initialized: {so.name}", StatusKind.Ok); Debug.Log($"[DB] Initialized: {so.name}", so); }
+            catch (Exception ex) { Context.SetStatus($"Initialize failed: {so.name}", StatusKind.Error); Debug.LogError($"[DB] Initialize failed for {so.name}: {ex}", so); }
+        }
+
+        private void InvokeCollect(ScriptableObject so)
+        {
+            if (so is not IDataBase c) return;
+            try { c.Collect(); EditorUtility.SetDirty(so); Context.SetStatus($"Collected: {so.name}", StatusKind.Ok); Debug.Log($"[DB] Collected: {so.name}", so); }
+            catch (Exception ex) { Context.SetStatus($"Collect failed: {so.name}", StatusKind.Error); Debug.LogError($"[DB] Collect failed for {so.name}: {ex}", so); }
+        }
+
+        // =================================================================
+        // ===== Auto-generation section ===================================
+        // =================================================================
+
+        private VisualElement BuildAutoGenFoldout()
+        {
+            var foldout = new Foldout { text = "Auto-Generation", value = true };
+            Margin(foldout, 0, 0, 12f, 0);
+
+            // Конфиг проекта (из гита) и личные тоглы (UserSettings) — читаем при сборке UI.
+            _project = ProjectGenConfig.LoadOrDefault(ProjectGenConfig.DefaultPath);
+            _prefs   = UserGenPrefs.Load(Context.GetUserConfigPath(UserGenPrefs.FileName));
+
+            // --- project config row (card) ---
+            var cfgRow = Context.Ui.Card(); Row(cfgRow); Pad(cfgRow, 6f); Margin(cfgRow, 0, 0, 0, 8f);
+            var info = new VisualElement();
+            info.Add(MakeLabel("Project config (git)", NexusToken.TextNormal));
+            _configPathLabel = MakeLabel("", NexusToken.TextDim);
+            info.Add(_configPathLabel);
+            cfgRow.Add(info);
+            var sp = new VisualElement(); sp.style.flexGrow = 1; cfgRow.Add(sp);
+            _revealConfigButton = Context.Ui.Button(NexusRole.Common, "Show", RevealProjectConfig);
+            _createConfigButton = Context.Ui.Button(NexusRole.Common, "Create", CreateProjectConfig);
+            _revealConfigButton.style.marginLeft = 6f; _createConfigButton.style.marginLeft = 6f;
+            cfgRow.Add(_revealConfigButton); cfgRow.Add(_createConfigButton);
+            foldout.Add(cfgRow);
+
+            // --- toggles (card) ---
+            var box = Context.Ui.Card(); Pad(box, 6f); Margin(box, 0, 0, 0, 8f);
+            _toggleAutoRegister  = AddToggle(box, "Auto-register on regenerate", v => _prefs.AutoRegisterEnabled = v);
+            _toggleAutoCreate    = AddToggle(box, "Auto-create missing assets",  v => _prefs.AutoCreateAssetsEnabled = v);
+            _toggleRescanOnFocus = AddToggle(box, "Re-scan on focus",            v => _prefs.RescanOnFocus = v);
+            _toggleFullAuto      = AddToggle(box, "Full auto mode",              v => _prefs.FullAutoMode = v);
+            _toggleLog           = AddToggle(box, "Log actions",                 v => _prefs.LogActions = v);
+            _toggleWarnNoAttr    = AddToggle(box, "Warn on missing [DataBase]",  v => _prefs.WarnOnMissingAttribute = v);
+            foldout.Add(box);
+
+            // --- action row ---
+            var actions = new VisualElement(); Row(actions); Margin(actions, 0, 0, 0, 6f);
+            var scan       = Context.Ui.Button(NexusRole.Common,  "Scan now",             RunScan);
+            var regenerate = Context.Ui.Button(NexusRole.Primary, "Regenerate code",      RegenerateNow);
+            var createAll  = Context.Ui.Button(NexusRole.Common,  "Create missing assets", CreateMissingAssets);
+            foreach (var b in new[] { scan, regenerate, createAll }) { b.style.marginRight = 6f; actions.Add(b); }
+            foldout.Add(actions);
+
+            // --- scan summary (StatusPill host) ---
+            _scanSummaryHost = new VisualElement(); Margin(_scanSummaryHost, 0, 0, 0, 6f);
+            foldout.Add(_scanSummaryHost);
+
+            // --- ready / missing lists ---
+            foldout.Add(MakeLabel("Ready to register", NexusToken.TextDim));
+            _readyList = MakeAutoGenList(() => _lastReport?.ReadyToRegister, showAsset: true);
+            foldout.Add(_readyList);
+
+            foldout.Add(MakeLabel("Missing asset", NexusToken.TextDim));
+            _missingList = MakeAutoGenList(() => _lastReport?.MissingAsset, showAsset: false);
+            foldout.Add(_missingList);
+
+            LoadTogglesFromPrefs();
+            UpdateConfigUi();
+            return foldout;
+        }
+
+        private Toggle AddToggle(VisualElement parent, string label, Action<bool> apply)
+        {
+            var t = new Toggle(label);
+            t.style.marginBottom = 2f;
+            t.RegisterValueChangedCallback(evt =>
+            {
+                if (_loadingPrefs) return;
+                apply(evt.newValue);
+                SaveUserPrefs();
+            });
+            parent.Add(t);
+            return t;
+        }
+
+        private ListView MakeAutoGenList(Func<List<DataBaseScanEntry>> source, bool showAsset)
+        {
+            var list = new ListView { fixedItemHeight = 22, selectionType = SelectionType.None };
+            list.style.minHeight = 80f;
+            list.style.backgroundColor = T(NexusToken.BgHard);
+            Border(list, T(NexusToken.Border), 1f, 6f);
+            list.makeItem = MakeAutoGenRow;
+            list.bindItem = (el, i) =>
+            {
+                var data = source() ?? new List<DataBaseScanEntry>();
+                BindAutoGenRow(el, data[i], showAsset);
+            };
+            return list;
+        }
+
+        private void LoadTogglesFromPrefs()
+        {
+            _loadingPrefs = true;
+            _toggleAutoRegister.value  = _prefs.AutoRegisterEnabled;
+            _toggleAutoCreate.value    = _prefs.AutoCreateAssetsEnabled;
+            _toggleRescanOnFocus.value = _prefs.RescanOnFocus;
+            _toggleFullAuto.value      = _prefs.FullAutoMode;
+            _toggleLog.value           = _prefs.LogActions;
+            _toggleWarnNoAttr.value    = _prefs.WarnOnMissingAttribute;
+            _loadingPrefs = false;
+        }
+
+        private void SaveUserPrefs()
+        {
+            if (_prefs == null) return;
+            _prefs.Save(Context.GetUserConfigPath(UserGenPrefs.FileName));
+        }
+
+        private AutoGenSettings Settings() => new AutoGenSettings(_project, _prefs);
+
+        private void UpdateConfigUi()
+        {
+            var exists = ProjectGenConfig.Exists(ProjectGenConfig.DefaultPath);
+            _configPathLabel.text = ProjectGenConfig.DefaultPath + (exists ? "" : "  (not created)");
+            _createConfigButton.style.display = exists ? DisplayStyle.None : DisplayStyle.Flex;
+            _revealConfigButton.SetEnabled(exists);
+        }
+
+        private void CreateProjectConfig()
+        {
+            try
+            {
+                _project.Save(ProjectGenConfig.DefaultPath);
+                AssetDatabase.SaveAssets();
+                Context.SetStatus($"Project config created: {ProjectGenConfig.DefaultPath}", StatusKind.Ok);
+            }
+            catch (Exception ex)
+            {
+                Context.SetStatus("Failed to create project config (see Console).", StatusKind.Error);
+                Debug.LogError($"[DB AutoGen] Create config failed: {ex}");
+            }
+            UpdateConfigUi();
+        }
+
+        private void RevealProjectConfig()
+        {
+            var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(ProjectGenConfig.DefaultPath);
+            if (obj != null) EditorGUIUtility.PingObject(obj);
+            else Context.SetStatus("Project config file not found.", StatusKind.Warning);
+        }
+
+        private void RunScan()
+        {
+            _lastReport = DataBaseScanner.Scan(Settings());
+
+            foreach (var w in _lastReport.Warnings) Debug.LogWarning("[DB AutoGen] " + w);
+            foreach (var e in _lastReport.Errors)   Debug.LogError("[DB AutoGen] " + e);
+
+            _readyList.itemsSource = _lastReport.ReadyToRegister;
+            _missingList.itemsSource = _lastReport.MissingAsset;
+            _readyList.RefreshItems();
+            _missingList.RefreshItems();
+
+            var text =
+                $"Ready: {_lastReport.ReadyToRegister.Count} · Missing asset: {_lastReport.MissingAsset.Count} · " +
+                $"Warnings: {_lastReport.Warnings.Count} · Errors: {_lastReport.Errors.Count}";
+            var kind = _lastReport.Errors.Count > 0 ? StatusKind.Error
+                     : _lastReport.Warnings.Count > 0 ? StatusKind.Warning
+                     : StatusKind.Ok;
+
+            _scanSummaryHost.Clear();
+            _scanSummaryHost.Add(Context.Ui.StatusPill(kind, text));
+
+            Context.SetStatus("Scan complete.", _lastReport.Errors.Count > 0 ? StatusKind.Error : StatusKind.Info);
+        }
+
+        private void RegenerateNow()
+        {
+            if (_lastReport == null) { RunScan(); if (_lastReport == null) return; }
+            if (_lastReport.Errors.Count > 0)
+            {
+                Context.SetStatus("Cannot regenerate: scan has errors. Check Console.", StatusKind.Error);
+                return;
+            }
+            var ok = DataBaseCodeGenerator.Generate(_lastReport.ReadyToRegister, Settings());
+            Context.SetStatus(ok ? $"Generated for {_lastReport.ReadyToRegister.Count} databases."
+                                 : "Generation failed.",
+                              ok ? StatusKind.Ok : StatusKind.Error);
+        }
+
+        private void CreateMissingAssets()
+        {
+            if (_lastReport == null) { RunScan(); if (_lastReport == null) return; }
+            if (_lastReport.MissingAsset.Count == 0)
+            {
+                Context.SetStatus("Nothing to create.", StatusKind.Info);
+                return;
+            }
+            int n = DataBaseAssetCreator.CreateAssets(_lastReport.MissingAsset, Settings());
+            Context.SetStatus($"Created {n} asset(s). Re-scanning…", StatusKind.Ok);
+            RunScan();
+        }
+
+        private VisualElement MakeAutoGenRow()
+        {
+            var row = new VisualElement(); Row(row); Pad(row, 3f); Margin(row, 2f, 2f, 1f, 1f);
+            var alias = MakeLabel("", NexusToken.Accent); alias.name = "alias";
+            alias.style.unityFontStyleAndWeight = FontStyle.Bold; alias.style.minWidth = 110f;
+            var sep   = MakeLabel("·", NexusToken.Muted); sep.name = "sep"; sep.style.marginLeft = 6f; sep.style.marginRight = 6f;
+            var type  = MakeLabel("", NexusToken.TextNormal); type.name = "type";
+            var spc   = new VisualElement(); spc.style.flexGrow = 1;
+            var asset = MakeLabel("", NexusToken.TextDim); asset.name = "asset";
+            row.Add(alias); row.Add(sep); row.Add(type); row.Add(spc); row.Add(asset);
+            return row;
+        }
+
+        private void BindAutoGenRow(VisualElement row, DataBaseScanEntry entry, bool showAsset)
+        {
+            row.Q<Label>("alias").text = entry.Alias;
+            row.Q<Label>("type").text  = entry.Type.FullName;
+            row.Q<Label>("asset").text = showAsset ? (entry.AssetPath ?? "") : "<no asset>";
+        }
+
+        // =================================================================
+        // ===== Small layout / theme helpers ==============================
+        // (токены — для фонов/текста/разделителей; это разрешённый путь) ====
+        // =================================================================
+
+        private Color T(NexusToken token) => Context.Theme.Get(token);
+
+        private Label MakeLabel(string text, NexusToken token)
+        {
+            var l = new Label(text);
+            l.style.color = T(token);
+            return l;
+        }
+
+        private static void Row(VisualElement e)
+        {
+            e.style.flexDirection = FlexDirection.Row;
+            e.style.alignItems = Align.Center;
+        }
+
+        private static void Pad(VisualElement e, float a)
+        {
+            e.style.paddingTop = a; e.style.paddingBottom = a;
+            e.style.paddingLeft = a; e.style.paddingRight = a;
+        }
+
+        // left, right, top, bottom
+        private static void Margin(VisualElement e, float l, float r, float t, float b)
+        {
+            e.style.marginLeft = l; e.style.marginRight = r;
+            e.style.marginTop = t;  e.style.marginBottom = b;
+        }
+
+        private static void Border(VisualElement e, Color c, float w, float radius)
+        {
+            e.style.borderTopWidth = w; e.style.borderRightWidth = w;
+            e.style.borderBottomWidth = w; e.style.borderLeftWidth = w;
+            e.style.borderTopColor = c; e.style.borderRightColor = c;
+            e.style.borderBottomColor = c; e.style.borderLeftColor = c;
+            e.style.borderTopLeftRadius = radius; e.style.borderTopRightRadius = radius;
+            e.style.borderBottomLeftRadius = radius; e.style.borderBottomRightRadius = radius;
+        }
+
+        // =================================================================
+
+        private sealed class DbEntry
+        {
+            public string Display;
+            public string PropertyName;
+            public Type Type;
+            public ScriptableObject Asset;
+        }
+    }
+}

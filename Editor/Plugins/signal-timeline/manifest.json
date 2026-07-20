@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "guid": "d3bd087c72054d5e97d694ac77c8d497",
+  "id": "signal-timeline",
+  "version": "1.1",
+  "typeName": "Exerussus.Nexus.Pages.SignalTimeline.SignalTimelinePage",
+  "display": {
+    "name": "Signals",
+    "category": "Infrastructure",
+    "order": 10,
+    "icon": null
+  },
+  "kind": "constitutive",
+  "requires": [],
+  "deploy": [
+    { "from": "SignalTimelinePage.cs.txt", "to": "SignalTimelinePage.cs" },
+    { "from": "SignalTimelinePage_Graph.cs.txt", "to": "SignalTimelinePage_Graph.cs" },
+    { "from": "SignalClusterPopup.cs.txt", "to": "SignalClusterPopup.cs" },
+    { "from": "SignalRegistry.cs.txt", "to": "SignalRegistry.cs" },
+    { "from": "SignalsConfig.cs.txt", "to": "SignalsConfig.cs" },
+    { "from": "SignalTimelinePage.uss.txt", "to": "SignalTimelinePage.uss" },
+    { "from": "Exerussus.Nexus.Pages.SignalTimeline.asmdef.txt", "to": "Exerussus.Nexus.Pages.SignalTimeline.asmdef" }
+  ]
+}

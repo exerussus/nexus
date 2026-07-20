@@ -1,0 +1,875 @@
+// ============================================================
+//  AppPage.Graph.cs — вкладка «Graph».
+//
+//  Рисует дерево навигации между AppPage/AppPopup в виде графа по string id.
+//  Узлы берутся из сцены (иерархия под AppRunner), рёбра — из nav-классов в UXML.
+//
+//  Алгоритм:
+//    1. находим AppRunner в активной сцене; нет — ничего не показываем;
+//    2. собираем его AppPage / AppPopup по иерархии (включая выключенные);
+//    3. достаём VisualTreeAsset из приватного поля компонента рефлексией;
+//    4. ищем в uxml навигационные uss-классы (Compose(prefix, postfix, id));
+//    5. строим связи и раскладку, рисуем граф;
+//    6. если что-то ломается — пишем об этом (статус + плашка на канвасе);
+//    7. несвязанные узлы отмечаем красной обводкой;
+//    8. вкладки, pan/zoom, click→ping в сцене, легенда, пунктир для попап-вызовов,
+//       стрелки, подсветка «битых» ссылок, тултипы, Fit.
+//
+//  Таб-бар/ShowTab — в AppPage.Tabs.cs; Compose/ClassAttrRx/WS — в ядре;
+//  BackNavClass()/BackTargetId — в AppPage.NavClasses.cs. Здесь только граф +
+//  кэшированная рефлексия сцены (её зовёт и Generation).
+//
+//  Требуется Unity 2022.2+ (MeshGenerationContext.painter2D).
+// ============================================================
+
+using Exerussus.Nexus.Abstractions;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        // ----------------------------------------------------- layout consts
+        private const float NodeW = 176f;
+        private const float NodeH = 62f;
+        private const float GapX  = 72f;
+        private const float GapY  = 22f;
+        private const float Pad   = 48f;
+
+        private VisualElement _graphViewport;   // клип-область (overflow: hidden)
+        private VisualElement _graphContent;    // pannable/zoomable, на нём рисуются рёбра
+        private Label         _graphEmpty;      // плашка-сообщение поверх канваса
+        private Label         _graphInfo;       // строка статистики под тулбаром
+
+        private float   _zoom = 1f;
+        private Vector2 _pan;                   // смещение _graphContent в пикселях (style.translate)
+        private bool    _panning;
+        private Vector2 _panStartMouse, _panStartContent;
+        private bool    _pendingFit;
+        private Vector2 _contentSize = new(10f, 10f);
+
+        // ----------------------------------------------------- graph model
+        private readonly List<GraphNode> _nodes = new();
+        private readonly List<GraphEdge> _edges = new();
+
+        private sealed class GraphNode
+        {
+            public string Id;
+            public bool   IsPopup;
+            public string NavClass;             // класс, которым на узел ссылаются другие
+            public long   Hash;
+            public UnityEngine.Object SceneObject;
+            public string UxmlPath;
+            public string UxmlText;
+            public bool   UxmlMissing;
+
+            public readonly HashSet<GraphNode> Out = new();
+            public readonly HashSet<GraphNode> In  = new();
+            public readonly List<string> DanglingLinks = new();   // nav-классы без узла-получателя
+            public bool    HasBack;             // в uxml есть to-back-page__navigation
+
+            public bool    Connected;
+            public int     Layer;
+            public Vector2 Pos;                 // левый-верхний угол в координатах канваса
+            public VisualElement Ve;
+        }
+
+        private sealed class GraphEdge
+        {
+            public GraphNode From, To;
+            public bool      Back;          // обратная связь по to-back-page__navigation
+        }
+
+        // ----------------------------------------------------- theme colors
+        // Цвета рёбер берём из токенов Nexus (Context.Theme) в RebuildGraph; значения ниже — фолбэк.
+        private Color _cEdge      = new(0.62f, 0.62f, 0.68f, 0.85f);
+        private Color _cEdgePopup = new(0.90f, 0.66f, 0.36f, 0.95f);
+        private Color _cEdgeBack  = new(0.42f, 0.78f, 0.55f, 0.95f);   // обратные рёбра (back)
+
+        // ----------------------------------------------------- reflection caches
+        private static readonly Dictionary<string, Type> _typeCache = new(StringComparer.Ordinal);
+        private static readonly Dictionary<Type, FieldInfo> _vtaFieldCache = new();
+        private static readonly Dictionary<Type, FieldInfo> _idFieldCache  = new();
+
+        // ============================================================ build
+
+        private void BuildGraphTab()
+        {
+            var toolbar = new VisualElement();
+            toolbar.AddToClassList("nav-toolbar");
+
+            var title = new Label("Navigation graph");
+            title.AddToClassList("nav-page-title");
+
+            var legend = new VisualElement();
+            legend.AddToClassList("nav-graph-legend");
+            legend.Add(LegendItem("nav-dot--page",   "page"));
+            legend.Add(LegendItem("nav-dot--popup",  "popup"));
+            legend.Add(LegendItem("nav-dot--back",   "back"));
+            legend.Add(LegendItem("nav-dot--orphan", "disconnected"));
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+
+            var fit = new Button(FitView) { text = "Fit" };
+            fit.AddToClassList("nav-btn");
+
+            var refresh = new Button(RebuildGraph) { text = "Refresh" };
+            refresh.AddToClassList("nav-btn");
+
+            toolbar.Add(title);
+            toolbar.Add(legend);
+            toolbar.Add(spacer);
+            toolbar.Add(fit);
+            toolbar.Add(refresh);
+            _graphRoot.Add(toolbar);
+
+            _graphInfo = new Label();
+            _graphInfo.AddToClassList("nav-hint");
+            _graphRoot.Add(_graphInfo);
+
+            _graphViewport = new VisualElement();
+            _graphViewport.AddToClassList("nav-graph-viewport");
+            _graphRoot.Add(_graphViewport);
+
+            _graphContent = new VisualElement();
+            _graphContent.AddToClassList("nav-graph-content");
+            _graphContent.generateVisualContent += OnGraphRepaint;
+            _graphViewport.Add(_graphContent);
+
+            _graphEmpty = new Label();
+            _graphEmpty.AddToClassList("nav-graph-empty");
+            _graphViewport.Add(_graphEmpty);
+
+            RegisterPanZoom();
+
+            // отложенный Fit, когда вьюпорт получит реальный размер
+            _graphViewport.RegisterCallback<GeometryChangedEvent>(_ =>
+            {
+                if (_pendingFit && _graphViewport.contentRect.width > 1f)
+                {
+                    _pendingFit = false;
+                    FitView();
+                }
+            });
+        }
+
+        private static VisualElement LegendItem(string dotClass, string text)
+        {
+            var item = new VisualElement();
+            item.AddToClassList("nav-legend-item");
+
+            var dot = new VisualElement();
+            dot.AddToClassList("nav-dot");
+            dot.AddToClassList(dotClass);
+
+            var lbl = new Label(text);
+            lbl.AddToClassList("nav-legend-label");
+
+            item.Add(dot);
+            item.Add(lbl);
+            return item;
+        }
+
+        // ============================================================ rebuild
+
+        private void RebuildGraph()
+        {
+            if (_graphContent == null) return;
+
+            // цвета рёбер — из активной палитры Nexus
+            _cEdge      = Tok(NexusToken.TextDim);
+            _cEdgePopup = Tok(NexusToken.Warning);
+            _cEdgeBack  = Tok(NexusToken.Accent);
+
+            // сброс канваса и трансформа
+            _graphContent.Clear();
+            _nodes.Clear();
+            _edges.Clear();
+            _pan  = Vector2.zero;
+            _zoom = 1f;
+            ApplyContentTransform();
+
+            bool ok;
+            string error = null;
+            try { ok = ScanScene(out error); }
+            catch (Exception ex) { ok = false; error = "Graph build failed: " + ex.Message; }
+
+            if (!ok)
+            {
+                _contentSize = new Vector2(10f, 10f);
+                _graphContent.style.width  = 0;
+                _graphContent.style.height = 0;
+                _graphInfo.text = "";
+
+                if (error == null)
+                {
+                    _graphEmpty.text = "No AppRunner in the active scene — nothing to show.";
+                    Context.SetStatus("Navigation graph: no AppRunner in scene.", StatusKind.Info);
+                }
+                else
+                {
+                    _graphEmpty.text = error;
+                    Context.SetStatus("Navigation graph: " + error, StatusKind.Error);
+                }
+
+                _graphEmpty.style.display = DisplayStyle.Flex;
+                _graphContent.MarkDirtyRepaint();
+                return;
+            }
+
+            _graphEmpty.style.display = DisplayStyle.None;
+
+            _contentSize = LayoutGraph();
+            _graphContent.style.width  = _contentSize.x;
+            _graphContent.style.height = _contentSize.y;
+
+            foreach (var n in _nodes)
+            {
+                var el = MakeNodeElement(n);
+                el.style.position = Position.Absolute;
+                el.style.left   = n.Pos.x;
+                el.style.top    = n.Pos.y;
+                el.style.width  = NodeW;
+                el.style.height = NodeH;
+                n.Ve = el;
+                _graphContent.Add(el);
+            }
+
+            _graphContent.MarkDirtyRepaint();
+            ApplyTheme();   // покрасить только что созданные узлы из токенов
+
+            // статистика + статус
+            int orphan = 0, missing = 0, dead = 0;
+            foreach (var n in _nodes)
+            {
+                if (!n.Connected) orphan++;
+                if (n.UxmlMissing) missing++;
+                dead += n.DanglingLinks.Count;
+            }
+
+            var sb = new StringBuilder();
+            sb.Append(_nodes.Count).Append(" node(s), ").Append(_edges.Count).Append(" link(s). ");
+            if (orphan  > 0) sb.Append(orphan).Append(" disconnected. ");
+            if (missing > 0) sb.Append(missing).Append(" without UXML. ");
+            if (dead    > 0) sb.Append(dead).Append(" dead link(s).");
+            _graphInfo.text = sb.ToString();
+
+            Context.SetStatus(
+                $"Navigation graph: {_nodes.Count} node(s), {_edges.Count} link(s)" +
+                (orphan > 0 ? $", {orphan} disconnected" : "") + ".",
+                (orphan > 0 || missing > 0 || dead > 0) ? StatusKind.Warning : StatusKind.Ok);
+
+            // подгоняем вид
+            _pendingFit = true;
+            _graphViewport.schedule.Execute(() =>
+            {
+                if (_pendingFit && _graphViewport.contentRect.width > 1f)
+                {
+                    _pendingFit = false;
+                    FitView();
+                }
+            }).StartingIn(40);
+        }
+
+        // ============================================================ scene scan
+
+        // true — граф собран; false + error==null — AppRunner нет; false + error — ошибка.
+        private bool ScanScene(out string error)
+        {
+            error = null;
+
+            var tRunner = ResolveType("App.AppRunner", "AppRunner");
+            var tPage   = ResolveType("App.Core.AppPage", "AppPage");
+            var tPopup  = ResolveType("App.Core.AppPopup", "AppPopup");
+
+            if (tRunner == null) { error = "Type 'AppRunner' not found in loaded assemblies."; return false; }
+            if (tPage == null && tPopup == null) { error = "Neither 'AppPage' nor 'AppPopup' type found."; return false; }
+
+            var runners = UnityEngine.Object.FindObjectsByType(tRunner, FindObjectsInactive.Include);
+
+            if (runners == null || runners.Length == 0)
+                return false;                              // AppRunner нет → ничего не показываем
+
+            if (runners[0] is not Component runner) { error = "AppRunner is not a Component."; return false; }
+
+            var pageComps  = tPage  != null ? runner.GetComponentsInChildren(tPage,  true) : Array.Empty<Component>();
+            var popupComps = tPopup != null ? runner.GetComponentsInChildren(tPopup, true) : Array.Empty<Component>();
+
+            foreach (var c in pageComps)  AddNode(c, false);
+            foreach (var c in popupComps) AddNode(c, true);
+
+            if (_nodes.Count == 0) { error = "AppRunner has no AppPage / AppPopup children."; return false; }
+
+            BuildEdges();
+            return true;
+        }
+
+        private void AddNode(Component c, bool isPopup)
+        {
+            if (c == null) return;
+
+            var reg = isPopup ? _popupReg : _pageReg;
+            var id  = (ReadStringField(c, isPopup ? "popupId" : "pageId") ?? "").Trim();
+
+            var n = new GraphNode
+            {
+                Id          = id,
+                IsPopup     = isPopup,
+                SceneObject = c.gameObject,
+                NavClass    = Compose(reg.Prefix, reg.Postfix, id),
+                Hash        = id.Length > 0 ? reg.HashOf(id) : 0,
+            };
+
+            var vta = ReadVisualTree(c);                   // ассет через рефлексию
+            if (vta == null)
+            {
+                n.UxmlMissing = true;
+            }
+            else
+            {
+                n.UxmlPath = AssetDatabase.GetAssetPath(vta);
+                try { n.UxmlText = string.IsNullOrEmpty(n.UxmlPath) ? null : File.ReadAllText(n.UxmlPath); }
+                catch { n.UxmlText = null; }
+                if (string.IsNullOrEmpty(n.UxmlText)) n.UxmlMissing = true;
+            }
+
+            _nodes.Add(n);
+        }
+
+        // ============================================================ edges
+
+        private void BuildEdges()
+        {
+            // класс → узел-получатель
+            var byClass = new Dictionary<string, GraphNode>(StringComparer.Ordinal);
+            foreach (var n in _nodes)
+                if (!string.IsNullOrEmpty(n.NavClass))
+                    byClass[n.NavClass] = n;
+
+            var pageRx  = NavPattern(_pageReg);
+            var popupRx = NavPattern(_popupReg);
+            var backClass = BackNavClass();     // to-back-page__navigation (см. AppPage.NavClasses.cs)
+
+            foreach (var s in _nodes)
+            {
+                if (string.IsNullOrEmpty(s.UxmlText)) continue;
+
+                foreach (var tok in ExtractClassTokens(s.UxmlText))
+                {
+                    if (string.Equals(tok, backClass, StringComparison.Ordinal))
+                    {
+                        s.HasBack = true;                           // спец-маркер «можно назад»
+                        continue;
+                    }
+                    if (byClass.TryGetValue(tok, out var m))
+                    {
+                        if (m == s) continue;                       // self-loop игнорируем
+                        if (s.Out.Add(m)) { m.In.Add(s); _edges.Add(new GraphEdge { From = s, To = m }); }
+                    }
+                    else if ((pageRx  != null && pageRx.IsMatch(tok)) ||
+                             (popupRx != null && popupRx.IsMatch(tok)))
+                    {
+                        // выглядит как nav-класс, но получателя нет — "битая" ссылка
+                        if (!s.DanglingLinks.Contains(tok)) s.DanglingLinks.Add(tok);
+                    }
+                }
+            }
+
+            // обратные рёбра: из страницы с to-back-page__navigation — назад ко всем,
+            // кто на неё ссылается. На связность не влияет.
+            foreach (var s in _nodes)
+            {
+                if (!s.HasBack) continue;
+                foreach (var q in s.In)
+                {
+                    if (q.IsPopup) continue;                        // «назад» — про страницы
+                    _edges.Add(new GraphEdge { From = s, To = q, Back = true });
+                }
+            }
+
+            // связность. Попап считается связанным, если есть кто его открывает.
+            foreach (var n in _nodes)
+                n.Connected = n.IsPopup ? n.In.Count > 0 : (n.In.Count > 0 || n.Out.Count > 0);
+        }
+
+        private static HashSet<string> ExtractClassTokens(string text)
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (Match m in ClassAttrRx.Matches(text))
+                foreach (var t in m.Groups["val"].Value.Split(WS, StringSplitOptions.RemoveEmptyEntries))
+                    set.Add(t);
+            return set;
+        }
+
+        private static Regex NavPattern(Registry reg)
+        {
+            var pre  = Regex.Escape(reg.Prefix  ?? "");
+            var post = Regex.Escape(reg.Postfix ?? "");
+            if (pre.Length == 0 && post.Length == 0) return null;
+            return new Regex("^" + pre + ".+" + post + "$", RegexOptions.Compiled);
+        }
+
+        // ============================================================ layout
+
+        // Слоистая раскладка: страницы ранжируются BFS-расстоянием от корней
+        // (in-degree==0), попапы — отдельной колонкой справа. Возвращает размер канваса.
+        private Vector2 LayoutGraph()
+        {
+            var pages  = new List<GraphNode>();
+            var popups = new List<GraphNode>();
+            foreach (var n in _nodes) (n.IsPopup ? popups : pages).Add(n);
+
+            foreach (var p in pages) p.Layer = -1;
+
+            var q = new Queue<GraphNode>();
+            foreach (var p in pages)
+            {
+                int inDeg = 0;
+                foreach (var x in p.In) if (!x.IsPopup) inDeg++;
+                if (inDeg == 0) { p.Layer = 0; q.Enqueue(p); }
+            }
+            BfsLayers(q);
+
+            // циклы / недостижимые узлы — назначаем локальные корни
+            foreach (var p in pages)
+            {
+                if (p.Layer >= 0) continue;
+                p.Layer = 0;
+                q.Enqueue(p);
+                BfsLayers(q);
+            }
+
+            int maxLayer = 0;
+            foreach (var p in pages) if (p.Layer > maxLayer) maxLayer = p.Layer;
+
+            var layers = new Dictionary<int, List<GraphNode>>();
+            foreach (var p in pages)
+            {
+                if (!layers.TryGetValue(p.Layer, out var l)) { l = new List<GraphNode>(); layers[p.Layer] = l; }
+                l.Add(p);
+            }
+
+            float colW = NodeW + GapX;
+            float rowH = NodeH + GapY;
+
+            for (int L = 0; L <= maxLayer; L++)
+            {
+                if (!layers.TryGetValue(L, out var l)) continue;
+                float total = l.Count * NodeH + (l.Count - 1) * GapY;
+                float y0 = -total / 2f;                            // центрируем колонку относительно 0
+                for (int i = 0; i < l.Count; i++)
+                    l[i].Pos = new Vector2(L * colW, y0 + i * rowH);
+            }
+
+            // попапы — отдельная колонка
+            float popupX = (pages.Count > 0 ? (maxLayer + 1) : 0) * colW;
+
+            popups.Sort((a, b) => PopupKey(a).CompareTo(PopupKey(b)));
+            float cursor = float.NegativeInfinity;
+            foreach (var pop in popups)
+            {
+                float desired = PopupDesiredY(pop);
+                float y = float.IsNaN(desired)
+                    ? (float.IsNegativeInfinity(cursor) ? 0f : cursor)
+                    : desired;
+                if (!float.IsNegativeInfinity(cursor) && y < cursor) y = cursor;   // без наложений
+                pop.Pos = new Vector2(popupX, y);
+                cursor = y + rowH;
+            }
+
+            // нормализация в положительные координаты + размер канваса
+            if (_nodes.Count == 0) return new Vector2(10f, 10f);
+
+            float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+            foreach (var n in _nodes)
+            {
+                minX = Mathf.Min(minX, n.Pos.x);
+                minY = Mathf.Min(minY, n.Pos.y);
+                maxX = Mathf.Max(maxX, n.Pos.x + NodeW);
+                maxY = Mathf.Max(maxY, n.Pos.y + NodeH);
+            }
+
+            var off = new Vector2(Pad - minX, Pad - minY);
+            foreach (var n in _nodes) n.Pos += off;
+
+            return new Vector2(maxX - minX + Pad * 2f, maxY - minY + Pad * 2f);
+        }
+
+        private static void BfsLayers(Queue<GraphNode> q)
+        {
+            while (q.Count > 0)
+            {
+                var u = q.Dequeue();
+                foreach (var v in u.Out)
+                {
+                    if (v.IsPopup) continue;
+                    if (v.Layer < 0) { v.Layer = u.Layer + 1; q.Enqueue(v); }
+                }
+            }
+        }
+
+        // желаемый y попапа = средний центр страниц-открывателей (NaN, если их нет)
+        private static float PopupDesiredY(GraphNode pop)
+        {
+            int c = 0; float sum = 0f;
+            foreach (var o in pop.In)
+                if (!o.IsPopup) { sum += o.Pos.y + NodeH / 2f; c++; }
+            return c == 0 ? float.NaN : sum / c - NodeH / 2f;
+        }
+
+        private static float PopupKey(GraphNode pop)
+        {
+            var d = PopupDesiredY(pop);
+            return float.IsNaN(d) ? float.MaxValue : d;
+        }
+
+        // ============================================================ node UI
+
+        private VisualElement MakeNodeElement(GraphNode n)
+        {
+            var el = new VisualElement();
+            el.AddToClassList("nav-graph-node");
+            el.AddToClassList(n.IsPopup ? "nav-graph-node--popup" : "nav-graph-node--page");
+            if (!n.Connected)  el.AddToClassList("nav-graph-node--orphan");   // красная обводка
+            if (n.UxmlMissing) el.AddToClassList("nav-graph-node--missing");
+
+            var head = new VisualElement();
+            head.AddToClassList("nav-graph-node__head");
+
+            var badge = new Label(n.IsPopup ? "POPUP" : "PAGE");
+            badge.AddToClassList("nav-graph-badge");
+
+            var idLbl = new Label(string.IsNullOrEmpty(n.Id) ? "<empty id>" : n.Id);
+            idLbl.AddToClassList("nav-graph-id");
+
+            head.Add(badge);
+            head.Add(idLbl);
+
+            var meta = new Label($"\u2192 {n.Out.Count}   \u2190 {n.In.Count}");
+            meta.AddToClassList("nav-graph-meta");
+
+            el.Add(head);
+            el.Add(meta);
+
+            if (n.UxmlMissing)
+            {
+                var w = new Label("no UXML");
+                w.AddToClassList("nav-graph-warn");
+                el.Add(w);
+            }
+            else if (n.DanglingLinks.Count > 0)
+            {
+                var w = new Label($"{n.DanglingLinks.Count} dead link(s)");
+                w.AddToClassList("nav-graph-warn");
+                el.Add(w);
+            }
+
+            el.tooltip = BuildNodeTooltip(n);
+
+            // клик по узлу — пинг объекта в иерархии сцены
+            el.RegisterCallback<PointerDownEvent>(e =>
+            {
+                if (e.button == 0 && n.SceneObject != null)
+                {
+                    EditorGUIUtility.PingObject(n.SceneObject);
+                    Selection.activeObject = n.SceneObject;
+                }
+            });
+
+            return el;
+        }
+
+        private static string BuildNodeTooltip(GraphNode n)
+        {
+            var sb = new StringBuilder();
+            sb.Append(n.IsPopup ? "Popup: " : "Page: ").AppendLine(string.IsNullOrEmpty(n.Id) ? "<empty>" : n.Id);
+            if (!string.IsNullOrEmpty(n.Id))
+            {
+                sb.Append("class: .").AppendLine(n.NavClass);
+                sb.Append("hash:  0x").AppendLine(n.Hash.ToString("X16"));
+            }
+            sb.Append("uxml:  ").AppendLine(n.UxmlMissing ? "(missing / unreadable)" : n.UxmlPath);
+            sb.Append("out: ").Append(n.Out.Count).Append("   in: ").Append(n.In.Count);
+            if (!n.Connected) sb.Append("\n(!) disconnected");
+            if (n.DanglingLinks.Count > 0)
+            {
+                sb.Append("\ndead links:");
+                foreach (var d in n.DanglingLinks) sb.Append("\n  .").Append(d);
+            }
+            return sb.ToString();
+        }
+
+        // ============================================================ edge paint
+
+        private void OnGraphRepaint(MeshGenerationContext ctx)
+        {
+            if (_edges.Count == 0) return;
+
+            var p = ctx.painter2D;
+            p.lineCap = LineCap.Round;
+
+            foreach (var e in _edges)
+            {
+                EdgeGeometry(e.From, e.To, out var a, out var b, out var c1, out var c2);
+
+                Color col;
+                float w;
+                bool dashed;
+                if (e.Back)            { col = _cEdgeBack;  w = 1.6f; dashed = true; }
+                else if (e.To.IsPopup) { col = _cEdgePopup; w = 1.6f; dashed = true; }
+                else                   { col = _cEdge;      w = 2f;   dashed = false; }
+
+                p.strokeColor = col;
+                p.fillColor   = col;
+                p.lineWidth   = w;
+
+                if (dashed)
+                    StrokeDashed(p, a, c1, c2, b);
+                else
+                {
+                    p.BeginPath();
+                    p.MoveTo(a);
+                    p.BezierCurveTo(c1, c2, b);
+                    p.Stroke();
+                }
+
+                DrawArrow(p, b, b - c2);
+            }
+        }
+
+        private static void EdgeGeometry(GraphNode s, GraphNode t,
+            out Vector2 a, out Vector2 b, out Vector2 c1, out Vector2 c2)
+        {
+            bool fwd = t.Pos.x >= s.Pos.x;
+            float sy = s.Pos.y + NodeH / 2f;
+            float ty = t.Pos.y + NodeH / 2f;
+
+            a = new Vector2(fwd ? s.Pos.x + NodeW : s.Pos.x, sy);
+            b = new Vector2(fwd ? t.Pos.x : t.Pos.x + NodeW, ty);
+
+            float k   = Mathf.Max(40f, Mathf.Abs(b.x - a.x) * 0.5f);
+            float dir = fwd ? 1f : -1f;
+            c1 = new Vector2(a.x + k * dir, a.y);
+            c2 = new Vector2(b.x - k * dir, b.y);
+        }
+
+        private static void StrokeDashed(Painter2D p, Vector2 a, Vector2 c1, Vector2 c2, Vector2 b)
+        {
+            const int n = 26;
+            var prev = a;
+            for (int i = 1; i <= n; i++)
+            {
+                float t = i / (float)n;
+                var cur = Bez(a, c1, c2, b, t);
+                if (i % 2 == 1)
+                {
+                    p.BeginPath();
+                    p.MoveTo(prev);
+                    p.LineTo(cur);
+                    p.Stroke();
+                }
+                prev = cur;
+            }
+        }
+
+        private static void DrawArrow(Painter2D p, Vector2 tip, Vector2 dirIn)
+        {
+            var dir = dirIn.normalized;
+            if (dir == Vector2.zero) dir = Vector2.right;
+            var perp = new Vector2(-dir.y, dir.x);
+
+            const float len = 10f, half = 5f;
+            var bc = tip - dir * len;
+            var l  = bc + perp * half;
+            var r  = bc - perp * half;
+
+            p.BeginPath();
+            p.MoveTo(tip);
+            p.LineTo(l);
+            p.LineTo(r);
+            p.ClosePath();
+            p.Fill();
+        }
+
+        private static Vector2 Bez(Vector2 a, Vector2 c1, Vector2 c2, Vector2 b, float t)
+        {
+            float u = 1f - t;
+            return u * u * u * a + 3f * u * u * t * c1 + 3f * u * t * t * c2 + t * t * t * b;
+        }
+
+        // ============================================================ pan / zoom / fit
+
+        private void RegisterPanZoom()
+        {
+            _graphViewport.RegisterCallback<WheelEvent>(OnWheel);
+            _graphViewport.RegisterCallback<PointerDownEvent>(OnPointerDown);
+            _graphViewport.RegisterCallback<PointerMoveEvent>(OnPointerMove);
+            _graphViewport.RegisterCallback<PointerUpEvent>(OnPointerUp);
+        }
+
+        private void OnWheel(WheelEvent e)
+        {
+            if (_graphContent == null) return;
+
+            var mouse = (Vector2)e.localMousePosition;
+            float old = _zoom;
+            float nz  = Mathf.Clamp(old * (1f - e.delta.y * 0.06f), 0.3f, 2.2f);
+            if (Mathf.Approximately(nz, old)) return;
+
+            var pos   = _pan;
+            var pivot = (mouse - pos) / old;             // точка под курсором остаётся на месте
+            _pan  = mouse - pivot * nz;
+            _zoom = nz;
+            ApplyContentTransform();
+
+            e.StopPropagation();
+        }
+
+        private void OnPointerDown(PointerDownEvent e)
+        {
+            if (e.button != 0 && e.button != 2) return;
+            _panning = true;
+            _panStartMouse   = (Vector2)e.localPosition;
+            _panStartContent = _pan;
+            _graphViewport.CapturePointer(e.pointerId);
+        }
+
+        private void OnPointerMove(PointerMoveEvent e)
+        {
+            if (!_panning) return;
+            var d = (Vector2)e.localPosition - _panStartMouse;
+            _pan = _panStartContent + d;
+            ApplyContentTransform();
+        }
+
+        private void OnPointerUp(PointerUpEvent e)
+        {
+            if (!_panning) return;
+            _panning = false;
+            if (_graphViewport.HasPointerCapture(e.pointerId))
+                _graphViewport.ReleasePointer(e.pointerId);
+        }
+
+        private void FitView()
+        {
+            if (_graphContent == null) return;
+
+            var vp = _graphViewport.contentRect;
+            float cw = _contentSize.x, ch = _contentSize.y;
+            if (vp.width <= 1f || vp.height <= 1f || cw <= 1f || ch <= 1f) return;
+
+            float z = Mathf.Clamp(Mathf.Min(vp.width / cw, vp.height / ch), 0.3f, 1.5f);
+            _zoom = z;
+
+            var pos = new Vector2((vp.width - cw * z) / 2f, (vp.height - ch * z) / 2f);
+            if (pos.x < 0f) pos.x = 0f;
+            if (pos.y < 0f) pos.y = 0f;
+            _pan = pos;
+            ApplyContentTransform();
+        }
+
+        // style.translate / style.scale; transform-origin: top left у .nav-graph-content (см. USS).
+        private void ApplyContentTransform()
+        {
+            if (_graphContent == null) return;
+            _graphContent.style.translate = new Translate(_pan.x, _pan.y, 0f);
+            _graphContent.style.scale     = new Scale(new Vector2(_zoom, _zoom));
+        }
+
+        // ============================================================ reflection (общая для графа и Generation)
+
+        private static Type ResolveType(params string[] names)
+        {
+            foreach (var nm in names)
+            {
+                if (_typeCache.TryGetValue(nm, out var cached))
+                {
+                    if (cached != null) return cached;
+                    continue;
+                }
+
+                Type found = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try { found = asm.GetType(nm, false); } catch { /* ignore */ }
+                    if (found != null) break;
+                }
+
+                if (found == null)   // fallback: по короткому имени
+                {
+                    var simple = nm.Contains('.') ? nm.Substring(nm.LastIndexOf('.') + 1) : nm;
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        Type[] types;
+                        try { types = asm.GetTypes(); } catch { continue; }
+                        foreach (var t in types) if (t.Name == simple) { found = t; break; }
+                        if (found != null) break;
+                    }
+                }
+
+                _typeCache[nm] = found;
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        private static VisualTreeAsset ReadVisualTree(Component c)
+        {
+            if (c == null) return null;
+            var t = c.GetType();
+            if (!_vtaFieldCache.TryGetValue(t, out var f))
+            {
+                f = FindField(t, "visualTree", typeof(VisualTreeAsset));
+                _vtaFieldCache[t] = f;
+            }
+            return f?.GetValue(c) as VisualTreeAsset;
+        }
+
+        private static string ReadStringField(Component c, string preferred)
+        {
+            if (c == null) return null;
+            var t = c.GetType();
+            if (!_idFieldCache.TryGetValue(t, out var f))
+            {
+                f = FindField(t, preferred, typeof(string));
+                _idFieldCache[t] = f;
+            }
+            return f?.GetValue(c) as string;
+        }
+
+        // Ищем приватное сериализованное поле по имени, затем по типу (с базовыми классами).
+        private static FieldInfo FindField(Type t, string preferred, Type fieldType)
+        {
+            const BindingFlags flags =
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly;
+
+            for (var cur = t; cur != null && cur != typeof(MonoBehaviour) && cur != typeof(object); cur = cur.BaseType)
+            {
+                var f = cur.GetField(preferred, flags);
+                if (f != null && fieldType.IsAssignableFrom(f.FieldType)) return f;
+            }
+
+            // fallback по типу (для string дополнительно требуем "id" в имени)
+            for (var cur = t; cur != null && cur != typeof(MonoBehaviour) && cur != typeof(object); cur = cur.BaseType)
+            {
+                foreach (var f in cur.GetFields(flags))
+                {
+                    if (!fieldType.IsAssignableFrom(f.FieldType)) continue;
+                    if (fieldType == typeof(string) &&
+                        f.Name.IndexOf("id", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    return f;
+                }
+            }
+            return null;
+        }
+    }
+}

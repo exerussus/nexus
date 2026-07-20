@@ -1,0 +1,101 @@
+using System;
+using System.IO;
+using Dsl.Compilation;
+using Dsl.Semantics;
+using Dsl.Text;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Владелец данных API-манифеста. Состоянием владеет страница (стор — её поле).
+    // Держит: stub-реестр для компиляции (ApiManifest.Import), распарсенную модель для
+    // подсветки/автокомплита и путь к оригиналу для авто-обновления копии по timestamp.
+    public sealed class ApiManifestStore
+    {
+        private readonly string _copyPath;      // UserSettings/.../salamander-api.json
+        private DateTime _copiedStampUtc;       // штамп оригинала на момент копирования
+        private string _json;                   // последний валидный манифест — для RebuildRegistry
+
+        public HostRegistry Registry { get; private set; } = new HostRegistry();
+        public int ApiVersion { get; private set; } = 1;
+        public SalApiModel Model { get; private set; }
+        public string SourcePath;               // персистится страницей в prefs.json
+        public bool HasManifest => Model != null;
+        public event Action Changed;
+
+        public ApiManifestStore(string copyPath) => _copyPath = copyPath;
+
+        // Подъём копии из UserSettings (OnEnter/OnRefresh). SourcePath должен быть присвоен ДО вызова.
+        public void LoadFromUserSettings()
+        {
+            if (!File.Exists(_copyPath)) return;
+            try
+            {
+                ApplyJson(File.ReadAllText(_copyPath));
+                _copiedStampUtc = SafeStamp(SourcePath);
+            }
+            catch { /* битая копия — остаёмся на пустом реестре, статус покажет компиляция */ }
+        }
+
+        // Импорт внешнего файла: сначала валидация ApplyJson, только потом копирование —
+        // битый файл никогда не затирает рабочую копию.
+        public bool ImportExternal(string sourcePath, out string error)
+        {
+            error = null;
+            try
+            {
+                string json = File.ReadAllText(sourcePath);
+                ApplyJson(json);
+                Directory.CreateDirectory(Path.GetDirectoryName(_copyPath));
+                File.WriteAllText(_copyPath, json);
+                SourcePath = sourcePath;
+                _copiedStampUtc = SafeStamp(sourcePath);
+                return true;
+            }
+            catch (Exception e)
+            {
+                error = e.Message;
+                return false;
+            }
+        }
+
+        // Низкочастотный опрос из насоса: оригинал стал новее копии → тихо перечитать.
+        public void PollExternalChange()
+        {
+            if (string.IsNullOrEmpty(SourcePath) || !File.Exists(SourcePath)) return;
+            DateTime stamp = File.GetLastWriteTimeUtc(SourcePath);
+            if (stamp <= _copiedStampUtc) return;
+            if (!ImportExternal(SourcePath, out _))
+                _copiedStampUtc = stamp; // битую версию не долбим каждые 2 секунды
+        }
+
+        private void ApplyJson(string json)
+        {
+            Registry = ApiManifest.Import(json, out int v); // может бросить — ловит вызывающий
+            ApiVersion = v;
+            _json = json;
+            Model = SalApiModel.Parse(json);
+            Changed?.Invoke();
+        }
+
+        // Компиляцию прервали (Thread.Abort) посреди работы с реестром — объект подозрителен,
+        // пересобираем из кэшированного JSON. Модель и событие Changed не трогаем: они не менялись.
+        public void RebuildRegistry()
+        {
+            try
+            {
+                Registry = string.IsNullOrEmpty(_json)
+                    ? new HostRegistry()
+                    : ApiManifest.Import(_json, out _);
+            }
+            catch
+            {
+                Registry = new HostRegistry();
+            }
+        }
+
+        private static DateTime SafeStamp(string path) =>
+            !string.IsNullOrEmpty(path) && File.Exists(path)
+                ? File.GetLastWriteTimeUtc(path)
+                : DateTime.MinValue;
+    }
+}

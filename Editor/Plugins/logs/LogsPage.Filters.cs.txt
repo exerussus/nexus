@@ -1,0 +1,261 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.Logs
+{
+    public sealed partial class LogsPage
+    {
+        // ---- UI чипов-тегов (владеет только этот partial) ----
+        private VisualElement _tagBar;
+        private VisualElement _tagChips;
+        private Button        _clearTagsBtn;
+        private List<string>  _lastTagSet = new();
+        private readonly Dictionary<string, Button> _tagBtns = new();
+        private Button        _sessionBtn;   // переключатель «только эта сессия» (строится в BuildFilterBar)
+
+        // -------------------------------------------------------- переключатели сбора
+
+        private void BuildCollectBar()
+        {
+            var bar = new VisualElement();
+            bar.AddToClassList("logc-bar");
+
+            var label = new Label("Сбор");
+            label.AddToClassList("logc-bar-label");
+            label.tooltip = "Какие уровни захватываются в бокс. " +
+                            "Выключенный уровень не сохраняется (влияет только на новые логи).";
+            _dimLabels.Add(label);
+            bar.Add(label);
+
+            foreach (var g in AllGroups)
+            {
+                var captured = g;
+                var btn = MakeLevelButton(g, () => ToggleCollect(captured));   // LogsPage.Theme.cs
+                _collectBtns[g] = btn;
+                bar.Add(btn);
+            }
+
+            _root.Add(bar);
+        }
+
+        private void ToggleCollect(LogGroup g)
+        {
+            var on = !LogCollector.Collects(g);
+            LogCollector.SetCollect(g, on);
+            SetThemedOn(_collectBtns[g], on);
+            Context.SetStatus(
+                on ? $"Теперь собираются логи: {GroupLabel(g)}."
+                   : $"Сбор {GroupLabel(g)} остановлен (уже собранные остаются).",
+                StatusKind.Info);
+        }
+
+        // ----------------------------------------------------------- переключатели показа
+
+        private void BuildFilterBar()
+        {
+            var bar = new VisualElement();
+            bar.AddToClassList("logc-bar");
+
+            var label = new Label("Показ");
+            label.AddToClassList("logc-bar-label");
+            label.tooltip = "Какие собранные уровни видны ниже.";
+            _dimLabels.Add(label);
+            bar.Add(label);
+
+            foreach (var g in AllGroups)
+            {
+                var captured = g;
+                var btn = MakeLevelButton(g, () => ToggleShow(captured));
+                _showBtns[g] = btn;
+                bar.Add(btn);
+            }
+
+            _sessionBtn = MakeButton("Последняя сессия", ToggleLastSession);   // LogsPage.Theme.cs
+            _sessionBtn.tooltip =
+                "Показывать только последний Play-прогон. В Play — текущий прогон; в Edit mode — " +
+                "остаётся самый недавний (логи собираются только во время Play).";
+            bar.Add(_sessionBtn);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("logc-spacer");
+            bar.Add(spacer);
+
+            _searchField = new TextField { value = _search };
+            _searchField.AddToClassList("logc-search");
+            _searchField.tooltip = "Фильтр по тексту сообщения";
+            _searchField.RegisterValueChangedCallback(evt =>
+            {
+                _search = evt.newValue ?? string.Empty;
+                SaveViewState();
+                RebuildList();
+                UpdateCounts();
+            });
+            bar.Add(_searchField);
+
+            _root.Add(bar);
+        }
+
+        private void ToggleShow(LogGroup g)
+        {
+            _showMask ^= (1 << (int)g);
+            SetThemedOn(_showBtns[g], (_showMask & (1 << (int)g)) != 0);
+            SaveViewState();
+            RebuildList();
+            UpdateCounts();
+        }
+
+        private void ToggleLastSession()
+        {
+            _lastSessionOnly = !_lastSessionOnly;
+            SetThemedOn(_sessionBtn, _lastSessionOnly);
+            SaveViewState();
+            RebuildList();
+            UpdateCounts();
+        }
+
+        // ------------------------------------------------------------- чипы тегов
+
+        private void BuildTagBar()
+        {
+            _tagBar = new VisualElement();
+            _tagBar.AddToClassList("logc-bar");
+            _tagBar.AddToClassList("logc-tagbar");
+
+            var label = new Label("Теги");
+            label.AddToClassList("logc-bar-label");
+            label.tooltip = "Найдены из токенов [...]. Клик — фильтр (совпадение по любому выбранному тегу).";
+            _dimLabels.Add(label);
+            _tagBar.Add(label);
+
+            _tagChips = new VisualElement();
+            _tagChips.AddToClassList("logc-chips");
+            _tagBar.Add(_tagChips);
+
+            _clearTagsBtn = MakeButton("Сбросить теги", ClearActiveTags);   // LogsPage.Theme.cs
+            _clearTagsBtn.style.display = DisplayStyle.None;
+            _tagBar.Add(_clearTagsBtn);
+
+            _root.Add(_tagBar);
+        }
+
+        /// <summary>Пересобирает чипы, только когда набор известных тегов реально изменился
+        /// (теги появляются/исчезают на лету, пока буфер наполняется и подрезается).</summary>
+        private void RebuildTagBarIfChanged()
+        {
+            var tags = LogCollector.GetTags();
+
+            if (!TagListEqual(tags, _lastTagSet))
+            {
+                _lastTagSet = tags;
+                _tagChips.Clear();
+                _tagBtns.Clear();
+
+                foreach (var t in tags)
+                {
+                    var captured = t;
+                    var btn = new Button(() => ToggleTag(captured)) { text = t };
+                    btn.AddToClassList("logc-chip");
+                    // чип, чей текст называет уровень, регистрируем с уровнем — для подкраски рамки
+                    if (LogParser.TryLevelTag(t, out var lg))
+                        RegisterThemed(btn, ThemeRole.Chip, track: false, hasLevel: true, level: lg);
+                    else
+                        RegisterThemed(btn, ThemeRole.Chip, track: false);
+                    _tagBtns[t] = btn;
+                    _tagChips.Add(btn);
+                }
+
+                // убрать активные фильтры для тегов, которых больше нет
+                _activeTags.RemoveWhere(a =>
+                    !tags.Exists(x => string.Equals(x, a, StringComparison.OrdinalIgnoreCase)));
+            }
+
+            UpdateTagChipVisuals();
+        }
+
+        private void ToggleTag(string tag)
+        {
+            if (!_activeTags.Remove(tag))
+                _activeTags.Add(tag);
+
+            UpdateTagChipVisuals();
+            SaveViewState();
+            RebuildList();
+            UpdateCounts();
+        }
+
+        private void ClearActiveTags()
+        {
+            _activeTags.Clear();
+            UpdateTagChipVisuals();
+            SaveViewState();
+            RebuildList();
+            UpdateCounts();
+        }
+
+        private void UpdateTagChipVisuals()
+        {
+            foreach (var kv in _tagBtns)
+            {
+                var on = _activeTags.Contains(kv.Key);
+                SetThemedOn(kv.Value, on);
+
+                var n = LogCollector.TagCount(kv.Key);
+                var text = n > 0 ? $"{kv.Key}  {n}" : kv.Key;
+                if (kv.Value.text != text) kv.Value.text = text;
+            }
+
+            if (_clearTagsBtn != null)
+                _clearTagsBtn.style.display =
+                    _activeTags.Count > 0 ? DisplayStyle.Flex : DisplayStyle.None;
+        }
+
+        private static bool TagListEqual(List<string> a, List<string> b)
+        {
+            if (a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+                if (!string.Equals(a[i], b[i], StringComparison.Ordinal)) return false;
+            return true;
+        }
+
+        // ------------------------------------------------------------- predicate
+
+        /// <summary>true, если запись проходит текущие фильтры показа
+        /// (маска уровней + выбор тегов [ИЛИ] + текстовый поиск).</summary>
+        private bool Passes(LogEntry e)
+        {
+            if (_lastSessionOnly && e.session != LogCollector.LastSession) return false;
+
+            if ((_showMask & (1 << e.group)) == 0) return false;
+
+            if (_activeTags.Count > 0)
+            {
+                bool any = false;
+                if (e.tags != null)
+                    foreach (var t in e.tags)
+                        if (_activeTags.Contains(t)) { any = true; break; }
+                if (!any) return false;
+            }
+
+            if (!string.IsNullOrEmpty(_search))
+            {
+                bool inMsg = (e.message ?? string.Empty)
+                    .IndexOf(_search, StringComparison.OrdinalIgnoreCase) >= 0;
+                bool inRaw = (e.raw ?? string.Empty)
+                    .IndexOf(_search, StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!inMsg && !inRaw) return false;
+            }
+
+            return true;
+        }
+
+        private int VisibleCount()
+        {
+            int n = 0;
+            foreach (var e in _all)
+                if (Passes(e)) n++;
+            return n;
+        }
+    }
+}

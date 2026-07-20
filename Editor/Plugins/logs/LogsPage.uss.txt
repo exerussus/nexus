@@ -1,0 +1,248 @@
+/* ============================================================
+   LogsPage.uss — раскладка страницы «Сборщик логов» Nexus.
+   ТОЛЬКО геометрия/типографика. Все цвета ставятся в C# через
+   Context.Theme.Get(token) (страница не видит ассембли Theme),
+   поэтому здесь нет color / background-color / border-color.
+   Префикс: logc-
+   ============================================================ */
+
+.logc-page {
+    flex-grow: 1;
+}
+
+/* ===== Верхний тулбар ===== */
+.logc-toolbar {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.logc-title {
+    -unity-font-style: bold;
+    font-size: 13px;
+}
+
+.logc-count {
+    margin-left: 10px;
+    font-size: 10px;
+}
+
+.logc-spacer {
+    flex-grow: 1;
+}
+
+.logc-font {
+    width: 22px;
+    margin-left: 6px;
+    -unity-text-align: middle-center;
+    font-size: 10px;
+}
+
+.logc-inline-label {
+    margin: 0 4px 0 6px;
+    font-size: 10px;
+}
+
+.logc-cap-field {
+    width: 64px;
+    margin-right: 6px;
+}
+.logc-cap-field .unity-base-text-field__input {
+    border-radius: 6px;
+}
+
+/* ===== Базовая кнопка-пилюля ===== */
+.logc-btn {
+    height: 22px;
+    padding: 0 12px;
+    margin-left: 6px;
+    border-width: 1px;
+    border-radius: 11px;
+    font-size: 11px;
+    -unity-font-style: bold;
+}
+
+/* ===== Бары фильтра / сбора ===== */
+.logc-bar {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 4px;
+}
+
+.logc-bar-label {
+    width: 54px;
+    flex-shrink: 0;
+    font-size: 10px;
+    -unity-font-style: bold;
+}
+
+/* ===== Пилюли уровней (Сбор / Показ) ===== */
+.logc-pill {
+    height: 20px;
+    padding: 0 10px;
+    margin-right: 4px;
+    border-width: 1px;
+    border-radius: 10px;
+    font-size: 10px;
+    -unity-font-style: bold;
+}
+
+/* ===== Поиск ===== */
+.logc-search {
+    width: 200px;
+    margin-left: 6px;
+}
+.logc-search .unity-base-text-field__input {
+    border-radius: 6px;
+}
+
+/* ===== Чипы тегов ===== */
+.logc-tagbar {
+    margin-bottom: 8px;
+}
+
+.logc-chips {
+    flex-direction: row;
+    flex-wrap: wrap;
+    flex-grow: 1;
+}
+
+.logc-chip {
+    height: 18px;
+    padding: 0 8px;
+    margin: 0 4px 3px 0;
+    border-width: 1px;
+    border-radius: 9px;
+    font-size: 10px;
+}
+
+/* ===== Список логов ===== */
+.logc-list {
+    flex-grow: 1;
+    border-width: 1px;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+.logc-empty,
+.logc-more {
+    margin: 8px 4px;
+    font-size: 11px;
+    white-space: normal;
+}
+.logc-empty {
+    -unity-text-align: middle-center;
+}
+
+/* ===== Строка ===== */
+.logc-row {
+    margin: 2px 0;
+    padding: 3px 6px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-left-width: 3px;
+}
+
+/* первая строка прогона — выделяется как разделитель сессии */
+.logc-row--session-start {
+    border-top-width: 2px;
+    margin-top: 6px;
+}
+
+.logc-row-head {
+    flex-direction: row;
+    align-items: center;
+}
+
+.logc-time {
+    width: 60px;
+    flex-shrink: 0;
+    font-size: 10px;
+}
+
+/* ===== Бейдж уровня ===== */
+.logc-badge {
+    flex-shrink: 0;
+    margin-right: 6px;
+    padding: 1px 7px;
+    border-radius: 8px;
+    font-size: 9px;
+    -unity-font-style: bold;
+}
+
+/* ===== Счётчик схлопывания (×N) ===== */
+.logc-count-chip {
+    flex-shrink: 0;
+    margin-right: 6px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    -unity-font-style: bold;
+}
+
+/* ===== Чипы тегов в строке (только отображение) ===== */
+.logc-rowtag {
+    flex-shrink: 0;
+    margin-right: 4px;
+    padding: 0 6px;
+    border-radius: 7px;
+    border-width: 1px;
+    font-size: 9px;
+}
+
+/* ===== Сообщение ===== */
+.logc-msg {
+    flex-grow: 1;
+    flex-shrink: 1;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ===== Раскрытые детали ===== */
+.logc-detail {
+    margin-top: 4px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border-width: 1px;
+}
+
+.logc-detail-msg {
+    margin-bottom: 6px;
+    font-size: 11px;
+    white-space: normal;
+}
+
+.logc-trace {
+    flex-direction: column;
+}
+
+.logc-frame {
+    padding: 1px 0;
+    font-size: 10px;
+    white-space: normal;
+}
+.logc-frame--link {
+    cursor: link;
+}
+
+.logc-trace-raw {
+    font-size: 10px;
+    white-space: normal;
+}
+.logc-trace-none {
+    font-size: 10px;
+    -unity-font-style: italic;
+}
+
+.logc-detail-actions {
+    flex-direction: row;
+    margin-top: 8px;
+}
+.logc-detail-actions .logc-btn {
+    margin-left: 0;
+    margin-right: 6px;
+    height: 20px;
+}

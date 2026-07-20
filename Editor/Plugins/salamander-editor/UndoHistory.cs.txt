@@ -1,0 +1,57 @@
+using System;
+using System.Collections.Generic;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // История правок для Ctrl+Z / Ctrl+Y: снапшоты полного текста со склейкой слитного
+    // набора в один шаг. Владелец — CodeEditorElement; запись только из пользовательских
+    // правок (undo/redo и программная загрузка текста историю не пишут).
+    internal sealed class UndoHistory
+    {
+        public int Capacity = 100;            // память ≈ Capacity × размер файла
+        public double CoalesceSeconds = 0.7;  // пауза набора, начинающая новый undo-шаг
+
+        private readonly List<string> _undo = new List<string>();
+        private readonly List<string> _redo = new List<string>();
+        private double _lastEditAt = double.NegativeInfinity;
+
+        // Зовётся ПЕРЕД применением правки (before — текст до неё). Слитный набор
+        // (|delta| == 1 без пауз) склеивается; паста/автокомплит/автоскобки — всегда новый шаг.
+        public void RecordEdit(string before, int delta, double now)
+        {
+            _redo.Clear(); // новая правка обрывает ветку redo — классика
+            bool newStep = now - _lastEditAt > CoalesceSeconds || Math.Abs(delta) != 1 || _undo.Count == 0;
+            _lastEditAt = now;
+            if (!newStep) return;
+            _undo.Add(before ?? "");
+            if (_undo.Count > Capacity) _undo.RemoveAt(0);
+        }
+
+        public bool TryUndo(string current, out string restored)
+        {
+            restored = null;
+            if (_undo.Count == 0) return false;
+            restored = _undo[_undo.Count - 1];
+            _undo.RemoveAt(_undo.Count - 1);
+            _redo.Add(current ?? "");
+            return true;
+        }
+
+        public bool TryRedo(string current, out string restored)
+        {
+            restored = null;
+            if (_redo.Count == 0) return false;
+            restored = _redo[_redo.Count - 1];
+            _redo.RemoveAt(_redo.Count - 1);
+            _undo.Add(current ?? "");
+            return true;
+        }
+
+        public void Reset()
+        {
+            _undo.Clear();
+            _redo.Clear();
+            _lastEditAt = double.NegativeInfinity;
+        }
+    }
+}

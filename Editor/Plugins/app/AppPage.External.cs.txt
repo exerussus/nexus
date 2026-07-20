@@ -1,0 +1,230 @@
+// ============================================================
+//  AppPage.External.cs — вкладка «External files».
+//
+//  AppPage — обслуживающая (servicing) страница Nexus: её рабочий продукт живёт ВНЕ
+//  плагина (в Assets/App/...), потребляется игрой напрямую и потому ОБЯЗАН переживать
+//  отключение страницы. Nexus сам этот внешний след не трогает. Поэтому страница владеет
+//  им явно: показывает статус с полными путями (из AppPaths) и даёт очистку, ограниченную
+//  ровно теми файлами, которые она генерирует.
+//
+//  Классификация следа:
+//    • generated — чисто-генерируемые выходы (перезаписываются на Apply/Generate):
+//                    Navigation.uss, NavTargets.cs, NavigationName.cs.
+//                    ТОЛЬКО их разрешено удалять кнопкой Clean.
+//    • config    — NavigationData / NavigationSetting: создаются страницей, но хранят
+//                    отредактированные данные (id, entries, аффиксы) → не трогаем.
+//    • authored  — скаффолд + рукопись: контейнеры, AppStyle/AppTheme/App Settings,
+//                    UISoundLibrary, Assets/App/Pages|Popups. Только статус.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        private enum ExtKind { Generated, Config, Authored }
+
+        private sealed class ExtEntry
+        {
+            public string  Label;
+            public string  Path;
+            public ExtKind Kind;
+            public bool    IsFolder;
+        }
+
+        // ----------------------------------------------------- UI поля
+        private ScrollView _extList;
+        private Label      _extStatus;
+        private Button     _extCleanBtn;
+
+        // ============================================================ UI
+
+        private void BuildExternalFilesTab()
+        {
+            var toolbar = new VisualElement();
+            toolbar.AddToClassList("nav-toolbar");
+
+            var title = new Label("External files");
+            title.AddToClassList("nav-page-title");
+            toolbar.Add(title);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+            toolbar.Add(spacer);
+
+            var refreshBtn = new Button(RefreshExternalFiles) { text = "Refresh" };
+            refreshBtn.AddToClassList("nav-btn");
+            toolbar.Add(refreshBtn);
+
+            _extCleanBtn = new Button(CleanGeneratedOutputs) { text = "Clean generated outputs" };
+            _extCleanBtn.AddToClassList("nav-btn");
+            _extCleanBtn.tooltip =
+                "Deletes ONLY the regenerable outputs (Navigation.uss, NavTargets.cs, NavigationName.cs). " +
+                "Authored & config data — NavigationData, NavigationSetting, containers, theme, page/popup UXML — " +
+                "is never touched.";
+            toolbar.Add(_extCleanBtn);
+
+            _extRoot.Add(toolbar);
+
+            var desc = new Label(
+                "This page is a servicing tool: the files it produces live outside Nexus and are consumed by the " +
+                "game directly, so disabling the page never deletes them. Listed below with full paths and live " +
+                "status. \"Clean\" removes only the regenerated outputs — everything you authored stays.");
+            desc.AddToClassList("nav-gen-desc");
+            _extRoot.Add(desc);
+
+            _extStatus = new Label(string.Empty);
+            _extStatus.AddToClassList("nav-tpl-status");
+            _extRoot.Add(_extStatus);
+
+            _extList = new ScrollView(ScrollViewMode.Vertical);
+            _extList.AddToClassList("nav-tpl-list");
+            _extRoot.Add(_extList);
+
+            RefreshExternalFiles();
+        }
+
+        // ============================================================ refresh
+
+        private void RefreshExternalFiles()
+        {
+            if (_extList == null) return;
+            _extList.Clear();
+
+            var entries = CollectExternalEntries();
+
+            int present = 0, generatedPresent = 0;
+            foreach (var e in entries)
+            {
+                bool exists = e.IsFolder ? AssetDatabase.IsValidFolder(e.Path) || Directory.Exists(e.Path)
+                                         : File.Exists(e.Path);
+                if (exists) present++;
+                if (exists && e.Kind == ExtKind.Generated) generatedPresent++;
+
+                _extList.Add(MakeExtRow(e, exists));
+            }
+
+            if (_extCleanBtn != null)
+                _extCleanBtn.SetEnabled(generatedPresent > 0);
+
+            if (_extStatus != null)
+                _extStatus.text =
+                    $"{present}/{entries.Count} artifact(s) present. " +
+                    $"{generatedPresent} regenerable output(s) on disk.";
+        }
+
+        // Полный список внешнего следа. Пути — из AppPaths, чтобы статус не разъезжался с генераторами.
+        private List<ExtEntry> CollectExternalEntries()
+        {
+            return new List<ExtEntry>
+            {
+                // --- generated (удаляемые Clean) ---
+                new() { Label = "Navigation.uss (generated)",   Path = AppPaths.NavUssPath,                              Kind = ExtKind.Generated },
+                new() { Label = "NavTargets.cs (generated)",     Path = $"{AppPaths.GenDir}/{AppPaths.UidFileName}.cs",   Kind = ExtKind.Generated },
+                new() { Label = "NavigationName.cs (generated)", Path = $"{AppPaths.GenDir}/{AppPaths.NameFileName}.cs",  Kind = ExtKind.Generated },
+
+                // --- config (создаётся страницей, хранит данные → не трогаем) ---
+                new() { Label = "NavigationData.asset (config)",    Path = AppPaths.NavigationDataPath, Kind = ExtKind.Config },
+                new() { Label = "NavigationSetting.asset (config)", Path = AppPaths.SettingPath,        Kind = ExtKind.Config },
+
+                // --- authored / scaffold (только статус) ---
+                new() { Label = "AppStyle.uss (authored)",       Path = AppPaths.AppStylePath,       Kind = ExtKind.Authored },
+                new() { Label = "AppTheme.tss (authored)",       Path = AppPaths.AppThemePath,       Kind = ExtKind.Authored },
+                new() { Label = "App Settings.asset (authored)", Path = AppPaths.AppSettingsPath,    Kind = ExtKind.Authored },
+                new() { Label = "AppStarter.uxml (authored)",    Path = AppPaths.AppStarterPath,     Kind = ExtKind.Authored },
+                new() { Label = "Default.uxml (authored)",       Path = AppPaths.DefaultTemplatePath, Kind = ExtKind.Authored },
+                new() { Label = "LoadingScreen.uxml (authored)", Path = AppPaths.LoadingScreenPath,  Kind = ExtKind.Authored },
+                new() { Label = "UISoundLibrary.asset (authored)", Path = AppPaths.UISoundLibraryPath, Kind = ExtKind.Authored },
+
+                new() { Label = "Pages root (authored)",  Path = AppPaths.PagesRoot,  Kind = ExtKind.Authored, IsFolder = true },
+                new() { Label = "Popups root (authored)", Path = AppPaths.PopupsRoot, Kind = ExtKind.Authored, IsFolder = true },
+            };
+        }
+
+        private VisualElement MakeExtRow(ExtEntry e, bool exists)
+        {
+            var row = new VisualElement();
+            row.AddToClassList("nav-tpl-row");
+
+            var id = new Label(e.Label);
+            id.AddToClassList("nav-tpl-id");
+            row.Add(id);
+
+            var path = new Label(e.Path);
+            path.AddToClassList("nav-tpl-path");
+            row.Add(path);
+
+            var state = new Label(exists ? (e.IsFolder ? "present" : "on disk") : "missing");
+            state.AddToClassList("nav-tpl-state");
+            state.AddToClassList(exists ? "nav-tpl-state--ok" : "nav-tpl-state--missing");
+            row.Add(state);
+
+            if (exists)
+            {
+                var pingPath = e.Path;
+                row.AddToClassList("nav-tpl-row--pingable");
+                row.RegisterCallback<PointerDownEvent>(_ =>
+                {
+                    var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(pingPath);
+                    if (obj != null) EditorGUIUtility.PingObject(obj);
+                });
+            }
+
+            return row;
+        }
+
+        // ============================================================ cleanup (только generated)
+
+        private void CleanGeneratedOutputs()
+        {
+            var targets = new List<string>();
+            foreach (var e in CollectExternalEntries())
+            {
+                if (e.Kind != ExtKind.Generated) continue;
+                if (File.Exists(e.Path)) targets.Add(e.Path);
+            }
+
+            if (targets.Count == 0)
+            {
+                Context.SetStatus("Nothing to clean — no generated outputs on disk.", StatusKind.Info);
+                RefreshExternalFiles();
+                return;
+            }
+
+            var msg =
+                "These regenerated files will be deleted:\n\n  " +
+                string.Join("\n  ", targets) +
+                "\n\nAuthored & config data (NavigationData, NavigationSetting, containers, theme, page/popup UXML) " +
+                "is NOT touched. You can recreate these via Apply / Generation. Proceed?";
+
+            if (!EditorUtility.DisplayDialog("App — clean generated outputs", msg, "Delete", "Cancel"))
+                return;
+
+            int deleted = 0;
+            var failed = new List<string>();
+            foreach (var path in targets)
+            {
+                bool ok = AssetDatabase.DeleteAsset(path);
+                if (ok) deleted++;
+                else failed.Add(path);
+            }
+
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            RefreshExternalFiles();
+
+            if (failed.Count == 0)
+                Context.SetStatus($"Cleaned {deleted} generated output(s).", StatusKind.Ok);
+            else
+                Context.SetStatus(
+                    $"Cleaned {deleted}; failed to delete: {string.Join(", ", failed)}.",
+                    StatusKind.Warning);
+        }
+    }
+}

@@ -1,0 +1,23 @@
+{
+    "schemaVersion": 1,
+    "guid": "10be084a784e4b39a54bf1814d86b8a9",
+    "id": "database",
+    "version": "1.0",
+    "typeName": "Exerussus.Nexus.Pages.DataBaseEditor.DataBasePage",
+    "display": {
+        "name": "DB",
+        "category": "Infrastructure",
+        "order": 0,
+        "icon": "d_ScriptableObject Icon"
+    },
+    "kind": "servicing",
+    "requires": [],
+    "deploy": [
+        { "from": "Exerussus.Nexus.Pages.DataBaseEditor.asmdef.txt", "to": "Exerussus.Nexus.Pages.DataBaseEditor.asmdef" },
+        { "from": "DataBasePage.cs.txt", "to": "DataBasePage.cs" },
+        { "from": "AutoGenSettings.cs.txt", "to": "AutoGenSettings.cs" },
+        { "from": "DataBaseScanner.cs.txt", "to": "DataBaseScanner.cs" },
+        { "from": "DataBaseCodeGenerator.cs.txt", "to": "DataBaseCodeGenerator.cs" },
+        { "from": "DataBaseAssetCreator.cs.txt", "to": "DataBaseAssetCreator.cs" }
+    ]
+}

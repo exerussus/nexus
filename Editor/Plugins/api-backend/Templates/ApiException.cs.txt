@@ -1,0 +1,43 @@
+using System;
+using UnityEngine.Networking;
+
+namespace ProjectApi
+{
+    /// <summary>
+    /// Ошибка обращения к API. Несёт HTTP-статус и сырое тело ответа,
+    /// чтобы вызывающий код мог разобрать ошибку по-человечески.
+    /// </summary>
+    public sealed class ApiException : Exception
+    {
+        /// <summary>HTTP-код ответа (0, если соединение вообще не состоялось).</summary>
+        public long StatusCode { get; }
+
+        /// <summary>Сырое тело ответа сервера (часто JSON с описанием ошибки).</summary>
+        public string ResponseBody { get; }
+
+        /// <summary>true — сеть/таймаут/протокол; false — сервер ответил ошибочным статусом.</summary>
+        public bool IsConnectionError { get; }
+
+        private ApiException(string message, long statusCode, string body, bool isConnectionError)
+            : base(message)
+        {
+            StatusCode = statusCode;
+            ResponseBody = body;
+            IsConnectionError = isConnectionError;
+        }
+
+        /// <summary>Собрать исключение из завершённого UnityWebRequest с ошибкой.</summary>
+        public static ApiException From(UnityWebRequest request)
+        {
+            var isConnection = request.result is
+                UnityWebRequest.Result.ConnectionError or
+                UnityWebRequest.Result.DataProcessingError;
+
+            var body = request.downloadHandler != null ? request.downloadHandler.text : null;
+            var message = $"API {request.method} {request.url} → " +
+                          $"{(long)request.responseCode} ({request.result}): {request.error}";
+
+            return new ApiException(message, request.responseCode, body, isConnection);
+        }
+    }
+}

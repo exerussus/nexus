@@ -1,0 +1,83 @@
+using Exerussus.Nexus.Abstractions;
+using Exerussus.Nexus.Services;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Logs
+{
+    /// <summary>
+    /// Образец constitutive-страницы. Лежит инертно в Plugins, при развёртке
+    /// компилируется в свою сборку Exerussus.Nexus.Pages.Logs (ссылается на
+    /// Abstractions + Services). ЗАВИСИТ от сервиса logformat (manifest.requires) —
+    /// и реально его зовёт: dependency-gate не даст развернуть страницу, если
+    /// сервиса нет, а компилятор не соберёт её код без сборки Services.
+    ///
+    /// Наследуется от EditorPageBase: Context и Track даёт база, подписка на шину
+    /// снимается сама в OnDispose.
+    /// </summary>
+    [EditorPage("logs", "Logs", PageCategory.Infrastructure, order: 20, icon: "d_UnityEditor.ConsoleWindow")]
+    public sealed class LogsPage : EditorPageBase
+    {
+        private Label _echo;
+
+        public override VisualElement BuildUI()
+        {
+            var root = new VisualElement { style = { flexGrow = 1f } };
+
+            // вызов сервиса logformat — доказывает, что зависимость живая;
+            // цвет берём из темы через Context (страница тематизируется, оставаясь изолированной)
+            root.Add(new Label(LogFormatService.Stamp("Logs page (M5 — service + theme)"))
+            {
+                style =
+                {
+                    unityFontStyleAndWeight = FontStyle.Bold,
+                    color = Context.Theme.Get(NexusToken.Accent),
+                },
+            });
+
+            _echo = new Label("ждём событие шины…") { style = { marginTop = 6f, color = Context.Theme.Get(NexusToken.TextDim) } };
+            root.Add(_echo);
+
+            // загрузка СОБСТВЕННОГО развёрнутого UXML по имени — путь резолвит хаб
+            // (страница не знает про State/<id>); если не нашёлся — мягко пропускаем
+            var tree = Context.LoadDeployedAsset<VisualTreeAsset>("LogsPage.uxml");
+            if (tree != null) root.Add(tree.Instantiate());
+
+            // подписка с авто-отпиской через Track; обработчик тоже зовёт сервис
+            Track(Context.Bus.Subscribe<string>(msg =>
+            {
+                if (_echo != null) _echo.text = LogFormatService.Stamp(msg);
+            }));
+
+            // типовые кнопки берём из фабрики по РОЛИ — единый стиль, без ручной раскраски
+            var actions = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 8f } };
+            actions.Add(Context.Ui.Button(NexusRole.Primary, "Publish ping",
+                () => Context.Bus.Publish("ping from Logs")));
+            actions.Add(Context.Ui.Button(NexusRole.Alarm, "Очистить",
+                () => { if (_echo != null) _echo.text = "—"; }));
+            actions.Add(Context.Ui.Badge(NexusRole.Success, "demo"));
+            root.Add(actions);
+
+            return root;
+        }
+
+        private int _focusCount;
+
+        // ось «активная вкладка»
+        public override void OnEnter() => Context.SetStatus("Logs активна (вкладка выбрана).", StatusKind.Info);
+        public override void OnExit()  => Context.SetStatus(string.Empty);
+
+        // ось «окно в фокусе при активной вкладке» — здесь возобновляют/останавливают
+        // высокочастотную работу (пуллинг, слежение за выделением)
+        public override void OnFocus()
+        {
+            _focusCount++;
+            if (_echo != null) _echo.text = LogFormatService.Stamp($"в фокусе — слежу (циклов: {_focusCount})");
+        }
+
+        public override void OnUnfocus()
+        {
+            if (_echo != null) _echo.text = LogFormatService.Stamp("фон — слежение приостановлено (вкладка ещё активна)");
+        }
+    }
+}

@@ -1,0 +1,184 @@
+using System;
+using System.Threading;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Debounce-насос с ФОНОВОЙ компиляцией (single-flight):
+    //   Snapshot (главный поток) → Work (выделенный поток) → Apply (главный поток).
+    // Главный поток никогда не ждёт компилятор — фризы «Hold on» при наборе исключены.
+    //
+    // Почему выделенный Thread, а не Task.Run: Unity не выгружает домен, пока в
+    // пользовательской сборке жив поток, — зависший воркер вешал бы КАЖДЫЙ рекомпайл
+    // C#/Apply/вход в Play на «Waiting for user code…». Поэтому воркер прерывается
+    // Thread.Abort: (а) по таймауту HangSeconds, (б) в beforeAssemblyReload/quitting.
+    // Dsl.Core — чистый managed-код, abort для него предсказуем; разделяемый реестр
+    // после аборта считается подозрительным (см. колбэк Aborted).
+    //
+    // На EditorApplication.update подписан только между OnFocus и OnUnfocus.
+    public sealed class CompileScheduler : IDisposable
+    {
+        public Func<object> Snapshot;        // main: собрать входы (быстро)
+        public Func<object, object> Work;    // worker: ТОЛЬКО чистый код, никакого Unity API
+        public Action<object> Apply;         // main: применить результат
+        public Action Poll;                  // main: низкочастотная проверка (манифест)
+        public Action Aborted;               // main: воркер прерван — пересобрать общие входы
+        public Action<string, bool> Report;  // main: проблема (сообщение, isError)
+
+        public double DebounceSeconds = 0.3; // единый источник правды для дебаунса
+        public double PollSeconds = 2.0;     // частота опроса манифеста
+        public double HangSeconds = 5.0;     // после этого зависший воркер прерывается
+
+        private bool _attached;
+        private bool _dirty;
+        private double _dueAt;
+        private double _nextPollAt;
+        private double _startedAt;
+
+        // Разделяется двумя потоками: воркер публикует Result/Error ДО volatile-записи Done,
+        // главный поток читает Done до Result — барьеров volatile достаточно.
+        private sealed class Job
+        {
+            public object Payload;
+            public Func<object, object> Work;
+            public Thread Thread;
+            public object Result;
+            public volatile string Error;
+            public volatile bool Done;
+        }
+
+        private Job _inflight;
+
+        public CompileScheduler()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += AbortInflight;
+            EditorApplication.quitting += AbortInflight;
+        }
+
+        public void Dispose()
+        {
+            Detach();
+            AbortInflight();
+            AssemblyReloadEvents.beforeAssemblyReload -= AbortInflight;
+            EditorApplication.quitting -= AbortInflight;
+        }
+
+        // Каждый вызов сдвигает дедлайн — компиляция стартует через Debounce после ПОСЛЕДНЕГО символа.
+        public void Request(bool now = false)
+        {
+            _dirty = true;
+            _dueAt = EditorApplication.timeSinceStartup + (now ? 0.0 : DebounceSeconds);
+        }
+
+        public void Attach()
+        {
+            if (_attached) return;
+            _attached = true;
+            _nextPollAt = EditorApplication.timeSinceStartup + PollSeconds;
+            EditorApplication.update += Pump;
+        }
+
+        public void Detach()
+        {
+            if (!_attached) return;
+            _attached = false;
+            EditorApplication.update -= Pump; // inflight не трогаем: доедет и применится на Attach
+        }
+
+        private void Pump()
+        {
+            double t = EditorApplication.timeSinceStartup;
+
+            // 1) итог фоновой компиляции → главный поток
+            if (_inflight != null)
+            {
+                if (_inflight.Done)
+                {
+                    var done = _inflight;
+                    _inflight = null;
+                    if (done.Error == null) Safe(() => Apply?.Invoke(done.Result));
+                    else Report?.Invoke($"Сбой компиляции: {done.Error}", true);
+                }
+                else if (t - _startedAt > HangSeconds)
+                {
+                    Report?.Invoke(
+                        $"Компилятор Salamander завис (> {HangSeconds:0} с) — поток прерван, " +
+                        "живая компиляция продолжает работу.", false);
+                    AbortInflight();
+                }
+            }
+
+            // 2) старт новой компиляции
+            if (_dirty && t >= _dueAt && _inflight == null)
+            {
+                object payload = null;
+                Safe(() => payload = Snapshot?.Invoke());
+                _dirty = false;
+                if (payload != null)
+                {
+                    _startedAt = t;
+                    var job = new Job
+                    {
+                        Payload = payload,
+                        Work = Work,
+                        Thread = new Thread(WorkerMain) { IsBackground = true, Name = "Salamander compile" },
+                    };
+                    _inflight = job;
+                    job.Thread.Start(job);
+                }
+            }
+
+            // 3) низкочастотный опрос
+            if (t >= _nextPollAt)
+            {
+                _nextPollAt = t + PollSeconds;
+                Safe(() => Poll?.Invoke());
+            }
+        }
+
+        private static void WorkerMain(object o)
+        {
+            var job = (Job)o;
+            try
+            {
+                job.Result = job.Work(job.Payload);
+            }
+            catch (ThreadAbortException)
+            {
+                job.Error = "прервано"; // штатно: зомби-таймаут или перезагрузка домена
+            }
+            catch (Exception e)
+            {
+                job.Error = e.Message;
+            }
+            finally
+            {
+                job.Done = true;
+            }
+        }
+
+        // Прервать текущую компиляцию: зомби-таймаут, перезагрузка домена, выход, Dispose.
+        // Повторный запуск ТОГО ЖЕ буфера не планируется: если пользователь печатал,
+        // _dirty уже взведён — следующая компиляция пойдёт с актуальным текстом.
+        private void AbortInflight()
+        {
+            var job = _inflight;
+            _inflight = null;
+            if (job == null) return;
+            try
+            {
+                if (job.Thread != null && job.Thread.IsAlive) job.Thread.Abort();
+            }
+            catch { /* поток мог успеть завершиться сам */ }
+            // компиляцию могли прервать посреди чтения реестра — владелец пересобирает входы
+            Safe(() => Aborted?.Invoke());
+        }
+
+        // Насос живёт вне песочницы хаба — исключения главного потока гасим сами.
+        private void Safe(Action a)
+        {
+            try { a(); }
+            catch (Exception e) { Report?.Invoke($"Ошибка страницы: {e.Message}", true); }
+        }
+    }
+}

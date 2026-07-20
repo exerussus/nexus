@@ -1,0 +1,187 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.Logs
+{
+    // Покраска по токенам. Страница не видит ассембли Theme, поэтому цвета берутся через
+    // Context.Theme.Get(token); USS оставлен только под раскладку. Hover/pressed/on-состояния
+    // (нет USS-псевдоклассов) разводятся pointer-колбэками — те же пару строк, что делает
+    // NexusStyles.MakePressable в движковом UI.
+    public sealed partial class LogsPage
+    {
+        private enum ThemeRole { Button, LevelPill, Chip }
+
+        private sealed class ThemeState
+        {
+            public ThemeRole role;
+            public bool      on;
+            public bool      hasLevel;
+            public LogGroup  level;
+            public bool      over;
+            public bool      down;
+        }
+
+        // Постоянные интерактивные элементы (тулбар/пилюли/кнопки) — перекрашиваются при смене
+        // палитры. Чипы тегов перестраиваются на лету и красятся через _tagBtns, сюда не идут.
+        private readonly List<VisualElement> _themed = new();
+
+        private Color Tok(NexusToken t) => Context.Theme.Get(t);
+
+        // Нет токенов «Info»/«Debug», поэтому берём семантически близкие (согласовано):
+        // Info -> Accent, Debug -> Muted.
+        private NexusToken LevelToken(LogGroup g) => g switch
+        {
+            LogGroup.Error   => NexusToken.Error,
+            LogGroup.Warning => NexusToken.Warning,
+            LogGroup.Info    => NexusToken.Accent,
+            LogGroup.Debug   => NexusToken.Muted,
+            _                => NexusToken.Accent,
+        };
+
+        // ---- общие сеттеры ----
+        private static void SetBg(VisualElement e, Color c) => e.style.backgroundColor = c;
+
+        private static void SetBorder(VisualElement e, Color c)
+        {
+            e.style.borderTopColor    = c;
+            e.style.borderRightColor  = c;
+            e.style.borderBottomColor = c;
+            e.style.borderLeftColor   = c;
+        }
+
+        // ---- фабрики интерактивных элементов ----
+        private Button MakeButton(string text, Action onClick)
+        {
+            var b = new Button(onClick) { text = text };
+            b.AddToClassList("logc-btn");
+            RegisterThemed(b, ThemeRole.Button, track: true);
+            return b;
+        }
+
+        private Button MakeLevelButton(LogGroup g, Action onClick)
+        {
+            var b = new Button(onClick) { text = GroupLabel(g) };
+            b.AddToClassList("logc-pill");
+            RegisterThemed(b, ThemeRole.LevelPill, track: true, hasLevel: true, level: g);
+            return b;
+        }
+
+        private void RegisterThemed(VisualElement e, ThemeRole role, bool track,
+                                    bool hasLevel = false, LogGroup level = LogGroup.Info)
+        {
+            var st = new ThemeState { role = role, hasLevel = hasLevel, level = level };
+            e.userData = st;
+            e.RegisterCallback<PointerEnterEvent>(_ => { st.over = true;  Recolor(e); });
+            e.RegisterCallback<PointerLeaveEvent>(_ => { st.over = false; st.down = false; Recolor(e); });
+            e.RegisterCallback<PointerDownEvent>(_ => { st.down = true;  Recolor(e); });
+            e.RegisterCallback<PointerUpEvent>(_   => { st.down = false; Recolor(e); });
+            if (track) _themed.Add(e);
+            Recolor(e);
+        }
+
+        private void SetThemedOn(VisualElement e, bool on)
+        {
+            if (e?.userData is ThemeState st) { st.on = on; Recolor(e); }
+        }
+
+        private void Recolor(VisualElement e)
+        {
+            if (e?.userData is not ThemeState st) return;
+            switch (st.role)
+            {
+                case ThemeRole.Button:    RecolorButton(e, st); break;
+                case ThemeRole.LevelPill: RecolorPill(e, st);   break;
+                case ThemeRole.Chip:      RecolorChip(e, st);   break;
+            }
+        }
+
+        private void RecolorButton(VisualElement e, ThemeState st)
+        {
+            if (st.on)
+            {
+                SetBg(e, Tok(NexusToken.Accent));
+                SetBorder(e, Tok(NexusToken.Accent));
+                e.style.color = Tok(NexusToken.BgHard);
+            }
+            else
+            {
+                var bg = st.down ? Tok(NexusToken.Pressed)
+                       : st.over ? Tok(NexusToken.Hover)
+                       :           Tok(NexusToken.BgRaised);
+                SetBg(e, bg);
+                SetBorder(e, Tok(NexusToken.Border));
+                e.style.color = Tok(NexusToken.TextNormal);
+            }
+        }
+
+        private void RecolorPill(VisualElement e, ThemeState st)
+        {
+            var lvl = Tok(LevelToken(st.level));
+            if (st.on)
+            {
+                SetBg(e, lvl);
+                SetBorder(e, lvl);
+                e.style.color = Tok(NexusToken.BgHard);
+            }
+            else
+            {
+                SetBg(e, st.over ? Tok(NexusToken.Hover) : Color.clear);
+                SetBorder(e, lvl);
+                e.style.color = lvl;
+            }
+        }
+
+        private void RecolorChip(VisualElement e, ThemeState st)
+        {
+            if (st.on)
+            {
+                SetBg(e, Tok(NexusToken.Accent));
+                SetBorder(e, Tok(NexusToken.Accent));
+                e.style.color = Tok(NexusToken.BgHard);
+            }
+            else
+            {
+                SetBg(e, st.over ? Tok(NexusToken.Hover) : Tok(NexusToken.BgRaised));
+                SetBorder(e, st.hasLevel ? Tok(LevelToken(st.level)) : Tok(NexusToken.Border));
+                e.style.color = Tok(NexusToken.TextDim);
+            }
+        }
+
+        // ---- статичная отделка (тулбары, поля, контейнер списка) ----
+        // Палитро-ивента в surface страницы нет, поэтому статику перекрашиваем заново в OnFocus.
+        private void ApplyStaticTheme()
+        {
+            if (_root == null) return;
+
+            if (_titleLabel != null) _titleLabel.style.color = Tok(NexusToken.Accent);
+            if (_countLabel != null) _countLabel.style.color = Tok(NexusToken.TextDim);
+            if (_fontLabel  != null) _fontLabel.style.color  = Tok(NexusToken.TextDim);
+            foreach (var l in _dimLabels) if (l != null) l.style.color = Tok(NexusToken.TextDim);
+
+            ThemeField(_capField);
+            ThemeField(_searchField);
+
+            if (_list != null)
+            {
+                SetBg(_list, Tok(NexusToken.BgHard));
+                SetBorder(_list, Tok(NexusToken.Border));
+            }
+
+            foreach (var e in _themed) Recolor(e);
+            foreach (var b in _tagBtns.Values) Recolor(b);   // _tagBtns — в LogsPage.Filters.cs
+        }
+
+        private void ThemeField(TextField f)
+        {
+            if (f == null) return;
+            var input = f.Q(className: "unity-base-text-field__input") ?? f.Q("unity-text-input");
+            var target = input ?? (VisualElement)f;
+            SetBg(target, Tok(NexusToken.BgHard));
+            SetBorder(target, Tok(NexusToken.Border));
+            target.style.color = Tok(NexusToken.TextNormal);
+        }
+    }
+}

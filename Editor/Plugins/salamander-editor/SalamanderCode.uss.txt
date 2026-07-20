@@ -1,0 +1,121 @@
+/* ============================================================================
+   SalamanderCode.uss — автономные стили кодовой области.
+   Токены темы Nexus сюда сознательно НЕ доходят: вся палитра кода (фон, базовый
+   текст, цвета подсветки, каретка, выделение, попап) живёт в ЭТОМ файле.
+   Правка внешнего вида кода = правка этого файла, без перекомпиляции.
+   ============================================================================ */
+
+.sal-code-editor {
+    flex-grow: 1;
+    background-color: #1E1E1E;
+
+    /* --- палитра подсветки: читается в C# через CustomStyleProperty --- */
+    --sal-comment: #6A9955;
+    --sal-string:  #CE9178;
+    --sal-number:  #B5CEA8;
+    --sal-keyword: #C586C0;
+    --sal-type:    #4EC9B0;
+    --sal-api:     #DCDCAA;
+    --sal-enum:    #4FC1FF;
+    --sal-member:  #9CDCFE;
+    --sal-func:    #DCDCAA;
+}
+
+.sal-code-scroll {
+    flex-grow: 1;
+}
+
+/* размер контейнера задаёт слой подсветки; поле ввода растянуто поверх */
+.sal-code-stack {
+}
+
+.sal-code-highlight {
+    color: #D4D4D4;              /* базовый цвет текста кода */
+    font-size: 13px;
+    white-space: pre;            /* без переносов: горизонталь скроллит ScrollView */
+    padding: 8px 12px;
+    margin: 0;
+}
+
+.sal-code-input {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0;
+}
+
+/* ВАЖНО: метрики (font-size, padding, white-space) обязаны байт-в-байт совпадать
+   с .sal-code-highlight — иначе каретка разъедется с подсветкой. */
+.sal-code-input > .unity-base-text-field__input {
+    background-color: rgba(0, 0, 0, 0);
+    border-width: 0;
+    border-radius: 0;
+    margin: 0;
+    padding: 8px 12px;
+    font-size: 13px;
+    white-space: pre;
+    color: rgba(0, 0, 0, 0);     /* текст поля невидим — виден только слой подсветки */
+    --unity-cursor-color: #FFFFFF;
+    --unity-selection-color: rgba(51, 153, 255, 0.35);
+}
+
+/* подчёркивание ошибок компиляции: геометрию ставит C#, вид — здесь */
+.sal-error-underline {
+    position: absolute;
+    height: 2px;
+    background-color: rgba(255, 80, 80, 0.9);
+}
+
+/* ---------------------------- попап автокомплита --------------------------- */
+
+.sal-popup {
+    position: absolute;
+    background-color: #252526;
+    border-width: 1px;
+    border-color: #454545;
+    min-width: 280px;
+    max-width: 560px;
+    max-height: 220px;
+}
+
+.sal-popup-item {
+    flex-direction: row;
+    align-items: center;
+    padding: 1px 8px;
+}
+
+.sal-popup-item-label {
+    color: #D4D4D4;
+    font-size: 12px;
+    margin-right: 12px;
+}
+
+.sal-popup-item-detail {
+    color: #808080;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 1;
+}
+
+/* цвет имени подсказки по виду (индексация — AutocompletePopup.KindClasses) */
+.sal-popup-kind-keyword { color: #C586C0; }
+.sal-popup-kind-type    { color: #4EC9B0; }
+.sal-popup-kind-class   { color: #4EC9B0; }
+.sal-popup-kind-api     { color: #DCDCAA; }
+.sal-popup-kind-method  { color: #DCDCAA; }
+.sal-popup-kind-event   { color: #DCDCAA; }
+.sal-popup-kind-enum    { color: #4FC1FF; }
+.sal-popup-kind-member  { color: #9CDCFE; }
+.sal-popup-kind-symbol  { color: #9CDCFE; }
+
+.sal-popup .unity-collection-view__item--selected {
+    background-color: #04395E;
+}
+
+.sal-popup .unity-collection-view__item:hover {
+    background-color: #2A2D2E;
+}

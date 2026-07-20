@@ -1,0 +1,92 @@
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    public sealed partial class ApiBackendPage
+    {
+        private void BuildDriftTab(VisualElement root)
+        {
+            Hint("Сравнивает спеку ВЫБРАННОГО профиля со снимком его последней генерации " +
+                 "и подсвечивает ломающие изменения. Линт показывает мусор на входе.", root);
+
+            BuildProfileSelector(root);
+
+            ActionButton(NexusRole.Primary, "Проанализировать", () => RunAnalysis(root), root);
+
+            var results = new VisualElement { name = "drift-results" };
+            root.Add(results);
+        }
+
+        private void RunAnalysis(VisualElement root)
+        {
+            var results = root.Q<VisualElement>("drift-results");
+            results.Clear();
+
+            var profile = SelectedProfile;
+            if (profile == null)
+            {
+                Context.SetStatus("Нет профилей — добавь на вкладке Profiles.", StatusKind.Error);
+                return;
+            }
+
+            var analysis = ApiCodegenEngine.Analyze(profile);
+
+            if (!analysis.Ok)
+            {
+                Line($"✗ {analysis.Fetch?.Error} {analysis.Fetch?.Diagnosis}".Trim(),
+                    NexusToken.Error, results);
+                Context.SetStatus($"«{profile.Name}»: спека недоступна.", StatusKind.Error);
+                return;
+            }
+
+            // --- Линт ---
+            var lintSection = Section($"Линт спеки ({analysis.Lint.Count})", results);
+            if (analysis.Lint.Count == 0)
+            {
+                Hint("Замечаний нет.", lintSection);
+            }
+            else
+            {
+                foreach (var f in analysis.Lint)
+                    Line($"[{f.Level}] {f.Where} — {f.Message}",
+                        f.Level == SpecLinter.Severity.Warning ? NexusToken.Warning : NexusToken.TextNormal,
+                        lintSection);
+            }
+
+            // --- Дрейф ---
+            var drift = analysis.Drift;
+            if (!drift.HasBaseline)
+            {
+                var note = Section("Дрейф", results);
+                Hint("Нет снимка прошлой генерации этого профиля — сравнивать не с чем. " +
+                     "Сгенерируй один раз во вкладке Generate.", note);
+                Context.SetStatus($"«{profile.Name}»: линт готов; снапшота для дрейфа ещё нет.", StatusKind.Info);
+                return;
+            }
+
+            var driftSection = Section(
+                $"Дрейф ({drift.Changes.Count}, ломающих: {drift.BreakingCount})", results);
+
+            if (drift.Empty)
+            {
+                Hint("Спека не менялась с последней генерации.", driftSection);
+                Context.SetStatus($"«{profile.Name}»: дрейфа нет.", StatusKind.Ok);
+                return;
+            }
+
+            foreach (var c in drift.Changes)
+            {
+                var breaking = c.Impact == DriftAnalyzer.Impact.Breaking;
+                Line($"{(breaking ? "✗" : "+")} {c.Target} — {c.Detail}",
+                    breaking ? NexusToken.Error : NexusToken.Ok, driftSection);
+            }
+
+            Context.SetStatus(
+                drift.BreakingCount > 0
+                    ? $"«{profile.Name}»: дрейф — {drift.BreakingCount} ломающих изменений, нужна регенерация."
+                    : $"«{profile.Name}»: дрейф есть, но без ломающих изменений.",
+                drift.BreakingCount > 0 ? StatusKind.Warning : StatusKind.Info);
+        }
+    }
+}

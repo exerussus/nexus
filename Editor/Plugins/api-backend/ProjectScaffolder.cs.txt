@@ -1,0 +1,232 @@
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Разворачивает ОБЩУЮ часть внешнего футпринта «с нуля»: рантайм-клиент и
+    /// шаблон api.mustache. Сырьё лежит инертными .txt в деплое страницы
+    /// (State/Templates/, задеплоено из Plugins/api-backend/Templates/); путь к
+    /// папке шаблонов передаёт страница, резолвя его через
+    /// Context.GetDeployedAssetPath — раскладку State знает хаб, не мы
+    /// (инвариант #7). Существующие файлы не перезатираются (твои правки
+    /// клиента не потеряются).
+    ///
+    /// Это обязательство servicing-страницы: внешние файлы (Assets/Api,
+    /// Tools/openapi-templates) создаются/показываются/сносятся ЯВНО из UI,
+    /// а disable/Restore плагина их не трогает.
+    ///
+    /// Обвязка ВЕРСИЙ (link.xml, asmdef в Assets/Api/&lt;Wrapper&gt;/) сюда
+    /// не входит — её движок создаёт сам при генерации (VersionDeployer).
+    /// </summary>
+    public static class ProjectScaffolder
+    {
+        // Папка для -t (куда кладётся api.mustache). Она же — дефолт TemplateDir
+        // у профилей: не заполняешь ничего — берётся общий шаблон отсюда.
+        public const string TemplateDirRel = "Tools/openapi-templates/csharp";
+
+        // Описание одного файла: откуда (имя в State/Templates страницы) и
+        // куда (цель, относительно корня проекта).
+        public sealed class FileSpec
+        {
+            public string TemplateName;
+            public string TargetRel;
+        }
+
+        public sealed class Step
+        {
+            public string Title;
+            public string Description;
+            public FileSpec[] Files;
+
+            // true — это шаг раскладки api.mustache; после него страница допишет
+            // TemplateDir профилям, у которых он пуст.
+            public bool IsTemplateStep;
+        }
+
+        // --- Описание шагов ---
+        public static readonly Step[] Steps =
+        {
+            new Step
+            {
+                Title = "Шаг 1. Рантайм-клиент",
+                Description = "Транспорт на UnityWebRequest + UniTask → Assets/Api/Runtime (один на все версии)",
+                Files = new[]
+                {
+                    new FileSpec { TemplateName = "RestClient.cs.txt",        TargetRel = "Assets/Api/Runtime/RestClient.cs" },
+                    new FileSpec { TemplateName = "RestClientOptions.cs.txt", TargetRel = "Assets/Api/Runtime/RestClientOptions.cs" },
+                    new FileSpec { TemplateName = "ApiException.cs.txt",      TargetRel = "Assets/Api/Runtime/ApiException.cs" },
+                }
+            },
+            new Step
+            {
+                Title = "Шаг 2. Шаблон api.mustache",
+                Description = "Шаблон обёрток вне Assets → Tools/openapi-templates/csharp (дефолт для профилей)",
+                IsTemplateStep = true,
+                Files = new[]
+                {
+                    new FileSpec { TemplateName = "api.mustache.txt", TargetRel = TemplateDirRel + "/api.mustache" },
+                }
+            },
+        };
+
+        // --- Статус ---
+        public sealed class FileStatus
+        {
+            public string TargetRel;
+            public bool Exists;
+        }
+
+        public sealed class StepStatus
+        {
+            public string Title;
+            public string Description;
+            public List<FileStatus> Files = new();
+            public bool AllExist => Files.Count > 0 && Files.All(f => f.Exists);
+            public bool NoneExist => Files.All(f => !f.Exists);
+            public int MissingCount => Files.Count(f => !f.Exists);
+        }
+
+        public static List<StepStatus> Inspect()
+        {
+            var root = ApiCodegenConfig.ProjectRoot;
+            var result = new List<StepStatus>();
+
+            foreach (var step in Steps)
+            {
+                var s = new StepStatus { Title = step.Title, Description = step.Description };
+                foreach (var f in step.Files)
+                    s.Files.Add(new FileStatus
+                    {
+                        TargetRel = f.TargetRel,
+                        Exists = File.Exists(Path.Combine(root, f.TargetRel))
+                    });
+                result.Add(s);
+            }
+            return result;
+        }
+
+        /// <summary>true, если шаблон реально на месте (есть api.mustache в TemplateDirRel).</summary>
+        public static bool TemplateDeployed() =>
+            File.Exists(Path.Combine(ApiCodegenConfig.ProjectRoot, TemplateDirRel, "api.mustache"));
+
+        /// <summary>
+        /// Создаёт недостающие файлы шага, копируя из папки шаблонов страницы
+        /// (<paramref name="templatesDirAbs"/> — абсолютный путь к задеплоенной
+        /// State/Templates, страница резолвит его через Context). Существующие
+        /// не трогает. Возвращает число созданных файлов; ошибку — через out.
+        /// </summary>
+        public static int CreateMissing(int stepIndex, string templatesDirAbs, out string error)
+        {
+            error = null;
+            if (stepIndex < 0 || stepIndex >= Steps.Length)
+            {
+                error = "Неверный индекс шага.";
+                return 0;
+            }
+            if (string.IsNullOrEmpty(templatesDirAbs) || !Directory.Exists(templatesDirAbs))
+            {
+                error = "Папка Templates в деплое страницы не найдена — сделай Restore/redeploy плагина в Nexus Manage.";
+                return 0;
+            }
+
+            var root = ApiCodegenConfig.ProjectRoot;
+            var created = 0;
+
+            foreach (var f in Steps[stepIndex].Files)
+            {
+                var target = Path.Combine(root, f.TargetRel);
+                if (File.Exists(target)) continue; // не перезатираем
+
+                var templatePath = Path.Combine(templatesDirAbs, f.TemplateName);
+                if (!File.Exists(templatePath))
+                {
+                    error = $"Шаблон не найден в деплое страницы: Templates/{f.TemplateName}";
+                    return created;
+                }
+
+                var dir = Path.GetDirectoryName(target);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.Copy(templatePath, target);
+                created++;
+            }
+
+            return created;
+        }
+
+        // ---- Полная очистка ---------------------------------------------------
+
+        // Строго эти два корня. НЕ весь Tools и НЕ весь Assets.
+        public const string TemplatesRootRel = "Tools/openapi-templates";
+
+        public sealed class CleanupTarget
+        {
+            public string Rel;
+            public bool Exists;
+        }
+
+        public static List<CleanupTarget> InspectCleanup()
+        {
+            var root = ApiCodegenConfig.ProjectRoot;
+            return new List<CleanupTarget>
+            {
+                new CleanupTarget
+                {
+                    Rel = ApiCodegenConfig.ApiRootRel,
+                    Exists = Directory.Exists(Path.Combine(root, ApiCodegenConfig.ApiRootRel))
+                },
+                new CleanupTarget
+                {
+                    Rel = TemplatesRootRel,
+                    Exists = Directory.Exists(Path.Combine(root, TemplatesRootRel))
+                },
+            };
+        }
+
+        /// <summary>
+        /// Сносит Assets/Api ЦЕЛИКОМ (рантайм-клиент и все версии) и
+        /// Tools/openapi-templates, сбрасывает снапшоты всех профилей.
+        /// Конфиг и список профилей не трогает. Для сноса ОДНОЙ версии —
+        /// VersionDeployer.RemoveVersion (кнопка на вкладке Profiles).
+        /// Возвращает список снесённого; ошибку — через out.
+        /// </summary>
+        public static List<string> CleanupAll(out string error)
+        {
+            error = null;
+            var removed = new List<string>();
+            var root = ApiCodegenConfig.ProjectRoot;
+
+            try
+            {
+                // Assets/Api — через AssetDatabase (уберёт и .meta).
+                if (AssetDatabase.IsValidFolder(ApiCodegenConfig.ApiRootRel))
+                {
+                    if (AssetDatabase.DeleteAsset(ApiCodegenConfig.ApiRootRel))
+                        removed.Add(ApiCodegenConfig.ApiRootRel);
+                    else
+                        error = $"Не удалось удалить {ApiCodegenConfig.ApiRootRel}.";
+                }
+
+                // Tools/openapi-templates — вне Assets, обычным IO (Tools/ целиком не трогаем).
+                var templatesAbs = Path.Combine(root, TemplatesRootRel);
+                if (Directory.Exists(templatesAbs))
+                {
+                    Directory.Delete(templatesAbs, recursive: true);
+                    removed.Add(TemplatesRootRel);
+                }
+
+                // Снапшоты генерации всех профилей (мета + зеркала) + хвосты старой схемы.
+                CodegenSnapshot.ClearAll();
+                removed.Add("снапшоты генерации (все профили)");
+            }
+            catch (System.Exception e)
+            {
+                error = e.Message;
+            }
+
+            return removed;
+        }
+    }
+}

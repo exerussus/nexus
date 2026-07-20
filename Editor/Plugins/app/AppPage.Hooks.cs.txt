@@ -1,0 +1,514 @@
+// ============================================================
+//  AppPage.Hooks.cs — вкладка «Hooks».
+//
+//  Action Hook — пустой VisualElement с display:none и конкретным именем,
+//  добавляемый дочерним внутрь элемента mainContainer (или внутрь первого
+//  визуального элемента, если mainContainer нет — но скаффолд всегда создаёт его).
+//
+//  Флоу:
+//   1) Библиотека хуков: добавляешь имя один раз — оно запоминается (UserSettings/<id>),
+//      рядом видно покрытие «на скольких страницах уже есть». Можно удалить.
+//   2) Выбираешь конкретный хук — снизу список страниц с его статусом, и можно
+//      сгенерить этот хук на выбранных (или на всех, где его нет).
+//
+//  UXML страницы берётся по конвенции AppPaths.PagesRoot/<Class>/<id>.uxml
+//  (как во вкладке Generation → templates).
+// ============================================================
+
+using Exerussus.Nexus.Abstractions;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Xml;
+using System.Xml.Linq;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public sealed partial class AppPage
+    {
+        // Библиотека хуков — личные данные страницы. В Nexus они лежат в
+        // UserSettings/Exerussus.Nexus/app/ (git-ignored, переживают restore/disable,
+        // вычищаются командой «Clear settings»), а не в глобальном EditorPrefs.
+        private const string HooksFileName     = "hooks.txt";
+        private const string MainContainerName = "mainContainer";
+        private const string ActionHookClass   = "action-hook";
+
+        // ----------------------------------------------------- состояние
+        private readonly List<string> _hooks = new();          // библиотека (persisted)
+        private string _selectedHook;
+
+        // кэш скана страниц (заполняется в RefreshHooks, переиспользуется при выборе хука)
+        private readonly List<string> _hookPageIds = new();
+        private readonly Dictionary<string, HashSet<string>> _hookPageNames = new(StringComparer.Ordinal); // id -> names (null=нечитаемо)
+
+        // ----------------------------------------------------- UI поля
+        private TextField  _hookNewField;
+        private ScrollView _hookLibList;
+        private Label      _hookPagesHeader;
+        private ScrollView _hooksList;
+        private Label      _hooksStatus;
+        private readonly Dictionary<string, Toggle> _hookPageSelect = new(StringComparer.Ordinal);
+
+        // ============================================================ UI
+
+        private void BuildHooksTab()
+        {
+            LoadHooks();
+
+            var toolbar = new VisualElement();
+            toolbar.AddToClassList("nav-toolbar");
+
+            var title = new Label("Action hooks");
+            title.AddToClassList("nav-page-title");
+            toolbar.Add(title);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+            toolbar.Add(spacer);
+
+            var refreshBtn = new Button(RefreshHooks) { text = "Refresh" };
+            refreshBtn.AddToClassList("nav-btn");
+            toolbar.Add(refreshBtn);
+
+            _hooksRoot.Add(toolbar);
+
+            var desc = new Label(
+                "Hook = empty VisualElement (display:none) inserted as a child of \"" + MainContainerName +
+                "\" (or of the first element if absent). Build a library of hook names once, then pick one and " +
+                "generate it onto pages.");
+            desc.AddToClassList("nav-gen-desc");
+            _hooksRoot.Add(desc);
+
+            // ---- библиотека хуков ----
+            var libHead = new VisualElement();
+            libHead.AddToClassList("nav-gen-subhead");
+
+            var libTitle = new Label("Hook library");
+            libTitle.AddToClassList("nav-page-title");
+            libHead.Add(libTitle);
+
+            _hookNewField = new TextField { value = string.Empty };
+            _hookNewField.AddToClassList("nav-hook-add-field");
+            _hookNewField.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter) { AddHookFromField(); e.StopPropagation(); }
+            });
+            libHead.Add(_hookNewField);
+
+            var addBtn = new Button(AddHookFromField) { text = "Add hook" };
+            addBtn.AddToClassList("nav-btn");
+            addBtn.AddToClassList("nav-btn--apply");
+            libHead.Add(addBtn);
+
+            _hooksRoot.Add(libHead);
+
+            _hookLibList = new ScrollView(ScrollViewMode.Vertical);
+            _hookLibList.AddToClassList("nav-hook-lib");
+            _hooksRoot.Add(_hookLibList);
+
+            // ---- страницы для выбранного хука ----
+            var pagesHead = new VisualElement();
+            pagesHead.AddToClassList("nav-gen-subhead");
+
+            _hookPagesHeader = new Label("Pages");
+            _hookPagesHeader.AddToClassList("nav-page-title");
+            pagesHead.Add(_hookPagesHeader);
+
+            var spacer2 = new VisualElement();
+            spacer2.AddToClassList("nav-spacer");
+            pagesHead.Add(spacer2);
+
+            var genSelBtn = new Button(() => GenerateSelectedHook(selectedOnly: true)) { text = "Generate on selected" };
+            genSelBtn.AddToClassList("nav-btn");
+            pagesHead.Add(genSelBtn);
+
+            var genAllBtn = new Button(() => GenerateSelectedHook(selectedOnly: false)) { text = "Generate all missing" };
+            genAllBtn.AddToClassList("nav-btn");
+            genAllBtn.AddToClassList("nav-btn--apply");
+            pagesHead.Add(genAllBtn);
+
+            _hooksRoot.Add(pagesHead);
+
+            _hooksStatus = new Label(string.Empty);
+            _hooksStatus.AddToClassList("nav-tpl-status");
+            _hooksRoot.Add(_hooksStatus);
+
+            _hooksList = new ScrollView(ScrollViewMode.Vertical);
+            _hooksList.AddToClassList("nav-tpl-list");
+            _hooksRoot.Add(_hooksList);
+        }
+
+        // ============================================================ библиотека (persist)
+
+        private void LoadHooks()
+        {
+            _hooks.Clear();
+
+            var path = Context.GetUserConfigPath(HooksFileName);
+            if (!File.Exists(path)) return;
+
+            string raw;
+            try { raw = File.ReadAllText(path); }
+            catch { return; }   // нечитаемо — стартуем с пустой библиотекой
+
+            foreach (var s in raw.Split('\n'))
+            {
+                var t = s.Trim();
+                if (t.Length > 0 && !_hooks.Contains(t)) _hooks.Add(t);
+            }
+        }
+
+        private void SaveHooks()
+        {
+            var path = Context.GetUserConfigPath(HooksFileName);
+            try
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(path, string.Join("\n", _hooks));
+            }
+            catch (Exception e)
+            {
+                Context.SetStatus("Cannot save hooks library: " + e.Message, StatusKind.Error);
+            }
+        }
+
+        private void AddHookFromField()
+        {
+            var name = (_hookNewField?.value ?? string.Empty).Trim();
+            if (name.Length == 0) return;
+            if (name.Any(char.IsWhiteSpace)) { _hooksStatus.text = "Hook name must not contain spaces."; return; }
+            if (_hooks.Contains(name)) { _selectedHook = name; _hookNewField.value = string.Empty; RefreshHooks(); return; }
+
+            _hooks.Add(name);
+            SaveHooks();
+            _selectedHook = name;            // только что добавленный — выбран
+            _hookNewField.value = string.Empty;
+            RefreshHooks();
+        }
+
+        private void RemoveHook(string name)
+        {
+            if (!_hooks.Remove(name)) return;
+            SaveHooks();
+            if (string.Equals(_selectedHook, name, StringComparison.Ordinal)) _selectedHook = null;
+            RefreshHooks();
+        }
+
+        private void SelectHook(string name)
+        {
+            _selectedHook = name;
+            BuildHookLibrary();      // обновить подсветку
+            BuildHookPages();        // показать страницы для выбранного
+        }
+
+        // ============================================================ refresh
+
+        private void RefreshHooks()
+        {
+            if (_hookLibList == null) return;
+
+            // 1) скан страниц один раз — id из NavigationData
+            _hookPageIds.Clear();
+            _hookPageNames.Clear();
+            foreach (var id in Distinct(_pageReg.ReadStored()))
+            {
+                _hookPageIds.Add(id);
+                var path = TemplateUxmlPath(id, false);
+                HashSet<string> names = null;
+                if (File.Exists(path))
+                {
+                    try { names = ReadElementNames(File.ReadAllText(path)); }
+                    catch { names = null; }
+                }
+                _hookPageNames[id] = names;
+            }
+
+            if (_selectedHook != null && !_hooks.Contains(_selectedHook)) _selectedHook = null;
+
+            BuildHookLibrary();
+            BuildHookPages();
+        }
+
+        private void BuildHookLibrary()
+        {
+            _hookLibList.Clear();
+
+            if (_hooks.Count == 0)
+            {
+                var empty = new Label("Library is empty — add a hook name above.");
+                empty.AddToClassList("nav-tpl-status");
+                _hookLibList.Add(empty);
+                return;
+            }
+
+            int readablePages = _hookPageNames.Values.Count(v => v != null);
+
+            foreach (var hook in _hooks)
+            {
+                int have = _hookPageNames.Values.Count(v => v != null && v.Contains(hook));
+
+                var row = new VisualElement();
+                row.AddToClassList("nav-hook-lib-row");
+                if (string.Equals(hook, _selectedHook, StringComparison.Ordinal))
+                    row.AddToClassList("nav-hook-lib-row--selected");
+
+                var name = new Label(hook);
+                name.AddToClassList("nav-tpl-id");
+                row.Add(name);
+
+                var cov = new Label($"{have}/{readablePages} pages");
+                cov.AddToClassList("nav-tpl-path");
+                row.Add(cov);
+
+                var spacer = new VisualElement();
+                spacer.AddToClassList("nav-spacer");
+                row.Add(spacer);
+
+                var capturedHook = hook;
+                var remove = new Button(() => RemoveHook(capturedHook)) { text = "\u2715" };
+                remove.AddToClassList("nav-remove");
+                remove.tooltip = "Remove from library";
+                row.Add(remove);
+
+                row.RegisterCallback<PointerDownEvent>(e =>
+                {
+                    if (e.button != 0) return;
+                    if (e.target is Button) return;        // клик по «✕» не выбирает
+                    SelectHook(capturedHook);
+                });
+
+                _hookLibList.Add(row);
+            }
+        }
+
+        private void BuildHookPages()
+        {
+            _hooksList.Clear();
+            _hookPageSelect.Clear();
+
+            if (_selectedHook == null)
+            {
+                _hookPagesHeader.text = "Pages";
+                _hooksStatus.text = "Select a hook from the library to generate it onto pages.";
+                return;
+            }
+
+            _hookPagesHeader.text = "Pages for: " + _selectedHook;
+
+            int present = 0, missing = 0, noUxml = 0;
+
+            foreach (var id in _hookPageIds)
+            {
+                var names = _hookPageNames.TryGetValue(id, out var n) ? n : null;
+                bool readable = names != null;
+                bool has = readable && names.Contains(_selectedHook);
+
+                if (!readable)   noUxml++;
+                else if (has)    present++;
+                else             missing++;
+
+                _hooksList.Add(MakeHookPageRow(id, readable, has));
+            }
+
+            _hooksStatus.text = $"\"{_selectedHook}\": present on {present}, missing on {missing}, " +
+                                $"{noUxml} page(s) without a readable uxml.";
+        }
+
+        private VisualElement MakeHookPageRow(string id, bool readable, bool has)
+        {
+            var path = TemplateUxmlPath(id, false);
+
+            var row = new VisualElement();
+            row.AddToClassList("nav-tpl-row");
+
+            bool canAdd = readable && !has;
+
+            var sel = new Toggle { value = canAdd };
+            sel.AddToClassList("nav-hook-select");
+            sel.SetEnabled(canAdd);
+            _hookPageSelect[id] = sel;
+            row.Add(sel);
+
+            var idLabel = new Label(id);
+            idLabel.AddToClassList("nav-tpl-id");
+            row.Add(idLabel);
+
+            var pathLabel = new Label(readable ? path : path + "  (not found)");
+            pathLabel.AddToClassList("nav-tpl-path");
+            row.Add(pathLabel);
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("nav-spacer");
+            row.Add(spacer);
+
+            string stateText = !readable ? "no uxml" : (has ? "present" : "missing");
+            var state = new Label(stateText);
+            state.AddToClassList("nav-tpl-state");
+            state.AddToClassList(has ? "nav-tpl-state--ok" : "nav-tpl-state--missing");
+            row.Add(state);
+
+            if (canAdd)
+            {
+                var capturedId = id;
+                var addBtn = new Button(() => GenerateSelectedHookForPage(capturedId)) { text = "Add" };
+                addBtn.AddToClassList("nav-btn");
+                addBtn.AddToClassList("nav-tpl-gen");
+                row.Add(addBtn);
+            }
+            else if (readable)
+            {
+                var capturedPath = path;
+                row.AddToClassList("nav-tpl-row--pingable");
+                row.tooltip = "Click to ping in Project: " + capturedPath;
+                row.RegisterCallback<PointerDownEvent>(e =>
+                {
+                    if (e.button != 0) return;
+                    var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(capturedPath);
+                    if (asset != null) { EditorGUIUtility.PingObject(asset); Selection.activeObject = asset; }
+                });
+            }
+
+            return row;
+        }
+
+        // ============================================================ генерация выбранного хука
+
+        private void GenerateSelectedHookForPage(string id)
+        {
+            if (_selectedHook == null) return;
+            int added = InsertHooks(id, new List<string> { _selectedHook }, out var msg);
+            AssetDatabase.Refresh();
+            RefreshHooks();
+            SetGenLog($"Hook \"{_selectedHook}\" [{id}]: " + msg, added > 0 ? StatusKind.Ok : StatusKind.Warning);
+        }
+
+        private void GenerateSelectedHook(bool selectedOnly)
+        {
+            if (_selectedHook == null) { SetGenLog("Hooks: select a hook first.", StatusKind.Warning); return; }
+
+            int totalAdded = 0, touched = 0, failed = 0;
+            var log = new StringBuilder();
+            var one = new List<string> { _selectedHook };
+
+            foreach (var id in _hookPageIds)
+            {
+                if (selectedOnly && !(_hookPageSelect.TryGetValue(id, out var t) && t.value)) continue;
+                int added = InsertHooks(id, one, out var msg);
+                if (added < 0)      { failed++;  log.AppendLine("! " + id + ": " + msg); }
+                else if (added > 0) { touched++; totalAdded += added; log.AppendLine($"+ {id}: {msg}"); }
+            }
+
+            AssetDatabase.Refresh();
+            RefreshHooks();
+
+            log.Insert(0, $"Hook \"{_selectedHook}\": added to {touched} page(s)" +
+                          (failed > 0 ? $", {failed} failed" : "") +
+                          (touched == 0 && failed == 0 ? " (nothing missing)" : "") + ".\n");
+            SetGenLog(log.ToString().TrimEnd(), failed > 0 ? StatusKind.Warning : StatusKind.Ok);
+        }
+
+        // ============================================================ вставка хуков
+
+        // Возвращает число добавленных хуков; -1 при ошибке. msg — человекочитаемое описание.
+        private int InsertHooks(string id, List<string> hooks, out string msg)
+        {
+            var path = TemplateUxmlPath(id, false);
+            if (!File.Exists(path)) { msg = "uxml not found: " + path; return -1; }
+
+            string raw;
+            try { raw = File.ReadAllText(path); }
+            catch (Exception e) { msg = "read failed: " + e.Message; return -1; }
+
+            XDocument doc;
+            try { doc = XDocument.Parse(raw, LoadOptions.None); }
+            catch (Exception e) { msg = "parse failed: " + e.Message; return -1; }
+
+            var root = doc.Root;
+            if (root == null) { msg = "empty document"; return -1; }
+
+            // целевой контейнер: элемент name="mainContainer", иначе первый элемент-потомок
+            var target = doc.Descendants()
+                            .FirstOrDefault(el => (string)el.Attribute("name") == MainContainerName)
+                         ?? root.Elements().FirstOrDefault();
+            if (target == null) { msg = "no element to host hooks"; return -1; }
+
+            // уже присутствующие имена — чтобы не дублировать
+            var existing = ReadElementNames(raw);
+
+            // namespace для VisualElement берём у уже существующих элементов (engine ns)
+            XNamespace ns = target.Name.Namespace != XNamespace.None
+                ? target.Name.Namespace
+                : (root.GetNamespaceOfPrefix("ui") ?? (XNamespace)"UnityEngine.UIElements");
+
+            int added = 0;
+            foreach (var h in hooks)
+            {
+                if (existing.Contains(h)) continue;
+                var el = new XElement(ns + "VisualElement",
+                    new XAttribute("name", h),
+                    new XAttribute("class", ActionHookClass),
+                    new XAttribute("picking-mode", "Ignore"),
+                    new XAttribute("style", "display: none;"));
+                target.Add(el);
+                existing.Add(h);
+                added++;
+            }
+
+            if (added == 0) { msg = "nothing to add (all present)"; return 0; }
+
+            try { WriteUxml(doc, raw, path); }
+            catch (Exception e) { msg = "write failed: " + e.Message; return -1; }
+
+            msg = $"added {added} hook(s) into <{(((string)target.Attribute("name")) ?? target.Name.LocalName)}>";
+            return added;
+        }
+
+        // ============================================================ utils
+
+        // все непустые name в uxml
+        private static HashSet<string> ReadElementNames(string uxml)
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            if (string.IsNullOrEmpty(uxml)) return set;
+            var doc = XDocument.Parse(uxml, LoadOptions.None);
+            foreach (var el in doc.Descendants())
+            {
+                var n = (string)el.Attribute("name");
+                if (!string.IsNullOrWhiteSpace(n)) set.Add(n.Trim());
+            }
+            return set;
+        }
+
+        private static void WriteUxml(XDocument doc, string original, string path)
+        {
+            var settings = new XmlWriterSettings
+            {
+                Indent             = true,
+                IndentChars        = "    ",
+                OmitXmlDeclaration = doc.Declaration == null && !original.TrimStart().StartsWith("<?xml"),
+                Encoding           = new UTF8Encoding(false),
+                NewLineChars       = "\n",
+            };
+
+            var sb = new StringBuilder();
+            using (var sw = new Utf8StringWriter(sb))
+            using (var xw = XmlWriter.Create(sw, settings))
+                doc.Save(xw);
+
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+            AssetDatabase.ImportAsset(path);
+        }
+
+        private sealed class Utf8StringWriter : StringWriter
+        {
+            public Utf8StringWriter(StringBuilder sb) : base(sb) { }
+            public override Encoding Encoding => new UTF8Encoding(false);
+        }
+    }
+}

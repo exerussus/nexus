@@ -1,0 +1,102 @@
+using System.Collections.Generic;
+using Newtonsoft.Json;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // DTO-кластер salamander-api.json + индексы для O(1)-классификации имён.
+    // Сознательное исключение из «один тип — один файл»: модель неделима по смыслу.
+    public sealed class SalApiModel
+    {
+        [JsonProperty("apiVersion")] public int ApiVersion = 1;
+        [JsonProperty("enums")]      public List<SalApiEnum> Enums = new List<SalApiEnum>();
+        [JsonProperty("classes")]    public List<SalApiClass> Classes = new List<SalApiClass>();
+        [JsonProperty("apis")]       public List<SalApiApi> Apis = new List<SalApiApi>();
+        [JsonProperty("events")]     public List<SalApiEvent> Events = new List<SalApiEvent>();
+
+        [JsonIgnore] private Dictionary<string, SalApiApi> _apiByName;
+        [JsonIgnore] private Dictionary<string, SalApiEnum> _enumByName;
+        [JsonIgnore] private HashSet<string> _classNames;
+
+        public static SalApiModel Parse(string json)
+        {
+            var m = JsonConvert.DeserializeObject<SalApiModel>(json) ?? new SalApiModel();
+            m.BuildIndexes();
+            return m;
+        }
+
+        public bool IsApi(string name)   => _apiByName != null && _apiByName.ContainsKey(name);
+        public bool IsEnum(string name)  => _enumByName != null && _enumByName.ContainsKey(name);
+        public bool IsClass(string name) => _classNames != null && _classNames.Contains(name);
+        public bool TryGetApi(string name, out SalApiApi api)
+        {
+            api = null;
+            return _apiByName != null && _apiByName.TryGetValue(name, out api);
+        }
+        public bool TryGetEnum(string name, out SalApiEnum e)
+        {
+            e = null;
+            return _enumByName != null && _enumByName.TryGetValue(name, out e);
+        }
+
+        private void BuildIndexes()
+        {
+            _apiByName  = new Dictionary<string, SalApiApi>(Apis.Count);
+            _enumByName = new Dictionary<string, SalApiEnum>(Enums.Count);
+            _classNames = new HashSet<string>();
+            foreach (var a in Apis)    if (!string.IsNullOrEmpty(a?.Name)) _apiByName[a.Name] = a;
+            foreach (var e in Enums)   if (!string.IsNullOrEmpty(e?.Name)) _enumByName[e.Name] = e;
+            foreach (var c in Classes) if (!string.IsNullOrEmpty(c?.Name)) _classNames.Add(c.Name);
+        }
+    }
+
+    public sealed class SalApiEnum
+    {
+        [JsonProperty("name")]    public string Name;
+        [JsonProperty("summary")] public string Summary;
+        [JsonProperty("members")] public List<string> Members = new List<string>();
+    }
+
+    public sealed class SalApiClass
+    {
+        [JsonProperty("name")]    public string Name;
+        [JsonProperty("summary")] public string Summary;
+        [JsonProperty("props")]   public List<SalApiProp> Props = new List<SalApiProp>();
+    }
+
+    public sealed class SalApiProp
+    {
+        [JsonProperty("name")]     public string Name;
+        [JsonProperty("type")]     public string Type;
+        [JsonProperty("readOnly")] public bool ReadOnly;
+        [JsonProperty("doc")]      public string Doc;
+    }
+
+    public sealed class SalApiApi
+    {
+        [JsonProperty("name")]    public string Name;
+        [JsonProperty("summary")] public string Summary;
+        [JsonProperty("methods")] public List<SalApiMethod> Methods = new List<SalApiMethod>();
+    }
+
+    public sealed class SalApiMethod
+    {
+        [JsonProperty("name")]    public string Name;
+        [JsonProperty("summary")] public string Summary;
+        [JsonProperty("params")]  public List<SalApiParam> Params = new List<SalApiParam>();
+        [JsonProperty("returns")] public string Returns;
+    }
+
+    public sealed class SalApiParam
+    {
+        [JsonProperty("name")] public string Name;
+        [JsonProperty("type")] public string Type;
+        [JsonProperty("doc")]  public string Doc;
+    }
+
+    public sealed class SalApiEvent
+    {
+        [JsonProperty("name")]    public string Name;
+        [JsonProperty("summary")] public string Summary;
+        [JsonProperty("params")]  public List<SalApiParam> Params = new List<SalApiParam>();
+    }
+}

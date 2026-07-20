@@ -1,0 +1,429 @@
+// ============================================================
+//  AppControllerGenerator.cs  (Editor)
+//
+//  Правый клик по .uxml  ->  Create  ->  AppPageController / AppPopupController.
+//  Генерирует C#-наследника соответствующего базового класса:
+//    • поля на каждый элемент с uss-классом "generate-link" (camelCase, _prefix);
+//    • OnActivate(): ленивый _isInitialized, Root.Q<T>("name") по всем полям,
+//      подписки на clicked у кнопок + пустые хендлеры On<Name>Clicked;
+//    • OnDestroy(): отписки от clicked (только если есть кнопки).
+//
+//  Имя класса = имя uxml без слов "Page"/"Popup" в PascalCase + суффикс
+//  ("PageController" / "PopupController").  Существующий файл не затирается без спроса.
+//
+//  Базовые классы AppPageController/AppPopupController лежат в App.Abstractions —
+//  поэтому в генерируемый код добавлен using App.Abstractions.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Xml.Linq;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    public static class AppControllerGenerator
+    {
+        private const string GenerateLinkClass = "generate-link";
+
+        // тип контроллера, который генерируем
+        private enum Kind { Page, Popup }
+
+        private static readonly char[] WS = { ' ', '\t', '\n', '\r' };
+
+        // ---- маппинг тега UXML -> тип UI Toolkit для Root.Q<T> ----
+        // имя тега берём без неймспейса (ui:Button -> Button). Незнакомые/кастомные
+        // типы оставляем как есть (зарегистрированные UxmlFactory обычно совпадают по имени).
+        private static readonly Dictionary<string, string> TagToType = new(StringComparer.Ordinal)
+        {
+            { "VisualElement",   "VisualElement" },
+            { "Button",          "Button" },
+            { "Label",           "Label" },
+            { "Toggle",          "Toggle" },
+            { "Slider",          "Slider" },
+            { "SliderInt",       "SliderInt" },
+            { "MinMaxSlider",    "MinMaxSlider" },
+            { "ScrollView",      "ScrollView" },
+            { "ListView",        "ListView" },
+            { "TreeView",        "TreeView" },
+            { "TextField",       "TextField" },
+            { "IntegerField",    "IntegerField" },
+            { "FloatField",      "FloatField" },
+            { "DoubleField",     "DoubleField" },
+            { "Foldout",         "Foldout" },
+            { "DropdownField",   "DropdownField" },
+            { "EnumField",       "EnumField" },
+            { "RadioButton",     "RadioButton" },
+            { "RadioButtonGroup","RadioButtonGroup" },
+            { "ProgressBar",     "ProgressBar" },
+            { "Image",           "Image" },
+            { "Box",             "Box" },
+            { "GroupBox",        "GroupBox" },
+            { "HelpBox",         "HelpBox" },
+            { "ScrollerButton",  "VisualElement" },
+            { "TemplateContainer","TemplateContainer" },
+            { "BindableElement", "BindableElement" },
+        };
+
+        // ============================================================ menu items
+
+        [MenuItem("Assets/Create/AppPageController", false, 80)]
+        private static void CreatePageController() => Generate(Kind.Page);
+
+        [MenuItem("Assets/Create/AppPageController", true)]
+        private static bool CreatePageControllerValidate() => IsUxmlSelected();
+
+        [MenuItem("Assets/Create/AppPopupController", false, 81)]
+        private static void CreatePopupController() => Generate(Kind.Popup);
+
+        [MenuItem("Assets/Create/AppPopupController", true)]
+        private static bool CreatePopupControllerValidate() => IsUxmlSelected();
+
+        private static bool IsUxmlSelected()
+        {
+            var path = SelectedUxmlPath();
+            return !string.IsNullOrEmpty(path);
+        }
+
+        private static string SelectedUxmlPath()
+        {
+            var obj = Selection.activeObject;
+            if (obj == null) return null;
+            var path = AssetDatabase.GetAssetPath(obj);
+            return (!string.IsNullOrEmpty(path) &&
+                    path.EndsWith(".uxml", StringComparison.OrdinalIgnoreCase)) ? path : null;
+        }
+
+        // ============================================================ generation
+
+        private static void Generate(Kind kind)
+        {
+            var uxmlPath = SelectedUxmlPath();
+            if (string.IsNullOrEmpty(uxmlPath))
+            {
+                EditorUtility.DisplayDialog("Controller generator", "Select a .uxml asset first.", "OK");
+                return;
+            }
+
+            var uxmlName  = Path.GetFileNameWithoutExtension(uxmlPath);
+            var suffix    = kind == Kind.Popup ? "PopupController" : "PageController";
+            var baseType  = kind == Kind.Popup ? "AppPopupController" : "AppPageController";
+            var className = BuildClassName(uxmlName, suffix);
+
+            var dir       = Path.GetDirectoryName(uxmlPath)?.Replace('\\', '/') ?? "Assets";
+            var outPath   = $"{dir}/{className}.cs";
+
+            // существующий файл не затираем без спроса
+            if (File.Exists(outPath))
+            {
+                bool overwrite = EditorUtility.DisplayDialog(
+                    "Controller generator",
+                    $"{className}.cs already exists at:\n{outPath}\n\nOverwrite it?",
+                    "Overwrite", "Cancel");
+                if (!overwrite) return;
+            }
+
+            // читаем элементы
+            List<Element> elements;
+            try
+            {
+                elements = ExtractElements(File.ReadAllText(uxmlPath));
+            }
+            catch (Exception e)
+            {
+                EditorUtility.DisplayDialog("Controller generator",
+                    $"Failed to parse UXML:\n{e.Message}", "OK");
+                return;
+            }
+
+            var code = BuildController(className, baseType, kind, uxmlName, elements);
+
+            try
+            {
+                File.WriteAllText(outPath, code, new UTF8Encoding(false));
+            }
+            catch (Exception e)
+            {
+                EditorUtility.DisplayDialog("Controller generator",
+                    $"Failed to write file:\n{e.Message}", "OK");
+                return;
+            }
+
+            AssetDatabase.ImportAsset(outPath);
+            AssetDatabase.Refresh();
+
+            var created = AssetDatabase.LoadAssetAtPath<MonoScript>(outPath);
+            if (created != null)
+            {
+                Selection.activeObject = created;
+                EditorGUIUtility.PingObject(created);
+            }
+
+            int buttons = elements.Count(e => e.IsButton);
+            Debug.Log($"[AppControllerGenerator] {className}.cs — {elements.Count} element(s), " +
+                      $"{buttons} button(s) -> {outPath}");
+        }
+
+        // ============================================================ code building
+
+        private static string BuildController(string className, string baseType, Kind kind,
+                                              string uxmlName, List<Element> elements)
+        {
+            bool anyButtons = elements.Any(e => e.IsButton);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("using App.Abstractions;");
+            sb.AppendLine("using Cysharp.Threading.Tasks;");
+            sb.AppendLine("using UnityEngine;");
+            sb.AppendLine("using UnityEngine.UIElements;");
+            sb.AppendLine();
+            sb.AppendLine("namespace App.Core");
+            sb.AppendLine("{");
+            sb.AppendLine($"    public class {className} : {baseType}");
+            sb.AppendLine("    {");
+            sb.AppendLine("        private bool _isInitialized;");
+
+            // ---- поля ----
+            if (elements.Count > 0)
+            {
+                sb.AppendLine();
+                int fieldPad = elements.Max(e => e.TypeName.Length);
+                foreach (var el in elements)
+                    sb.AppendLine($"        private {el.TypeName.PadRight(fieldPad)} {el.Field};");
+            }
+
+            // ---- OnActivate ----
+            sb.AppendLine();
+            sb.AppendLine("        public override UniTask OnActivate()");
+            sb.AppendLine("        {");
+            sb.AppendLine("            if (!_isInitialized)");
+            sb.AppendLine("            {");
+            sb.AppendLine("                _isInitialized = true;");
+
+            if (elements.Count > 0)
+            {
+                sb.AppendLine();
+                int qPad = elements.Max(e => e.Field.Length);
+                foreach (var el in elements)
+                    sb.AppendLine($"                {el.Field.PadRight(qPad)} = Root.Q<{el.TypeName}>(\"{Escape(el.RawName)}\");");
+
+                if (anyButtons)
+                {
+                    sb.AppendLine();
+                    foreach (var el in elements.Where(e => e.IsButton))
+                        sb.AppendLine($"                {el.Field}.clicked += {el.Handler};");
+                }
+            }
+
+            sb.AppendLine("            }");
+            sb.AppendLine();
+            sb.AppendLine("            return UniTask.CompletedTask;");
+            sb.AppendLine("        }");
+
+            // ---- OnDestroy (отписки) ----
+            if (anyButtons)
+            {
+                sb.AppendLine();
+                sb.AppendLine("        private void OnDestroy()");
+                sb.AppendLine("        {");
+                foreach (var el in elements.Where(e => e.IsButton))
+                {
+                    sb.AppendLine($"            if ({el.Field} != null)");
+                    sb.AppendLine($"                {el.Field}.clicked -= {el.Handler};");
+                }
+                sb.AppendLine("        }");
+
+                // ---- хендлеры кнопок ----
+                foreach (var el in elements.Where(e => e.IsButton))
+                {
+                    sb.AppendLine();
+                    sb.AppendLine($"        private void {el.Handler}()");
+                    sb.AppendLine("        {");
+                    sb.AppendLine("            // TODO: implement");
+                    sb.AppendLine("        }");
+                }
+            }
+
+            sb.AppendLine("    }");
+            sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        // ============================================================ uxml parsing
+
+        private sealed class Element
+        {
+            public string RawName;     // атрибут name как в uxml
+            public string TypeName;    // тип для Root.Q<T>
+            public string Field;       // _camelCase
+            public string Handler;     // On<Name>Clicked
+            public bool   IsButton;
+        }
+
+        // элементы с классом generate-link и непустым name; дубли полей разруливаем суффиксом
+        private static List<Element> ExtractElements(string uxml)
+        {
+            var result = new List<Element>();
+            if (string.IsNullOrEmpty(uxml)) return result;
+
+            var doc = XDocument.Parse(uxml, LoadOptions.None);
+            var usedFields   = new HashSet<string>(StringComparer.Ordinal);
+            var usedHandlers = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var el in doc.Descendants())
+            {
+                var cls = (string)el.Attribute("class");
+                if (string.IsNullOrEmpty(cls)) continue;
+                if (!cls.Split(WS, StringSplitOptions.RemoveEmptyEntries).Any(t => t == GenerateLinkClass))
+                    continue;
+
+                var name = (string)el.Attribute("name");
+                if (string.IsNullOrWhiteSpace(name)) continue;     // без name связать нечем — пропускаем
+                name = name.Trim();
+
+                var tag      = el.Name.LocalName;                  // ui:Button -> Button
+                var typeName = TagToType.TryGetValue(tag, out var t) ? t : tag;
+                bool isButton = typeName == "Button";
+
+                var field   = Unique(usedFields, "_" + ToCamel(name));
+                var handler = isButton
+                    ? Unique(usedHandlers, "On" + ToPascal(name) + "Clicked")
+                    : null;
+
+                result.Add(new Element
+                {
+                    RawName  = name,
+                    TypeName = typeName,
+                    Field    = field,
+                    Handler  = handler,
+                    IsButton = isButton,
+                });
+            }
+            return result;
+        }
+
+        // ============================================================ naming helpers
+
+        private static string BuildClassName(string uxmlName, string suffix)
+        {
+            // убираем слова Page/Popup (как отдельные сегменты), собираем PascalCase, добавляем суффикс
+            var segs = SplitWords(uxmlName)
+                .Where(w => !w.Equals("page",  StringComparison.OrdinalIgnoreCase) &&
+                            !w.Equals("popup", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var sb = new StringBuilder();
+            foreach (var w in segs) sb.Append(Capitalize(w));
+
+            var core = sb.ToString();
+            if (core.Length == 0) core = ""; // напр. файл назывался просто "Page"
+            return EnsureValidIdent(core + suffix);
+        }
+
+        // _camelCase: первое слово со строчной, остальные с заглавной, разделители убраны
+        private static string ToCamel(string raw)
+        {
+            var words = SplitWords(raw);
+            if (words.Count == 0) return "field";
+            var sb = new StringBuilder();
+            for (int i = 0; i < words.Count; i++)
+                sb.Append(i == 0 ? Decapitalize(words[i]) : Capitalize(words[i]));
+            var s = sb.ToString();
+            if (s.Length == 0) return "field";
+            if (char.IsDigit(s[0])) s = "_" + s;
+            return s;
+        }
+
+        private static string ToPascal(string raw)
+        {
+            var words = SplitWords(raw);
+            var sb = new StringBuilder();
+            foreach (var w in words) sb.Append(Capitalize(w));
+            var s = sb.ToString();
+            return s.Length == 0 ? "Element" : s;
+        }
+
+        // дробим по любым не-буквенно-цифровым (-, _, пробел, .) и по границам camelCase.
+        //   projectList -> [project, List];  project-list / project_list -> [project, list]
+        //   аббревиатуры: HUD -> [HUD];  HUDPanel -> [HUD, Panel];  UIRoot -> [UI, Root]
+        private static List<string> SplitWords(string raw)
+        {
+            var words = new List<string>();
+            if (string.IsNullOrEmpty(raw)) return words;
+
+            var cur = new StringBuilder();
+            char prev = '\0', prev2 = '\0';
+            foreach (var ch in raw)
+            {
+                if (!char.IsLetterOrDigit(ch))                       // разделитель
+                {
+                    Flush(cur, words);
+                    prev = prev2 = '\0';
+                    continue;
+                }
+
+                if (cur.Length > 0 && char.IsUpper(ch) &&
+                    (char.IsLower(prev) || char.IsDigit(prev)))
+                {
+                    // строчная/цифра -> Заглавная : projectList -> project | List
+                    Flush(cur, words);
+                }
+                else if (cur.Length > 0 && char.IsLower(ch) &&
+                         char.IsUpper(prev) && char.IsUpper(prev2))
+                {
+                    // конец аббревиатуры перед словом : HUDPanel -> HUD | Panel
+                    var last = cur[cur.Length - 1];
+                    cur.Remove(cur.Length - 1, 1);
+                    Flush(cur, words);
+                    cur.Append(last);
+                }
+
+                cur.Append(ch);
+                prev2 = prev;
+                prev  = ch;
+            }
+            Flush(cur, words);
+            return words;
+
+            static void Flush(StringBuilder b, List<string> acc)
+            {
+                if (b.Length == 0) return;
+                acc.Add(b.ToString());
+                b.Clear();
+            }
+        }
+
+        private static string Capitalize(string w) =>
+            string.IsNullOrEmpty(w) ? w : char.ToUpperInvariant(w[0]) + w.Substring(1).ToLowerInvariant();
+
+        private static string Decapitalize(string w)
+        {
+            if (string.IsNullOrEmpty(w)) return w;
+            // целиком заглавное слово (аббревиатура) -> всё строчным: HUD -> hud
+            bool allUpper = w.All(c => !char.IsLetter(c) || char.IsUpper(c));
+            return allUpper ? w.ToLowerInvariant() : char.ToLowerInvariant(w[0]) + w.Substring(1);
+        }
+
+        private static string EnsureValidIdent(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "Controller";
+            if (char.IsDigit(s[0])) s = "_" + s;
+            return s;
+        }
+
+        private static string Unique(HashSet<string> used, string ident)
+        {
+            var baseId = ident;
+            int i = 2;
+            while (!used.Add(ident)) ident = baseId + "_" + i++;
+            return ident;
+        }
+
+        private static string Escape(string s) =>
+            (s ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+}

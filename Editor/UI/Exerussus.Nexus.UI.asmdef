@@ -1,0 +1,20 @@
+{
+    "name": "Exerussus.Nexus.UI",
+    "rootNamespace": "Exerussus.Nexus.UI",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "Exerussus.Nexus.Core",
+        "Exerussus.Nexus.Theme"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements">
+    <!-- Только структура и раскладка. Все цвета и hover/press выставляются в C#
+         через Context.Theme.Get(token); USS отвечает за геометрию, не за палитру. -->
+    <ui:VisualElement name="ws-root" class="ws-root">
+
+        <ui:VisualElement name="ws-toolbar" class="ws-toolbar">
+            <ui:Button name="ws-add-selection" text="+ Выделение" class="ws-btn"
+                       tooltip="Добавить текущее выделение Project/Hierarchy" />
+            <ui:Button name="ws-add-set" text="+ Набор" class="ws-btn"
+                       tooltip="Свернуть выделение в одну карточку-набор" />
+            <ui:Button name="ws-add-group" text="+ Группа" class="ws-btn"
+                       tooltip="Добавить новую полку" />
+
+            <ui:VisualElement class="ws-tool-sep" />
+
+            <ui:Label text="Фильтр" class="ws-tool-label" />
+            <ui:TextField name="ws-search" class="ws-search" />
+
+            <ui:VisualElement class="ws-flex-spacer" />
+
+            <ui:Label text="Размер" class="ws-tool-label" />
+            <ui:Slider name="ws-scale" class="ws-scale" low-value="64" high-value="168" />
+
+            <ui:VisualElement class="ws-tool-sep" />
+
+            <ui:Button name="ws-clear" text="Очистить" class="ws-btn ws-btn--danger"
+                       tooltip="Убрать все незакреплённые карточки" />
+        </ui:VisualElement>
+
+        <ui:ScrollView name="ws-scroll" class="ws-scroll">
+            <ui:VisualElement name="ws-groups" class="ws-groups" />
+        </ui:ScrollView>
+
+    </ui:VisualElement>
+</ui:UXML>

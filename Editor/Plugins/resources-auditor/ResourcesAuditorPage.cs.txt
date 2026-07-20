@@ -1,0 +1,734 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditorInternal;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Аудит содержимого билда: Resources (Assets + пакеты) и StreamingAssets.
+    // Все сканы — только по явной кнопке (никакой фоновой индексации).
+    [EditorPage("resources-auditor", "Resources Auditor", PageCategory.Infrastructure, order: 40)]
+    public sealed class ResourcesAuditorPage : EditorPageBase
+    {
+        const string SnapshotFile = "report.json";
+        const int MaxDetailLinks = 30; // рефереров может быть сотни — не раздуваем панель
+
+        AuditReport _report = new AuditReport();
+        readonly List<ResourceAssetEntry> _filtered = new List<ResourceAssetEntry>();
+
+        VisualElement _summaryRow, _tabsRow, _tabContent, _detailPane;
+        Label _stampsLabel;
+        ListView _list;
+        int _tab;                       // 0 Resources, 1 StreamingAssets, 2 Вызовы, 3 Addressables
+        string _search = "";
+        AssetVerdict? _verdictFilter;   // null = все вердикты
+
+        protected override void OnInitialize()
+        {
+            // Поднимаем последний снапшот — страница открывается с прошлым отчётом, не пустой.
+            var path = Context.GetUserConfigPath(SnapshotFile);
+            if (!File.Exists(path)) return;
+            try { _report = JsonUtility.FromJson<AuditReport>(File.ReadAllText(path)) ?? new AuditReport(); }
+            catch { _report = new AuditReport(); }
+        }
+
+        public override VisualElement BuildUI()
+        {
+            var root = new VisualElement();
+            root.style.flexGrow = 1;
+            root.style.backgroundColor = Context.Theme.Get(NexusToken.BgHard);
+            root.style.paddingLeft = 8;
+            root.style.paddingRight = 8;
+            root.style.paddingTop = 6;
+            root.style.paddingBottom = 6;
+
+            root.Add(BuildToolbar());
+
+            _stampsLabel = new Label();
+            _stampsLabel.style.color = Context.Theme.Get(NexusToken.TextFaint);
+            _stampsLabel.style.fontSize = 10;
+            _stampsLabel.style.marginBottom = 4;
+            root.Add(_stampsLabel);
+
+            _summaryRow = Row();
+            _summaryRow.style.flexWrap = Wrap.Wrap;
+            root.Add(_summaryRow);
+
+            _tabsRow = Row();
+            _tabsRow.style.marginTop = 6;
+            root.Add(_tabsRow);
+            root.Add(Context.Ui.Divider());
+
+            _tabContent = new VisualElement();
+            _tabContent.style.flexGrow = 1;
+            root.Add(_tabContent);
+
+            RefreshAll();
+            return root;
+        }
+
+        public override void OnRefresh()
+        {
+            if (_tabContent != null) RefreshAll();
+        }
+
+        // ─────────────────────────── сканы ───────────────────────────
+
+        VisualElement BuildToolbar()
+        {
+            var bar = Row();
+            bar.style.flexWrap = Wrap.Wrap;
+            bar.style.marginBottom = 4;
+            AddBtn(bar, Context.Ui.Button(NexusRole.Primary, "Скан Resources", RunInventory));
+            AddBtn(bar, Context.Ui.Button(NexusRole.Common, "Скан кода", RunCode));
+            AddBtn(bar, Context.Ui.Button(NexusRole.Common, "Ссылки: сцены билда", RunRefsBuild));
+            AddBtn(bar, Context.Ui.Button(NexusRole.Common, "Ссылки: весь проект", RunRefsAll));
+            AddBtn(bar, Context.Ui.Button(NexusRole.Common, "BuildReport", RunBuildReport));
+            var spacer = new VisualElement();
+            spacer.style.flexGrow = 1;
+            bar.Add(spacer);
+            AddBtn(bar, Context.Ui.Button(NexusRole.Ghost, "Экспорт MD", () => Export(true)));
+            AddBtn(bar, Context.Ui.Button(NexusRole.Ghost, "Экспорт CSV", () => Export(false)));
+            return bar;
+        }
+
+        void RunInventory()
+        {
+            try
+            {
+                InventoryScanner.Scan(_report);
+                // Инвентарь пересоздал записи — результаты прошлых сканов к ним больше не привязаны.
+                // Честнее сбросить штампы и попросить перескан, чем показывать устаревшие вердикты.
+                _report.codeAt = _report.refsBuildAt = _report.refsAllAt = _report.buildReportAt = null;
+                _report.buildPackedTotal = -1;
+                _report.dynamicCalls.Clear();
+                _report.brokenCalls.Clear();
+                _report.hasDynamicCalls = false;
+                AddressablesProbe.Scan(_report); // дёшево — заодно с инвентарём
+                Finish("Инвентарь: " + _report.resources.Count + " ассетов в Resources, " +
+                    _report.streaming.Count + " файлов в StreamingAssets. Остальные сканы нужно перезапустить.",
+                    StatusKind.Ok);
+            }
+            catch (Exception ex) { Fail(ex); }
+        }
+
+        void RunCode()
+        {
+            if (!EnsureInventory()) return;
+            try
+            {
+                CodeUsageScanner.Scan(_report, Progress);
+                int bound = 0;
+                foreach (var e in _report.resources) bound += e.callSites.Count;
+                Finish("Код: привязано вызовов — " + bound + ", динамических — " + _report.dynamicCalls.Count +
+                    ", битых литералов — " + _report.brokenCalls.Count + ".",
+                    _report.brokenCalls.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
+            }
+            catch (Exception ex) { Fail(ex); }
+            finally { EditorUtility.ClearProgressBar(); }
+        }
+
+        void RunRefsBuild() { RunRefs(true); }
+        void RunRefsAll() { RunRefs(false); }
+
+        void RunRefs(bool buildMode)
+        {
+            if (!EnsureInventory()) return;
+            try
+            {
+                if (buildMode) ReferenceScanner.ScanBuildClosure(_report, Progress);
+                else ReferenceScanner.ScanAll(_report, Progress);
+                int referenced = 0;
+                foreach (var e in _report.resources)
+                    if ((buildMode ? e.buildReferrers : e.referrers).Count > 0) referenced++;
+                Finish((buildMode ? "Ссылки (сцены билда): " : "Ссылки (весь проект): ") +
+                    "прямые ссылки найдены на " + referenced + " ассетов Resources.", StatusKind.Ok);
+            }
+            catch (Exception ex) { Fail(ex); }
+            finally { EditorUtility.ClearProgressBar(); }
+        }
+
+        void RunBuildReport()
+        {
+            if (!EnsureInventory()) return;
+            try
+            {
+                string error;
+                if (!BuildReportReader.Read(_report, out error))
+                {
+                    Context.SetStatus(error, StatusKind.Warning);
+                    return;
+                }
+                Finish("BuildReport (" + _report.buildReportInfo + "): упаковано Resources на " +
+                    Fmt.Size(_report.buildPackedTotal) + ".", StatusKind.Ok);
+            }
+            catch (Exception ex) { Fail(ex); }
+        }
+
+        bool EnsureInventory()
+        {
+            // остальным сканам не во что резолвить без инвентаря — снимаем его автоматически
+            if (_report.resources.Count > 0 || !string.IsNullOrEmpty(_report.inventoryAt)) return true;
+            try { InventoryScanner.Scan(_report); AddressablesProbe.Scan(_report); return true; }
+            catch (Exception ex) { Fail(ex); return false; }
+        }
+
+        void Finish(string msg, StatusKind kind)
+        {
+            VerdictSolver.Recompute(_report);
+            SaveSnapshot();
+            RefreshAll();
+            Context.SetStatus(msg, kind);
+        }
+
+        void Fail(Exception ex)
+        {
+            Debug.LogException(ex);
+            Context.SetStatus("Скан упал: " + ex.Message, StatusKind.Error);
+        }
+
+        static void Progress(float f, string msg)
+        {
+            EditorUtility.DisplayProgressBar("Resources Auditor", msg, f);
+        }
+
+        void SaveSnapshot()
+        {
+            try { File.WriteAllText(Context.GetUserConfigPath(SnapshotFile), JsonUtility.ToJson(_report)); }
+            catch { /* снапшот — удобство, не критичен */ }
+        }
+
+        void Export(bool markdown)
+        {
+            if (_report.resources.Count == 0 && _report.streaming.Count == 0)
+            {
+                Context.SetStatus("Нечего экспортировать — сначала запустите сканы.", StatusKind.Warning);
+                return;
+            }
+            var ext = markdown ? "md" : "csv";
+            var path = EditorUtility.SaveFilePanel("Экспорт отчёта", "", "resources-audit." + ext, ext);
+            if (string.IsNullOrEmpty(path)) return;
+            File.WriteAllText(path, markdown
+                ? ReportExporter.BuildMarkdown(_report)
+                : ReportExporter.BuildCsv(_report));
+            Context.SetStatus("Отчёт сохранён: " + path, StatusKind.Ok);
+        }
+
+        // ─────────────────────────── перерисовка ───────────────────────────
+
+        void RefreshAll()
+        {
+            UpdateStamps();
+            BuildSummary();
+            BuildTabsRow();
+            BuildTabContent();
+        }
+
+        void UpdateStamps()
+        {
+            _stampsLabel.text =
+                "Инвентарь: " + Or(_report.inventoryAt) +
+                " · Код: " + Or(_report.codeAt) +
+                " · Ссылки (билд): " + Or(_report.refsBuildAt) +
+                " · Ссылки (все): " + Or(_report.refsAllAt) +
+                " · BuildReport: " + Or(_report.buildReportAt);
+        }
+
+        void BuildSummary()
+        {
+            _summaryRow.Clear();
+            long disk = 0, pkg = 0, dead = 0;
+            int pkgN = 0, deadN = 0;
+            foreach (var e in _report.resources)
+            {
+                disk += e.sizeDisk;
+                if (e.fromPackage) { pkg += e.sizeDisk; pkgN++; }
+                if (e.verdict == AssetVerdict.Dead) { dead += e.sizeDisk; deadN++; }
+            }
+            long sa = 0;
+            foreach (var s in _report.streaming) sa += s.size;
+
+            _summaryRow.Add(SummaryCard("Resources в билде (диск)",
+                _report.resources.Count + " · " + Fmt.Size(disk), NexusToken.Accent));
+            _summaryRow.Add(SummaryCard("из них в пакетах",
+                pkgN + " · " + Fmt.Size(pkg), NexusToken.TextNormal));
+            _summaryRow.Add(SummaryCard("StreamingAssets",
+                _report.streaming.Count + " · " + Fmt.Size(sa), NexusToken.TextNormal));
+            _summaryRow.Add(SummaryCard(
+                "упаковано (BuildReport" +
+                (string.IsNullOrEmpty(_report.buildReportInfo) ? "" : ": " + _report.buildReportInfo) + ")",
+                _report.buildPackedTotal >= 0 ? Fmt.Size(_report.buildPackedTotal) : "нет данных",
+                _report.buildPackedTotal >= 0 ? NexusToken.TextNormal : NexusToken.TextFaint));
+            _summaryRow.Add(SummaryCard("вероятный мёртвый груз",
+                deadN + " · " + Fmt.Size(dead), deadN > 0 ? NexusToken.Error : NexusToken.Ok));
+            _summaryRow.Add(SummaryCard("динамических вызовов",
+                _report.dynamicCalls.Count.ToString(),
+                _report.hasDynamicCalls ? NexusToken.Warning : NexusToken.Ok));
+        }
+
+        VisualElement SummaryCard(string caption, string value, NexusToken valueColor)
+        {
+            var card = Context.Ui.Card();
+            card.style.marginRight = 6;
+            card.style.marginBottom = 6;
+            card.style.paddingLeft = 10;
+            card.style.paddingRight = 10;
+            card.style.paddingTop = 6;
+            card.style.paddingBottom = 6;
+            card.style.minWidth = 150;
+            var v = new Label(value);
+            v.style.fontSize = 15;
+            v.style.unityFontStyleAndWeight = FontStyle.Bold;
+            v.style.color = Context.Theme.Get(valueColor);
+            var c = new Label(caption);
+            c.style.fontSize = 10;
+            c.style.color = Context.Theme.Get(NexusToken.TextDim);
+            card.Add(v);
+            card.Add(c);
+            return card;
+        }
+
+        void BuildTabsRow()
+        {
+            _tabsRow.Clear();
+            AddBtn(_tabsRow, TabButton(0, "Resources (" + _report.resources.Count + ")"));
+            AddBtn(_tabsRow, TabButton(1, "StreamingAssets (" + _report.streaming.Count + ")"));
+            AddBtn(_tabsRow, TabButton(2, "Вызовы (" + (_report.dynamicCalls.Count + _report.brokenCalls.Count) + ")"));
+            AddBtn(_tabsRow, TabButton(3, "Addressables"));
+        }
+
+        VisualElement TabButton(int index, string text)
+        {
+            return Context.Ui.Button(_tab == index ? NexusRole.Primary : NexusRole.Ghost, text, () =>
+            {
+                _tab = index;
+                BuildTabsRow();
+                BuildTabContent();
+            });
+        }
+
+        void BuildTabContent()
+        {
+            _tabContent.Clear();
+            switch (_tab)
+            {
+                case 0: _tabContent.Add(BuildResourcesTab()); break;
+                case 1: _tabContent.Add(BuildStreamingTab()); break;
+                case 2: _tabContent.Add(BuildCallsTab()); break;
+                default: _tabContent.Add(BuildAddressablesTab()); break;
+            }
+        }
+
+        // ─────────────────────────── вкладка Resources ───────────────────────────
+
+        VisualElement BuildResourcesTab()
+        {
+            var box = new VisualElement();
+            box.style.flexGrow = 1;
+
+            if (_report.resources.Count == 0)
+            {
+                box.Add(Hint(string.IsNullOrEmpty(_report.inventoryAt)
+                    ? "Нажмите «Скан Resources», чтобы собрать инвентарь."
+                    : "Папок Resources, попадающих в билд, в проекте нет."));
+                return box;
+            }
+
+            // фильтры: поиск + вердикты
+            var filters = Row();
+            filters.style.marginTop = 4;
+            filters.style.marginBottom = 4;
+            filters.style.flexWrap = Wrap.Wrap;
+            filters.style.alignItems = Align.Center;
+
+            var search = Context.Ui.Input(_search, v =>
+            {
+                _search = v ?? "";
+                ApplyFilter();
+                _list.itemsSource = _filtered;
+                _list.Rebuild(); // поиск меняет только список — вкладку не пересобираем, фокус не теряется
+            });
+            search.style.width = 220;
+            search.style.marginRight = 8;
+            filters.Add(search);
+
+            AddBtn(filters, FilterButton(null, "все"));
+            foreach (AssetVerdict v in Enum.GetValues(typeof(AssetVerdict)))
+                AddBtn(filters, FilterButton(v, VerdictText.Label(v)));
+            box.Add(filters);
+
+            ApplyFilter();
+
+            _list = new ListView
+            {
+                fixedItemHeight = 22,
+                makeItem = MakeRow,
+                bindItem = BindRow,
+                selectionType = SelectionType.Single,
+                itemsSource = _filtered,
+            };
+            _list.style.flexGrow = 1;
+            _list.style.backgroundColor = Context.Theme.Get(NexusToken.BgSoft);
+            _list.selectionChanged += objs => ShowDetail(objs.FirstOrDefault() as ResourceAssetEntry);
+            box.Add(_list);
+
+            _detailPane = new ScrollView();
+            _detailPane.style.height = 160;
+            _detailPane.style.marginTop = 4;
+            _detailPane.style.backgroundColor = Context.Theme.Get(NexusToken.BgRaised);
+            _detailPane.style.paddingLeft = 8;
+            _detailPane.style.paddingTop = 4;
+            box.Add(_detailPane);
+            ShowDetail(null);
+            return box;
+        }
+
+        VisualElement FilterButton(AssetVerdict? v, string text)
+        {
+            bool active = Nullable.Equals(_verdictFilter, v);
+            return Context.Ui.Button(active ? NexusRole.Primary : NexusRole.Ghost, text, () =>
+            {
+                _verdictFilter = v;
+                BuildTabContent(); // клик по фильтру — пересборка вкладки, чтобы перекрасить активную кнопку
+            });
+        }
+
+        void ApplyFilter()
+        {
+            _filtered.Clear();
+            foreach (var e in _report.resources)
+            {
+                if (_verdictFilter.HasValue && e.verdict != _verdictFilter.Value) continue;
+                if (_search.Length > 0 &&
+                    e.assetPath.IndexOf(_search, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    e.resourcesPath.IndexOf(_search, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    e.typeName.IndexOf(_search, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                _filtered.Add(e);
+            }
+        }
+
+        VisualElement MakeRow()
+        {
+            var row = Row();
+            row.style.alignItems = Align.Center;
+            row.style.paddingLeft = 4;
+
+            var pill = new Label { name = "pill" };
+            pill.style.width = 96;
+            pill.style.fontSize = 10;
+            pill.style.unityTextAlign = TextAnchor.MiddleCenter;
+            pill.style.marginRight = 6;
+            SetRadius(pill, 6);
+
+            var type = new Label { name = "type" };
+            type.style.width = 96;
+            type.style.fontSize = 11;
+            type.style.color = Context.Theme.Get(NexusToken.TextDim);
+
+            var path = new Label { name = "path" };
+            path.style.flexGrow = 1;
+            path.style.overflow = Overflow.Hidden;
+            path.style.textOverflow = TextOverflow.Ellipsis;
+            path.style.whiteSpace = WhiteSpace.NoWrap;
+            path.style.color = Context.Theme.Get(NexusToken.TextNormal);
+
+            var flags = new Label { name = "flags" };
+            flags.style.width = 70;
+            flags.style.fontSize = 10;
+            flags.style.color = Context.Theme.Get(NexusToken.Warning);
+
+            var disk = new Label { name = "disk" };
+            disk.style.width = 72;
+            disk.style.unityTextAlign = TextAnchor.MiddleRight;
+            disk.style.color = Context.Theme.Get(NexusToken.TextDim);
+
+            var packed = new Label { name = "packed" };
+            packed.style.width = 72;
+            packed.style.unityTextAlign = TextAnchor.MiddleRight;
+            packed.style.color = Context.Theme.Get(NexusToken.TextNormal);
+
+            row.Add(pill); row.Add(type); row.Add(path); row.Add(flags); row.Add(disk); row.Add(packed);
+            return row;
+        }
+
+        void BindRow(VisualElement row, int i)
+        {
+            var e = _filtered[i];
+            var rc = Context.Theme.GetRole(RoleOf(e.verdict));
+            var pill = row.Q<Label>("pill");
+            pill.text = VerdictText.Label(e.verdict);
+            pill.style.backgroundColor = rc.Soft;
+            pill.style.color = rc.Fg;
+            row.Q<Label>("type").text = e.typeName;
+            row.Q<Label>("path").text = (e.fromPackage ? "[pkg] " : "") + e.assetPath;
+            row.Q<Label>("flags").text = RowFlags(e);
+            row.Q<Label>("disk").text = Fmt.Size(e.sizeDisk);
+            row.Q<Label>("packed").text = e.sizePacked >= 0 ? Fmt.Size(e.sizePacked) : "—";
+        }
+
+        static string RowFlags(ResourceAssetEntry e)
+        {
+            var f = "";
+            if (e.editorOnlyUsage) f += "ed ";
+            if (e.caseMismatch) f += "Aa ";
+            if (e.addressableDuplicate) f += "addr";
+            return f.TrimEnd();
+        }
+
+        static NexusRole RoleOf(AssetVerdict v)
+        {
+            switch (v)
+            {
+                case AssetVerdict.UsedByCode:
+                case AssetVerdict.UsedByLoadAll:  return NexusRole.Success;
+                case AssetVerdict.DirectRefsOnly: return NexusRole.Warning;
+                case AssetVerdict.Dead:           return NexusRole.Alarm;
+                case AssetVerdict.Unknown:        return NexusRole.Info;
+                default:                          return NexusRole.Muted;
+            }
+        }
+
+        void ShowDetail(ResourceAssetEntry e)
+        {
+            _detailPane.Clear();
+            if (e == null)
+            {
+                _detailPane.Add(Hint("Выберите ассет, чтобы увидеть вызовы и ссылки."));
+                return;
+            }
+
+            var head = Row();
+            head.style.alignItems = Align.Center;
+            var title = new Label(e.assetPath);
+            title.style.unityFontStyleAndWeight = FontStyle.Bold;
+            title.style.color = Context.Theme.Get(NexusToken.TextNormal);
+            title.style.marginRight = 8;
+            head.Add(title);
+            AddBtn(head, Context.Ui.Button(NexusRole.Common, "Ping", () =>
+                EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(e.assetPath))));
+            AddBtn(head, Context.Ui.Button(NexusRole.Ghost, "Копировать Load-путь", () =>
+            {
+                EditorGUIUtility.systemCopyBuffer = e.resourcesPath;
+                Context.SetStatus("Скопировано: " + e.resourcesPath, StatusKind.Info);
+            }));
+            _detailPane.Add(head);
+
+            var loadPath = new Label("Resources.Load(\"" + e.resourcesPath + "\") · " + e.typeName +
+                " · диск " + Fmt.Size(e.sizeDisk) +
+                (e.sizePacked >= 0 ? " · в билде " + Fmt.Size(e.sizePacked) : ""));
+            loadPath.style.color = Context.Theme.Get(NexusToken.TextDim);
+            loadPath.style.fontSize = 11;
+            _detailPane.Add(loadPath);
+
+            if (e.editorOnlyUsage)
+                _detailPane.Add(Context.Ui.StatusPill(StatusKind.Warning, "Грузится только editor-кодом — билд эти вызовы не исполняет"));
+            if (e.caseMismatch)
+                _detailPane.Add(Context.Ui.StatusPill(StatusKind.Warning, "Вызов совпадает с путём только без учёта регистра — сломается на case-sensitive платформах"));
+            if (e.addressableDuplicate)
+                _detailPane.Add(Context.Ui.StatusPill(StatusKind.Warning, "Ассет одновременно упакован Addressables — двойная упаковка"));
+
+            AddLinkSection("Вызовы из кода", e.callSites.Count, e.callSites.Select(c => (object)c),
+                obj =>
+                {
+                    var c = (CallSite)obj;
+                    return Context.Ui.Button(NexusRole.Ghost,
+                        c.file + ":" + c.line + " · " + c.method + (c.editorCode ? " · editor" : ""),
+                        () => OpenAt(c.file, c.line));
+                });
+            AddLinkSection("Прямые ссылки (сцены билда)", e.buildReferrers.Count,
+                e.buildReferrers.Select(p => (object)p), obj => PingButton((string)obj));
+            AddLinkSection("Прямые ссылки (весь проект)", e.referrers.Count,
+                e.referrers.Select(p => (object)p), obj => PingButton((string)obj));
+        }
+
+        void AddLinkSection(string title, int count, IEnumerable<object> items,
+            Func<object, VisualElement> makeLink)
+        {
+            _detailPane.Add(Context.Ui.Divider());
+            var header = new Label(title + ": " + count);
+            header.style.color = Context.Theme.Get(NexusToken.TextDim);
+            header.style.fontSize = 11;
+            _detailPane.Add(header);
+            int shown = 0;
+            foreach (var it in items)
+            {
+                if (shown++ >= MaxDetailLinks)
+                {
+                    _detailPane.Add(Hint("… и ещё " + (count - MaxDetailLinks)));
+                    break;
+                }
+                var link = makeLink(it);
+                link.style.alignSelf = Align.FlexStart;
+                _detailPane.Add(link);
+            }
+        }
+
+        VisualElement PingButton(string assetPath)
+        {
+            return Context.Ui.Button(NexusRole.Ghost, assetPath, () =>
+                EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath)));
+        }
+
+        static void OpenAt(string file, int line)
+        {
+            // работает и для Assets, и для Packages/PackageCache (файл откроется read-only)
+            InternalEditorUtility.OpenFileAtLineExternal(file, line);
+        }
+
+        // ─────────────────────────── остальные вкладки ───────────────────────────
+
+        VisualElement BuildStreamingTab()
+        {
+            var box = new VisualElement();
+            box.style.flexGrow = 1;
+            if (_report.streaming.Count == 0)
+            {
+                box.Add(Hint(string.IsNullOrEmpty(_report.inventoryAt)
+                    ? "Нажмите «Скан Resources» — StreamingAssets собирается тем же сканом."
+                    : "Папки Assets/StreamingAssets нет или она пуста."));
+                return box;
+            }
+            var list = new ListView
+            {
+                fixedItemHeight = 22,
+                selectionType = SelectionType.Single,
+                itemsSource = _report.streaming,
+                makeItem = () =>
+                {
+                    var row = Row();
+                    row.style.alignItems = Align.Center;
+                    row.style.paddingLeft = 4;
+                    var path = new Label { name = "path" };
+                    path.style.flexGrow = 1;
+                    path.style.overflow = Overflow.Hidden;
+                    path.style.textOverflow = TextOverflow.Ellipsis;
+                    path.style.whiteSpace = WhiteSpace.NoWrap;
+                    path.style.color = Context.Theme.Get(NexusToken.TextNormal);
+                    var size = new Label { name = "size" };
+                    size.style.width = 80;
+                    size.style.unityTextAlign = TextAnchor.MiddleRight;
+                    size.style.color = Context.Theme.Get(NexusToken.TextDim);
+                    row.Add(path); row.Add(size);
+                    return row;
+                },
+                bindItem = (row, i) =>
+                {
+                    var s = _report.streaming[i];
+                    row.Q<Label>("path").text = s.path;
+                    row.Q<Label>("size").text = Fmt.Size(s.size);
+                },
+            };
+            list.style.flexGrow = 1;
+            list.style.backgroundColor = Context.Theme.Get(NexusToken.BgSoft);
+            list.selectionChanged += objs =>
+            {
+                var s = objs.FirstOrDefault() as StreamingEntry;
+                if (s != null)
+                    EditorGUIUtility.PingObject(AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(s.path));
+            };
+            box.Add(list);
+            return box;
+        }
+
+        VisualElement BuildCallsTab()
+        {
+            var scroll = new ScrollView();
+            scroll.style.flexGrow = 1;
+            if (string.IsNullOrEmpty(_report.codeAt))
+            {
+                scroll.Add(Hint("Нажмите «Скан кода», чтобы найти вызовы Resources.Load."));
+                return scroll;
+            }
+            AddCallsSection(scroll, "Динамические вызовы — пути не резолвятся статически (" +
+                _report.dynamicCalls.Count + ")", _report.dynamicCalls, false);
+            AddCallsSection(scroll, "Битые литералы — под путём нет ассета (" +
+                _report.brokenCalls.Count + ")", _report.brokenCalls, true);
+            if (_report.dynamicCalls.Count == 0 && _report.brokenCalls.Count == 0)
+                scroll.Add(Context.Ui.StatusPill(StatusKind.Ok, "Все найденные вызовы — литеральные и резолвятся в ассеты"));
+            return scroll;
+        }
+
+        void AddCallsSection(VisualElement parent, string title, List<CodeCallEntry> calls, bool withLiteral)
+        {
+            if (calls.Count == 0) return;
+            var header = new Label(title);
+            header.style.unityFontStyleAndWeight = FontStyle.Bold;
+            header.style.color = Context.Theme.Get(NexusToken.TextNormal);
+            header.style.marginTop = 6;
+            parent.Add(header);
+            foreach (var c in calls)
+            {
+                var text = c.file + ":" + c.line + " · " + c.method +
+                    (withLiteral ? " \"" + c.literal + "\"" : "") +
+                    (c.editorCode ? " · editor" : "") + "   —   " + c.snippet;
+                var btn = Context.Ui.Button(NexusRole.Ghost, text, () => OpenAt(c.file, c.line));
+                btn.style.alignSelf = Align.FlexStart;
+                parent.Add(btn);
+            }
+        }
+
+        VisualElement BuildAddressablesTab()
+        {
+            var scroll = new ScrollView();
+            scroll.style.flexGrow = 1;
+            if (!_report.addressablesPresent)
+            {
+                scroll.Add(Hint("Пакет Addressables в проекте не обнаружен."));
+                return scroll;
+            }
+            var dups = _report.resources.Where(e => e.addressableDuplicate).ToList();
+            if (dups.Count == 0)
+            {
+                scroll.Add(Context.Ui.StatusPill(StatusKind.Ok, "Дублей Resources ↔ Addressables не найдено"));
+                return scroll;
+            }
+            scroll.Add(Context.Ui.StatusPill(StatusKind.Warning,
+                "Двойная упаковка: " + dups.Count + " ассетов лежат и в Resources, и в Addressables"));
+            foreach (var e in dups)
+            {
+                var btn = PingButton(e.assetPath + " · " + Fmt.Size(e.sizeDisk));
+                btn.style.alignSelf = Align.FlexStart;
+                scroll.Add(btn);
+            }
+            return scroll;
+        }
+
+        // ─────────────────────────── мелкие помощники ───────────────────────────
+
+        static VisualElement Row()
+        {
+            var v = new VisualElement();
+            v.style.flexDirection = FlexDirection.Row;
+            return v;
+        }
+
+        static void AddBtn(VisualElement parent, VisualElement b)
+        {
+            b.style.marginRight = 4;
+            parent.Add(b);
+        }
+
+        static void SetRadius(VisualElement e, int r)
+        {
+            e.style.borderTopLeftRadius = r;
+            e.style.borderTopRightRadius = r;
+            e.style.borderBottomLeftRadius = r;
+            e.style.borderBottomRightRadius = r;
+        }
+
+        Label Hint(string text)
+        {
+            var l = new Label(text);
+            l.style.color = Context.Theme.Get(NexusToken.TextFaint);
+            l.style.marginTop = 8;
+            return l;
+        }
+
+        static string Or(string s) { return string.IsNullOrEmpty(s) ? "—" : s; }
+    }
+}

@@ -1,0 +1,297 @@
+using System;
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Workspace
+{
+    /// <summary>
+    /// Рабочая область (scratchpad): Drag&amp;Drop ассетов и объектов сцены, карточки с иконкой типа,
+    /// клик = пинг+выделение, двойной клик = открыть/редактировать префаб, alt+клик = убрать карточку.
+    /// Объекты сцены помнят свою сцену (GlobalObjectId) и предлагают перейти в неё перед пингом.
+    /// Образующая (constitutive) страница: ничего вне проекта не зависит от её вывода.
+    /// Личное состояние — JSON в <c>UserSettings/Exerussus.Nexus/&lt;id&gt;/</c> через <c>Context</c>.
+    /// Тематизация — только через <c>Context.Theme.Get(token)</c>; ссылки на сборку Theme у страницы нет.
+    /// </summary>
+    [EditorPage("workspace", "Рабочая область", PageCategory.Infrastructure, 20, "d_Favorite")]
+    public sealed partial class WorkspacePage : EditorPageBase
+    {
+        private const string ConfigFile = "workspace.json";
+        private const string UxmlAsset = "WorkspacePage.uxml";
+        private const string UssAsset = "WorkspacePage.uss";
+
+        // Ключи для переноса карточек между группами через DragAndDrop.SetGenericData.
+        private const string MoveEntryKey = "ws-move-entry";
+        private const string MoveFromKey = "ws-move-from";
+
+        private WorkspaceStore _store;
+
+        private VisualElement _root;
+        private VisualElement _groupsContainer;
+        private Slider _scaleSlider;
+        private TextField _search;
+
+        private string _filter = "";
+        private string _flashKey; // карточка, которую подсветить после rebuild (дубликат при дропе)
+        private IVisualElementScheduledItem _rebuildJob;
+        private IVisualElementScheduledItem _scaleSaveJob;
+        private float _pendingScale;
+
+        // Подписки на редакторные события — личные, со временем жизни «пока вкладка в фокусе».
+        // Track() в базе снимается лишь в OnExit, а нам нужно гасить их в OnUnfocus
+        // (off means off: расфокушенная вкладка не должна реагировать на иерархию/сцены),
+        // поэтому ведём их вручную и диспоузим в OnUnfocus.
+        private readonly List<IDisposable> _focusSubs = new();
+
+        // ---------- Жизненный цикл ----------
+
+        protected override void OnInitialize()
+        {
+            _store = new WorkspaceStore(Context.GetUserConfigPath(ConfigFile));
+            _store.EnsureAtLeastOneGroup();
+            _pendingScale = _store.CardScale;
+        }
+
+        public override VisualElement BuildUI()
+        {
+            _root = new VisualElement { name = "ws-host" };
+            _root.style.flexGrow = 1;
+
+            var tree = Context.LoadDeployedAsset<VisualTreeAsset>(UxmlAsset);
+            if (tree != null) tree.CloneTree(_root);
+            var uss = Context.LoadDeployedAsset<StyleSheet>(UssAsset);
+            if (uss != null) _root.styleSheets.Add(uss);
+
+            _groupsContainer = _root.Q<VisualElement>("ws-groups");
+
+            // Тулбар
+            _root.Q<Button>("ws-add-selection").clicked += AddSelection;
+            _root.Q<Button>("ws-add-set").clicked += CreateSetFromSelection;
+            _root.Q<Button>("ws-add-group").clicked += () => { _store.AddGroup("Группа"); RebuildGroups(); };
+            _root.Q<Button>("ws-clear").clicked += ClearWorkspace;
+
+            _scaleSlider = _root.Q<Slider>("ws-scale");
+            _scaleSlider.lowValue = WorkspaceStore.MinScale;
+            _scaleSlider.highValue = WorkspaceStore.MaxScale;
+            _scaleSlider.SetValueWithoutNotify(_store.CardScale);
+            _scaleSlider.RegisterValueChangedCallback(evt => ApplyScale(evt.newValue));
+
+            _search = _root.Q<TextField>("ws-search");
+            _search.RegisterValueChangedCallback(evt => { _filter = evt.newValue ?? ""; RebuildGroups(); });
+
+            // Дроп в свободную область списка → добавить в первую группу.
+            RegisterGroupDrop(_groupsContainer, () => _store.EnsureAtLeastOneGroup(), () => -1);
+
+            ApplyChrome();
+            RebuildGroups();
+            return _root;
+        }
+
+        public override void OnEnter()
+        {
+            // Данные уже загружены в OnInitialize — здесь только лёгкая отрисовка «пока видно».
+            RebuildGroups();
+        }
+
+        public override void OnExit()
+        {
+            CancelPendingClicks();
+            // Подписки гасятся в OnUnfocus (он всегда раньше OnExit), но подстрахуемся.
+            UnhookEditorEvents();
+        }
+
+        public override void OnFocus()
+        {
+            // Высокочастотная работа — отслеживание изменений иерархии/сцен — только в фокусе.
+            HookEditorEvents();
+            RebuildGroups(); // догнать изменения, случившиеся пока вкладка была не в фокусе
+        }
+
+        public override void OnUnfocus()
+        {
+            UnhookEditorEvents();
+            FlushPendingScale();
+        }
+
+        public override void OnRefresh()
+        {
+            RebuildGroups();
+            Context.SetStatus("Рабочая область обновлена", StatusKind.Info);
+        }
+
+        public override bool CanClose()
+        {
+            FlushPendingScale();
+            return true;
+        }
+
+        public override void OnPrePack()
+        {
+            // Последний шанс дописать отложенное перед упаковкой в Preserve при disable.
+            FlushPendingScale();
+            _store?.Persist();
+        }
+
+        protected override void OnDisposing()
+        {
+            UnhookEditorEvents();
+        }
+
+        // ---------- Редакторные события ----------
+
+        private void HookEditorEvents()
+        {
+            if (_focusSubs.Count > 0) return;
+            _focusSubs.Add(Sub(
+                () => EditorApplication.hierarchyChanged += ScheduleRebuild,
+                () => EditorApplication.hierarchyChanged -= ScheduleRebuild));
+            _focusSubs.Add(Sub(
+                () => EditorSceneManager.sceneOpened += OnSceneOpened,
+                () => EditorSceneManager.sceneOpened -= OnSceneOpened));
+            _focusSubs.Add(Sub(
+                () => EditorSceneManager.sceneClosed += OnSceneClosed,
+                () => EditorSceneManager.sceneClosed -= OnSceneClosed));
+        }
+
+        private void UnhookEditorEvents()
+        {
+            foreach (var d in _focusSubs) d.Dispose();
+            _focusSubs.Clear();
+        }
+
+        private static IDisposable Sub(Action subscribe, Action unsubscribe)
+        {
+            subscribe();
+            return new ActionDisposable(unsubscribe);
+        }
+
+        private sealed class ActionDisposable : IDisposable
+        {
+            private Action _dispose;
+            public ActionDisposable(Action dispose) => _dispose = dispose;
+            public void Dispose() { _dispose?.Invoke(); _dispose = null; }
+        }
+
+        private void OnSceneOpened(Scene s, OpenSceneMode m) => ScheduleRebuild();
+        private void OnSceneClosed(Scene s) => ScheduleRebuild();
+
+        /// <summary>Дебаунс пересборки — события сцены/иерархии могут лететь пачками.</summary>
+        private void ScheduleRebuild()
+        {
+            if (_root == null) return;
+            _rebuildJob?.Pause();
+            _rebuildJob = _root.schedule.Execute(RebuildGroups).StartingIn(120);
+        }
+
+        // ---------- Масштаб карточек ----------
+
+        private void ApplyScale(float size)
+        {
+            _pendingScale = size;
+            // Меняем размер карточек мгновенно, а запись на диск откладываем —
+            // слайдер шлёт изменения каждый кадр.
+            _root.Query<VisualElement>(className: "ws-card").ForEach(c =>
+            {
+                c.style.width = size;
+                c.style.height = size;
+            });
+            _scaleSaveJob?.Pause();
+            _scaleSaveJob = _root.schedule.Execute(FlushPendingScale).StartingIn(250);
+        }
+
+        private void FlushPendingScale()
+        {
+            if (_scaleSaveJob == null) return;
+            _scaleSaveJob.Pause();
+            _scaleSaveJob = null;
+            _store.CardScale = _pendingScale;
+        }
+
+        // ---------- Пересборка ----------
+
+        /// <summary>Полная пересборка полок из стора.</summary>
+        private void RebuildGroups()
+        {
+            if (_groupsContainer == null) return;
+            _groupsContainer.Clear();
+
+            foreach (var group in _store.Groups)
+                _groupsContainer.Add(BuildGroup(group));
+        }
+
+        // ---------- Тема (резолв токенов в C#; псевдоклассов USS у нас нет) ----------
+
+        private Color Col(NexusToken token) => Context.Theme.Get(token);
+
+        private static void SetBorder(VisualElement e, Color c)
+        {
+            e.style.borderTopColor = c;
+            e.style.borderBottomColor = c;
+            e.style.borderLeftColor = c;
+            e.style.borderRightColor = c;
+        }
+
+        /// <summary>Тот же hover/press, что делает движковый MakePressable, но локально и без ссылки на Theme.</summary>
+        private void WireHover(VisualElement e, Color baseBg, Color hoverBg, Color baseBorder, Color hoverBorder)
+        {
+            e.style.backgroundColor = baseBg;
+            SetBorder(e, baseBorder);
+            e.RegisterCallback<PointerEnterEvent>(_ => { e.style.backgroundColor = hoverBg; SetBorder(e, hoverBorder); });
+            e.RegisterCallback<PointerLeaveEvent>(_ => { e.style.backgroundColor = baseBg; SetBorder(e, baseBorder); });
+        }
+
+        /// <summary>Статичный «хром» окна (тулбар/скролл/подписи/поля) — красится один раз при сборке.</summary>
+        private void ApplyChrome()
+        {
+            var toolbar = _root.Q<VisualElement>("ws-toolbar");
+            if (toolbar != null)
+            {
+                toolbar.style.backgroundColor = Col(NexusToken.BgSoft);
+                toolbar.style.borderBottomColor = Col(NexusToken.Border);
+            }
+
+            var scroll = _root.Q<ScrollView>("ws-scroll");
+            if (scroll != null) scroll.style.backgroundColor = Col(NexusToken.BgHard);
+
+            _root.Query<Label>(className: "ws-tool-label").ForEach(l => l.style.color = Col(NexusToken.TextDim));
+
+            var input = _search?.Q(className: "unity-base-text-field__input");
+            if (input != null)
+            {
+                input.style.backgroundColor = Col(NexusToken.BgHard);
+                input.style.color = Col(NexusToken.TextNormal);
+                SetBorder(input, Col(NexusToken.Border));
+            }
+
+            ThemeButton(_root.Q<Button>("ws-add-selection"), danger: false);
+            ThemeButton(_root.Q<Button>("ws-add-set"), danger: false);
+            ThemeButton(_root.Q<Button>("ws-add-group"), danger: false);
+            ThemeButton(_root.Q<Button>("ws-clear"), danger: true);
+        }
+
+        private void ThemeButton(Button b, bool danger)
+        {
+            if (b == null) return;
+            b.style.color = Col(NexusToken.TextNormal);
+            b.style.backgroundColor = Col(NexusToken.BgRaised);
+            SetBorder(b, Col(NexusToken.Border));
+
+            b.RegisterCallback<PointerEnterEvent>(_ =>
+            {
+                b.style.backgroundColor = Col(NexusToken.Hover);
+                SetBorder(b, Col(danger ? NexusToken.Error : NexusToken.Accent));
+                if (danger) b.style.color = Col(NexusToken.Error);
+            });
+            b.RegisterCallback<PointerLeaveEvent>(_ =>
+            {
+                b.style.backgroundColor = Col(NexusToken.BgRaised);
+                SetBorder(b, Col(NexusToken.Border));
+                b.style.color = Col(NexusToken.TextNormal);
+            });
+        }
+    }
+}

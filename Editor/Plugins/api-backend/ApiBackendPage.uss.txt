@@ -1,0 +1,72 @@
+/* Страница API/Backend. ТОЛЬКО layout: все цвета красятся из C# токенами
+   палитры (Context.Theme / Context.Ui). transparent ниже — сброс дефолтных
+   стилей кнопки, не цвет палитры. */
+
+.api-root {
+    flex-grow: 1;
+    padding: 8px;
+}
+
+/* --- Табы --- */
+.api-tabbar {
+    flex-direction: row;
+    margin-bottom: 8px;
+    border-bottom-width: 1px;
+}
+
+.api-tab {
+    background-color: transparent;
+    border-width: 0;
+    border-bottom-width: 2px;
+    border-bottom-color: transparent;
+    padding: 6px 14px;
+    margin-right: 2px;
+    -unity-font-style: bold;
+}
+
+.api-content {
+    flex-grow: 1;
+}
+
+/* --- Секции-карточки (вид карточки даёт Context.Ui.Card) --- */
+.api-section {
+    margin-bottom: 8px;
+}
+
+.api-section__title {
+    -unity-font-style: bold;
+    margin-bottom: 6px;
+}
+
+/* --- Поля и кнопки --- */
+.api-field {
+    margin-bottom: 4px;
+}
+
+.api-btn {
+    margin-top: 6px;
+}
+
+/* --- Лог / предпросмотр команды --- */
+.api-log {
+    margin-top: 6px;
+    max-height: 260px;
+    white-space: normal;
+}
+
+/* --- Подсказки и статусы --- */
+.api-hint {
+    margin-bottom: 6px;
+    white-space: normal;
+}
+
+.api-inline-status {
+    margin-top: 4px;
+    white-space: normal;
+}
+
+/* --- Строки изменений (дрейф / дифф кода / линт) --- */
+.api-change {
+    padding: 2px 0;
+    white-space: normal;
+}

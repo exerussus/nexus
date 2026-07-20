@@ -1,0 +1,114 @@
+using System.Text;
+
+namespace Exerussus.Nexus.Pages.ResourcesAuditor
+{
+    // Экспорт отчёта. Markdown — для людей и репозиториев (таблицы ок),
+    // CSV — для таблиц/скриптов. Путь выбирает пользователь.
+    public static class ReportExporter
+    {
+        public static string BuildMarkdown(AuditReport r)
+        {
+            var sb = new StringBuilder(64 * 1024);
+            sb.AppendLine("# Resources Audit");
+            sb.AppendLine();
+            sb.AppendLine("Инвентарь: " + Or(r.inventoryAt) + " · Код: " + Or(r.codeAt) +
+                " · Ссылки (билд): " + Or(r.refsBuildAt) + " · Ссылки (все): " + Or(r.refsAllAt) +
+                " · BuildReport: " + Or(r.buildReportAt));
+            sb.AppendLine();
+
+            long disk = 0, dead = 0; int deadN = 0;
+            foreach (var e in r.resources)
+            {
+                disk += e.sizeDisk;
+                if (e.verdict == AssetVerdict.Dead) { dead += e.sizeDisk; deadN++; }
+            }
+            long saDisk = 0;
+            foreach (var s in r.streaming) saDisk += s.size;
+
+            sb.AppendLine("- Resources: **" + r.resources.Count + "** файлов, **" + Fmt.Size(disk) + "** на диске" +
+                (r.buildPackedTotal >= 0 ? ", **" + Fmt.Size(r.buildPackedTotal) + "** упаковано (" + r.buildReportInfo + ")" : ""));
+            sb.AppendLine("- StreamingAssets: **" + r.streaming.Count + "** файлов, **" + Fmt.Size(saDisk) + "**");
+            sb.AppendLine("- Вероятный мёртвый груз: **" + deadN + "** файлов, **" + Fmt.Size(dead) + "**");
+            sb.AppendLine("- Динамические вызовы Resources.Load: **" + r.dynamicCalls.Count + "**" +
+                (r.hasDynamicCalls ? " (вердикты «неизвестно» могут использоваться динамически)" : ""));
+            sb.AppendLine();
+
+            sb.AppendLine("## Resources");
+            sb.AppendLine();
+            sb.AppendLine("| Вердикт | Ассет | Load-путь | Тип | Диск | В билде | Флаги |");
+            sb.AppendLine("|---|---|---|---|---|---|---|");
+            foreach (var e in r.resources)
+                sb.AppendLine("| " + VerdictText.Label(e.verdict) + " | " + e.assetPath +
+                    (e.fromPackage ? " (pkg)" : "") + " | `" + e.resourcesPath + "` | " + e.typeName +
+                    " | " + Fmt.Size(e.sizeDisk) + " | " + Fmt.Size(e.sizePacked) + " | " + Flags(e) + " |");
+            sb.AppendLine();
+
+            if (r.streaming.Count > 0)
+            {
+                sb.AppendLine("## StreamingAssets");
+                sb.AppendLine();
+                sb.AppendLine("| Файл | Размер |");
+                sb.AppendLine("|---|---|");
+                foreach (var s in r.streaming)
+                    sb.AppendLine("| " + s.path + " | " + Fmt.Size(s.size) + " |");
+                sb.AppendLine();
+            }
+
+            AppendCalls(sb, "Динамические вызовы (пути не резолвятся)", r.dynamicCalls, false);
+            AppendCalls(sb, "Битые литералы (ассета под путём нет)", r.brokenCalls, true);
+            return sb.ToString();
+        }
+
+        static void AppendCalls(StringBuilder sb, string title,
+            System.Collections.Generic.List<CodeCallEntry> calls, bool withLiteral)
+        {
+            if (calls.Count == 0) return;
+            sb.AppendLine("## " + title);
+            sb.AppendLine();
+            foreach (var c in calls)
+                sb.AppendLine("- `" + c.file + ":" + c.line + "` — " + c.method +
+                    (withLiteral ? " \"" + c.literal + "\"" : "") +
+                    (c.editorCode ? " (editor)" : "") + " — `" + c.snippet.Replace("`", "'") + "`");
+            sb.AppendLine();
+        }
+
+        public static string BuildCsv(AuditReport r)
+        {
+            var sb = new StringBuilder(64 * 1024);
+            sb.AppendLine("assetPath,resourcesPath,type,fromPackage,sizeDisk,sizePacked,verdict,editorOnlyUsage,caseMismatch,addressableDuplicate,callSites,buildRefs,allRefs");
+            foreach (var e in r.resources)
+                sb.AppendLine(string.Join(",", new[]
+                {
+                    Csv(e.assetPath), Csv(e.resourcesPath), Csv(e.typeName),
+                    e.fromPackage ? "1" : "0",
+                    e.sizeDisk.ToString(), e.sizePacked.ToString(),
+                    Csv(VerdictText.Label(e.verdict)),
+                    e.editorOnlyUsage ? "1" : "0",
+                    e.caseMismatch ? "1" : "0",
+                    e.addressableDuplicate ? "1" : "0",
+                    e.callSites.Count.ToString(),
+                    e.buildReferrers.Count.ToString(),
+                    e.referrers.Count.ToString(),
+                }));
+            return sb.ToString();
+        }
+
+        static string Flags(ResourceAssetEntry e)
+        {
+            var f = "";
+            if (e.editorOnlyUsage) f += "editor-only ";
+            if (e.caseMismatch) f += "case! ";
+            if (e.addressableDuplicate) f += "addr-dup ";
+            return f.TrimEnd();
+        }
+
+        static string Csv(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return "";
+            return v.IndexOfAny(new[] { ',', '"', '\n' }) >= 0
+                ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
+        }
+
+        static string Or(string s) { return string.IsNullOrEmpty(s) ? "—" : s; }
+    }
+}

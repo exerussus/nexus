@@ -1,0 +1,508 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Самодостаточная кодовая область: rich-text-подсветка под прозрачным TextField,
+    // общий скролл, каретка/выделение нативные. Весь внешний вид — в SalamanderCode.uss
+    // (стайлшит передаёт страница: элемент не знает путей — инвариант №7 Nexus).
+    // Иерархия:
+    //   this (.sal-code-editor)
+    //   └── ScrollView (.sal-code-scroll)
+    //       └── stack (.sal-code-stack)             ← размер задаёт слой подсветки
+    //           ├── Label (.sal-code-highlight)     ← rich-text, в потоке
+    //           └── TextField (.sal-code-input)     ← absolute поверх, текст прозрачный
+    // Метка ошибки компиляции для подчёркивания в коде (Line/Column — 1-based, как у диагностик).
+    public struct SalErrorMark
+    {
+        public int Line;
+        public int Column;
+        public string Message; // уходит в tooltip подчёркивания
+    }
+
+    public sealed class CodeEditorElement : VisualElement
+    {
+        // кастомные свойства палитры из USS
+        private static readonly CustomStyleProperty<Color> CommentProp = new CustomStyleProperty<Color>("--sal-comment");
+        private static readonly CustomStyleProperty<Color> StringProp  = new CustomStyleProperty<Color>("--sal-string");
+        private static readonly CustomStyleProperty<Color> NumberProp  = new CustomStyleProperty<Color>("--sal-number");
+        private static readonly CustomStyleProperty<Color> KeywordProp = new CustomStyleProperty<Color>("--sal-keyword");
+        private static readonly CustomStyleProperty<Color> TypeProp    = new CustomStyleProperty<Color>("--sal-type");
+        private static readonly CustomStyleProperty<Color> ApiProp     = new CustomStyleProperty<Color>("--sal-api");
+        private static readonly CustomStyleProperty<Color> EnumProp    = new CustomStyleProperty<Color>("--sal-enum");
+        private static readonly CustomStyleProperty<Color> MemberProp  = new CustomStyleProperty<Color>("--sal-member");
+        private static readonly CustomStyleProperty<Color> FuncProp    = new CustomStyleProperty<Color>("--sal-func");
+
+        private readonly ScrollView _scroll;
+        private readonly VisualElement _stack;
+        private readonly Label _highlight;
+        private readonly TextField _input;
+
+        private readonly List<SalToken> _tokens = new List<SalToken>(256);
+        private readonly StringBuilder _sb = new StringBuilder(4096);
+        private SalCodePalette _palette = SalCodePalette.Default();
+        private SalApiModel _model;
+
+        private readonly UndoHistory _history = new UndoHistory();
+        private readonly List<SalErrorMark> _errorMarks = new List<SalErrorMark>();
+        private readonly List<VisualElement> _errorBars = new List<VisualElement>();
+        private bool _barsRetryPending;
+
+        private Vector2 _charSize;      // моноширинные метрики (ширина символа, высота строки)
+        private bool _metricsReady;
+
+        public event Action TextChanged;
+        // Перехватчик клавиш (ставит AutocompleteController); true = событие съедено.
+        public Func<KeyDownEvent, bool> KeyInterceptor;
+
+        public string Text
+        {
+            get => _input.value ?? "";
+            set
+            {
+                _input.SetValueWithoutNotify(value ?? "");
+                _history.Reset();  // программная загрузка текста — история с нуля
+                ClearErrorMarks();
+                Rehighlight();
+                TextChanged?.Invoke();
+            }
+        }
+
+        public int CaretIndex => _input.cursorIndex;
+
+        public CodeEditorElement(StyleSheet codeStyles)
+        {
+            AddToClassList("sal-code-editor");
+            if (codeStyles != null) styleSheets.Add(codeStyles);
+
+            // USS не умеет ссылаться на системные шрифты — единственная настройка вне USS.
+            // Ставим на корень: наследуют и слой подсветки, и поле ввода, и попап автокомплита.
+            var mono = Font.CreateDynamicFontFromOSFont(
+                new[] { "Consolas", "Menlo", "DejaVu Sans Mono", "Courier New" }, 13);
+            if (mono != null) style.unityFontDefinition = FontDefinition.FromFont(mono);
+
+            _scroll = new ScrollView(ScrollViewMode.VerticalAndHorizontal);
+            _scroll.AddToClassList("sal-code-scroll");
+            Add(_scroll);
+
+            _stack = new VisualElement();
+            _stack.AddToClassList("sal-code-stack");
+            _scroll.Add(_stack);
+
+            _highlight = new Label { enableRichText = true, pickingMode = PickingMode.Ignore };
+            _highlight.AddToClassList("sal-code-highlight");
+            _stack.Add(_highlight);
+
+            _input = new TextField { multiline = true };
+            _input.AddToClassList("sal-code-input");
+            _input.verticalScrollerVisibility = ScrollerVisibility.Hidden; // скроллит внешний ScrollView
+            _stack.Add(_input);
+
+            _input.RegisterValueChangedCallback(evt =>
+            {
+                string before = evt.previousValue ?? "";
+                string after = evt.newValue ?? "";
+                _history.RecordEdit(before, after.Length - before.Length, Time.realtimeSinceStartup);
+                ClearErrorMarks(); // позиции меток после правки врут — гасим до новой компиляции
+                Rehighlight();
+                TextChanged?.Invoke();
+            });
+            // TrickleDown: перехватываем ДО внутреннего TextElement (иначе Tab уведёт фокус,
+            // а Enter вставит перенос раньше нас).
+            _input.RegisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
+            // клик по пустоте под текстом — фокус в поле (stack ниже вьюпорта не тянется)
+            _scroll.RegisterCallback<PointerDownEvent>(_ => _input.Focus());
+            RegisterCallback<CustomStyleResolvedEvent>(OnCustomStyle);
+
+            Rehighlight();
+        }
+
+        public void SetApiModel(SalApiModel model)
+        {
+            _model = model;
+            Rehighlight();
+        }
+
+        // ── правка текста ───────────────────────────────────────────────────────
+
+        // Замена диапазона с постановкой каретки (caretBack символов назад от конца вставки).
+        public void ReplaceRange(int start, int end, string insert, int caretBack)
+        {
+            string t = Text;
+            start = Mathf.Clamp(start, 0, t.Length);
+            end = Mathf.Clamp(end, start, t.Length);
+            insert ??= "";
+            string next = t.Substring(0, start) + insert + t.Substring(end);
+            _history.RecordEdit(t, next.Length - t.Length, Time.realtimeSinceStartup);
+            _input.SetValueWithoutNotify(next);
+            int caret = Mathf.Clamp(start + insert.Length - Mathf.Max(0, caretBack), 0, next.Length);
+            _input.SelectRange(caret, caret);
+            ClearErrorMarks();
+            Rehighlight();
+            TextChanged?.Invoke();
+            _input.Focus();
+        }
+
+        public void ReplaceSelection(string insert)
+        {
+            int a = Mathf.Min(_input.cursorIndex, _input.selectIndex);
+            int b = Mathf.Max(_input.cursorIndex, _input.selectIndex);
+            ReplaceRange(a, b, insert, 0);
+        }
+
+        // Каретка на line:column (1-based — формат диагностик компилятора).
+        public void SetCaret(int line, int column)
+        {
+            string t = Text;
+            int idx = 0, ln = 1;
+            while (ln < line && idx < t.Length)
+                if (t[idx++] == '\n') ln++;
+            idx = Mathf.Min(t.Length, idx + Mathf.Max(0, column - 1));
+            _input.Focus();
+            _input.SelectRange(idx, idx);
+            ScrollToCaret();
+        }
+
+        // ── позиция каретки для попапа ──────────────────────────────────────────
+
+        // Точка ПОД кареткой в координатах target. Считается по моноширинным метрикам:
+        // это и есть причина требования monospace-шрифта (таб считается одним символом).
+        public Vector2 GetCaretPositionIn(VisualElement target)
+        {
+            EnsureMetrics();
+            GetLineCol(Text, CaretIndex, out int line, out int col);
+            var rs = _highlight.resolvedStyle;
+            var local = new Vector2(rs.paddingLeft + col * _charSize.x,
+                                    rs.paddingTop + (line + 1) * _charSize.y);
+            return _stack.ChangeCoordinatesTo(target, local); // учитывает смещение скролла
+        }
+
+        private void EnsureMetrics()
+        {
+            if (_metricsReady) return;
+            var one = _highlight.MeasureTextSize("M", 0, MeasureMode.Undefined, 0, MeasureMode.Undefined);
+            var two = _highlight.MeasureTextSize("M\nM", 0, MeasureMode.Undefined, 0, MeasureMode.Undefined);
+            _charSize = new Vector2(one.x, Mathf.Max(1f, two.y - one.y));
+            _metricsReady = one.x > 0f; // до первого layout шрифт не готов — попробуем в следующий раз
+        }
+
+        private void ScrollToCaret()
+        {
+            EnsureMetrics();
+            if (!_metricsReady) return;
+            GetLineCol(Text, CaretIndex, out int line, out _);
+            float y = line * _charSize.y;
+            var off = _scroll.scrollOffset;
+            float vh = _scroll.contentViewport.layout.height;
+            if (y < off.y) off.y = y;
+            else if (y + _charSize.y > off.y + vh) off.y = y + _charSize.y - vh;
+            _scroll.scrollOffset = off;
+        }
+
+        private static void GetLineCol(string t, int index, out int line, out int col)
+        {
+            line = 0;
+            col = 0;
+            index = Mathf.Clamp(index, 0, t.Length);
+            for (int i = 0; i < index; i++)
+            {
+                if (t[i] == '\n') { line++; col = 0; }
+                else col++;
+            }
+        }
+
+        // ── клавиатура ─────────────────────────────────────────────────────────
+
+        private void OnKeyDown(KeyDownEvent evt)
+        {
+            // IMGUI-модель шлёт ПАРУ событий (keycode-событие, затем character-событие).
+            // Вставку по Enter/Tab/Ctrl+Space мы делаем сами на keycode-событии,
+            // поэтому character-двойника глотаем — иначе получим лишний перенос/таб/пробел.
+            if (evt.keyCode == KeyCode.None &&
+                (evt.character == '\n' || evt.character == '\t' ||
+                 (evt.character == ' ' && (evt.ctrlKey || evt.commandKey))))
+            {
+                evt.StopImmediatePropagation();
+                return;
+            }
+
+            // авто-парность скобок/кавычек: печатаемые символы приходят character-событием
+            if (evt.keyCode == KeyCode.None && HandleAutoPair(evt.character))
+            {
+                evt.StopImmediatePropagation();
+                return;
+            }
+
+            if (KeyInterceptor != null && KeyInterceptor(evt))
+            {
+                evt.StopImmediatePropagation();
+                return;
+            }
+
+            // Ctrl/Cmd+Z — отмена; Ctrl/Cmd+Y или Ctrl/Cmd+Shift+Z — повтор
+            if ((evt.ctrlKey || evt.commandKey) && evt.keyCode == KeyCode.Z && !evt.shiftKey)
+            {
+                DoUndo();
+                evt.StopImmediatePropagation();
+                return;
+            }
+            if ((evt.ctrlKey || evt.commandKey) &&
+                (evt.keyCode == KeyCode.Y || (evt.keyCode == KeyCode.Z && evt.shiftKey)))
+            {
+                DoRedo();
+                evt.StopImmediatePropagation();
+                return;
+            }
+
+            // Tab → 4 пробела (иначе UI Toolkit уводит фокус с поля)
+            if (evt.keyCode == KeyCode.Tab && !evt.ctrlKey && !evt.altKey && !evt.shiftKey)
+            {
+                ReplaceSelection("    ");
+                evt.StopImmediatePropagation();
+                return;
+            }
+
+            if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter)
+            {
+                // Shift+Enter → новая строка НИЖЕ текущей (с её отступом), каретка на неё;
+                // Enter → перенос с сохранением отступа текущей строки
+                if (evt.shiftKey) InsertLineBelow();
+                else ReplaceSelection("\n" + CurrentLineIndent());
+                evt.StopImmediatePropagation();
+            }
+        }
+
+        // Авто-парность: ({[ и кавычки вставляются парой (каретка между), закрывающий символ
+        // под кареткой «проскакивается». Внутри строк и комментариев — обычная вставка.
+        private bool HandleAutoPair(char c)
+        {
+            string t = Text;
+            int a = Mathf.Min(_input.cursorIndex, _input.selectIndex);
+            int b = Mathf.Max(_input.cursorIndex, _input.selectIndex);
+
+            // «проскок»: закрывающий символ уже стоит под кареткой — шагаем через него
+            if (a == b && b < t.Length && t[b] == c &&
+                (c == ')' || c == ']' || c == '}' || c == '"' || c == '\''))
+            {
+                _input.SelectRange(b + 1, b + 1);
+                return true;
+            }
+
+            // в строке/комментарии пары не плодим: кавычка закрывает строку одиночной
+            if ((c == '(' || c == '[' || c == '{' || c == '"' || c == '\'') &&
+                SalTokenizer.IsInCommentOrString(t, a))
+                return false;
+
+            switch (c)
+            {
+                case '(':  ReplaceRange(a, b, "()", 1); return true;
+                case '[':  ReplaceRange(a, b, "[]", 1); return true;
+                case '{':  ReplaceRange(a, b, "{}", 1); return true;
+                case '"':  ReplaceRange(a, b, "\"\"", 1); return true;
+                case '\'': ReplaceRange(a, b, "''", 1); return true;
+            }
+            return false;
+        }
+
+        // Shift+Enter: строка ниже текущей с её ПОЛНЫМ отступом (независимо от позиции каретки).
+        private void InsertLineBelow()
+        {
+            string t = Text;
+            int caret = Mathf.Clamp(_input.cursorIndex, 0, t.Length);
+            int le = caret;
+            while (le < t.Length && t[le] != '\n') le++;
+            ReplaceRange(le, le, "\n" + FullLineIndent(caret), 0);
+        }
+
+        private string FullLineIndent(int at)
+        {
+            string t = Text;
+            int ls = Mathf.Clamp(at, 0, t.Length);
+            while (ls > 0 && t[ls - 1] != '\n') ls--;
+            int i = ls;
+            while (i < t.Length && (t[i] == ' ' || t[i] == '\t')) i++;
+            return t.Substring(ls, i - ls);
+        }
+
+        // ── undo/redo ───────────────────────────────────────────────────────────
+
+        private void DoUndo()
+        {
+            string cur = Text;
+            while (_history.TryUndo(cur, out string restored))
+            {
+                if (!string.Equals(restored, cur, StringComparison.Ordinal))
+                {
+                    ApplyRestored(restored);
+                    return;
+                }
+                cur = restored; // одинаковые снапшоты пропускаем
+            }
+        }
+
+        private void DoRedo()
+        {
+            string cur = Text;
+            while (_history.TryRedo(cur, out string restored))
+            {
+                if (!string.Equals(restored, cur, StringComparison.Ordinal))
+                {
+                    ApplyRestored(restored);
+                    return;
+                }
+                cur = restored;
+            }
+        }
+
+        // Восстановление состояния истории: каретка встаёт в точку первого расхождения.
+        // Этот путь историю НЕ пишет (RecordEdit зовут только пользовательские правки).
+        private void ApplyRestored(string restored)
+        {
+            string cur = Text;
+            _input.SetValueWithoutNotify(restored);
+            int caret = Mathf.Clamp(FirstDiff(cur, restored), 0, restored.Length);
+            _input.SelectRange(caret, caret);
+            ClearErrorMarks();
+            Rehighlight();
+            TextChanged?.Invoke(); // документ/dirty/компиляция обновятся штатно
+            ScrollToCaret();
+            _input.Focus();
+        }
+
+        private static int FirstDiff(string a, string b)
+        {
+            int n = Math.Min(a.Length, b.Length);
+            int i = 0;
+            while (i < n && a[i] == b[i]) i++;
+            return i;
+        }
+
+        // ── метки ошибок в коде ─────────────────────────────────────────────────
+
+        // Подчеркнуть ошибки компиляции. Метки живут до первой правки: позиции после неё
+        // врут, а свежая компиляция всё равно перерисует.
+        public void SetErrorMarks(List<SalErrorMark> marks)
+        {
+            _errorMarks.Clear();
+            if (marks != null) _errorMarks.AddRange(marks);
+            RefreshErrorBars();
+        }
+
+        private void ClearErrorMarks()
+        {
+            if (_errorMarks.Count == 0) return;
+            _errorMarks.Clear();
+            RefreshErrorBars();
+        }
+
+        private void RefreshErrorBars()
+        {
+            EnsureMetrics();
+            if (!_metricsReady)
+            {
+                // до первого layout метрик нет — одна отложенная попытка
+                if (_errorMarks.Count > 0 && !_barsRetryPending)
+                {
+                    _barsRetryPending = true;
+                    schedule.Execute(() => { _barsRetryPending = false; RefreshErrorBars(); })
+                        .StartingIn(64);
+                }
+                return;
+            }
+
+            var rs = _highlight.resolvedStyle;
+            string t = Text;
+            int used = 0;
+            for (int m = 0; m < _errorMarks.Count && used < 64; m++) // потолок на число плашек
+            {
+                var mark = _errorMarks[m];
+                int offset = OffsetOf(t, mark.Line, mark.Column);
+                if (offset < 0) continue;
+                GetLineCol(t, offset, out int line, out int col);
+                var bar = GetBar(used++);
+                bar.style.left = rs.paddingLeft + col * _charSize.x;
+                bar.style.top = rs.paddingTop + (line + 1) * _charSize.y - 2f;
+                bar.style.width = WordLenAt(t, offset) * _charSize.x;
+                bar.tooltip = mark.Message; // ховер по подчёркиванию показывает текст ошибки
+                bar.style.display = DisplayStyle.Flex;
+            }
+            for (int k = used; k < _errorBars.Count; k++)
+                _errorBars[k].style.display = DisplayStyle.None;
+        }
+
+        private VisualElement GetBar(int i)
+        {
+            while (_errorBars.Count <= i)
+            {
+                var bar = new VisualElement { pickingMode = PickingMode.Ignore };
+                bar.AddToClassList("sal-error-underline"); // вид плашки — в SalamanderCode.uss
+                bar.style.position = Position.Absolute;
+                _stack.Add(bar);
+                _errorBars.Add(bar);
+            }
+            return _errorBars[i];
+        }
+
+        // Смещение по 1-based line:column; -1, если строка за пределами буфера.
+        private static int OffsetOf(string t, int line, int column)
+        {
+            if (t.Length == 0) return -1;
+            int idx = 0, ln = 1;
+            while (ln < line)
+            {
+                idx = t.IndexOf('\n', idx);
+                if (idx < 0) return -1;
+                idx++;
+                ln++;
+            }
+            int off = idx + Math.Max(0, column - 1);
+            return off >= t.Length ? t.Length - 1 : off;
+        }
+
+        private static int WordLenAt(string t, int offset)
+        {
+            int i = offset;
+            while (i < t.Length && (t[i] == '_' || char.IsLetterOrDigit(t[i]))) i++;
+            return Math.Max(1, i - offset);
+        }
+
+        private string CurrentLineIndent()
+        {
+            string t = Text;
+            int caret = Mathf.Clamp(Mathf.Min(_input.cursorIndex, _input.selectIndex), 0, t.Length);
+            int ls = caret;
+            while (ls > 0 && t[ls - 1] != '\n') ls--;
+            int i = ls;
+            while (i < t.Length && (t[i] == ' ' || t[i] == '\t')) i++;
+            return t.Substring(ls, Mathf.Min(i, caret) - ls);
+        }
+
+        // ── подсветка ───────────────────────────────────────────────────────────
+
+        private void Rehighlight()
+        {
+            string text = _input.value ?? "";
+            SalTokenizer.Tokenize(text, _model, _tokens);
+            _highlight.text = SalHighlighter.Build(text, _tokens, _palette.HexByKind, _sb);
+        }
+
+        private void OnCustomStyle(CustomStyleResolvedEvent e)
+        {
+            var cs = e.customStyle;
+            bool any = false;
+            if (cs.TryGetValue(CommentProp, out var c0)) { _palette.Set(SalTokenKind.Comment, c0); any = true; }
+            if (cs.TryGetValue(StringProp,  out var c1)) { _palette.Set(SalTokenKind.String,  c1); any = true; }
+            if (cs.TryGetValue(NumberProp,  out var c2)) { _palette.Set(SalTokenKind.Number,  c2); any = true; }
+            if (cs.TryGetValue(KeywordProp, out var c3)) { _palette.Set(SalTokenKind.Keyword, c3); any = true; }
+            if (cs.TryGetValue(TypeProp,    out var c4)) { _palette.Set(SalTokenKind.Type,    c4); any = true; }
+            if (cs.TryGetValue(ApiProp,     out var c5)) { _palette.Set(SalTokenKind.Api,     c5); any = true; }
+            if (cs.TryGetValue(EnumProp,    out var c6)) { _palette.Set(SalTokenKind.Enum,    c6); any = true; }
+            if (cs.TryGetValue(MemberProp,  out var c7)) { _palette.Set(SalTokenKind.Member,  c7); any = true; }
+            if (cs.TryGetValue(FuncProp,    out var c8)) { _palette.Set(SalTokenKind.Func,    c8); any = true; }
+            if (any) Rehighlight();
+        }
+    }
+}

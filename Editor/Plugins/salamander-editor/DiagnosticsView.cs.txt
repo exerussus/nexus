@@ -1,0 +1,77 @@
+using System;
+using System.Collections.Generic;
+using Dsl.Compilation;
+using Dsl.Semantics;
+using Dsl.Text;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Панель диагностик. Это ОБОЛОЧКА — красится только токенами темы Nexus (IPageTheme),
+    // цвета резолвятся при бинде строки, так что смена палитры подхватывается на перерисовке.
+    public sealed class DiagnosticsView : VisualElement
+    {
+        private readonly IPageTheme _theme;
+        private readonly ListView _list;
+        private readonly List<Diagnostic> _items = new List<Diagnostic>();
+
+        public event Action<Diagnostic> Selected; // клик по строке → каретка на Line:Column
+
+        public DiagnosticsView(IPageTheme theme)
+        {
+            _theme = theme;
+            style.height = 140; // высота панели диагностики — правится здесь
+            style.backgroundColor = _theme.Get(NexusToken.BgSoft);
+
+            _list = new ListView(_items, 20f, MakeRow, BindRow)
+            {
+                selectionType = SelectionType.Single,
+                style = { flexGrow = 1 },
+            };
+            _list.selectionChanged += sel =>
+            {
+                foreach (var o in sel)
+                {
+                    Selected?.Invoke((Diagnostic)o);
+                    break;
+                }
+            };
+            Add(_list);
+        }
+
+        public void SetDiagnostics(List<Diagnostic> diags)
+        {
+            _items.Clear();
+            if (diags != null) _items.AddRange(diags);
+            _list.RefreshItems();
+        }
+
+        private static VisualElement MakeRow()
+        {
+            var l = new Label
+            {
+                style = { unityTextAlign = TextAnchor.MiddleLeft, paddingLeft = 6,
+                          overflow = Overflow.Hidden, textOverflow = TextOverflow.Ellipsis },
+            };
+            return l;
+        }
+
+        private void BindRow(VisualElement el, int i)
+        {
+            var d = _items[i];
+            var l = (Label)el;
+            l.text = $"{Glyph(d.Severity)} {d.Line}:{d.Column}  {d.Code}  {d.Message}";
+            l.style.color = ColorFor(d.Severity);
+        }
+
+        private static string Glyph(Severity s) =>
+            s == Severity.Error ? "●" : s == Severity.Warning ? "▲" : "○";
+
+        private Color ColorFor(Severity s) =>
+            s == Severity.Error   ? _theme.Get(NexusToken.Error)
+            : s == Severity.Warning ? _theme.Get(NexusToken.Warning)
+            : _theme.Get(NexusToken.TextDim);
+    }
+}

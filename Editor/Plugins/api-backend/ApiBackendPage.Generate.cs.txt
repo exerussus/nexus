@@ -1,0 +1,270 @@
+using System.IO;
+using UnityEditor;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    public sealed partial class ApiBackendPage
+    {
+        private void BuildGenerateTab(VisualElement root)
+        {
+            BuildScaffoldSection(root);
+
+            var genHeader = new Label("Генерация");
+            genHeader.AddToClassList("api-section__title");
+            genHeader.style.color = Context.Theme.Get(NexusToken.TextNormal);
+            genHeader.style.marginTop = 10;
+            root.Add(genHeader);
+
+            Hint("Запускает генератор по выбранному профилю или по всем сразу. CLI пишет " +
+                 "в staging (Temp/), в Assets деплоятся только .cs; link.xml и asmdef " +
+                 "версии создаются сами. Перед запуском проверяются ручные правки.", root);
+
+            BuildProfileSelector(root);
+
+            var force = new Toggle("Force (затереть ручные правки)") { value = false, name = "force-toggle" };
+            force.AddToClassList("api-field");
+            root.Add(force);
+
+            ActionButton(NexusRole.Primary, "Сгенерировать профиль",
+                () => RunGeneration(root, allProfiles: false), root);
+
+            var allBtn = ActionButton(NexusRole.Common, "Сгенерировать все профили",
+                () => RunGeneration(root, allProfiles: true), root);
+            allBtn.SetEnabled(_config.Profiles.Count > 1);
+
+            var changesSection = new VisualElement { name = "gen-changes" };
+            root.Add(changesSection);
+
+            var logSection = Section("Лог", root);
+            LogField(logSection, "gen-log");
+        }
+
+        private void RunGeneration(VisualElement root, bool allProfiles)
+        {
+            var force = root.Q<Toggle>("force-toggle").value;
+            var log = root.Q<TextField>("gen-log");
+            var changes = root.Q<VisualElement>("gen-changes");
+            changes.Clear();
+
+            Context.SetStatus("Генерация…", StatusKind.Info);
+
+            if (allProfiles)
+            {
+                var results = ApiCodegenEngine.GenerateAll(_config, force);
+
+                var sb = new System.Text.StringBuilder();
+                var okCount = 0;
+                foreach (var r in results)
+                {
+                    sb.AppendLine($"=== {r.Profile.Name} ===");
+                    sb.AppendLine(r.Log);
+                    if (!r.Generated) continue;
+
+                    okCount++;
+                    RenderChanges(changes, r, $"«{r.Profile.Name}»: изменения кода ({r.CodeChanges.Count})");
+                }
+                log.value = sb.ToString();
+
+                AssetDatabase.Refresh();
+                var failedCount = results.Count - okCount;
+                Context.SetStatus(
+                    failedCount == 0
+                        ? $"Готово: профилей сгенерировано {okCount}."
+                        : $"Готово: {okCount} ок, {failedCount} с ошибкой — см. лог.",
+                    failedCount == 0 ? StatusKind.Ok : StatusKind.Error);
+                return;
+            }
+
+            var profile = SelectedProfile;
+            if (profile == null)
+            {
+                Context.SetStatus("Нет профилей — добавь на вкладке Profiles.", StatusKind.Error);
+                return;
+            }
+
+            var result = ApiCodegenEngine.Generate(profile, force);
+            log.value = result.Log;
+
+            if (result.Generated)
+            {
+                // Подтянуть свежие .cs (и, возможно, созданные link.xml/asmdef) в проект.
+                AssetDatabase.Refresh();
+                RenderChanges(changes, result);
+                Context.SetStatus(
+                    $"«{profile.Name}»: готово. Изменено файлов: {result.CodeChanges.Count}.",
+                    StatusKind.Ok);
+            }
+            else if (result.ManualEdits is { Any: true } && !force)
+            {
+                Context.SetStatus(
+                    "Прервано: ручные правки в выводе. Включи Force, если их можно потерять.",
+                    StatusKind.Warning);
+            }
+            else
+            {
+                Context.SetStatus("Генерация не удалась — см. лог.", StatusKind.Error);
+            }
+        }
+
+        // ---- Развёртывание с нуля (общая часть: клиент + шаблон) ---------------
+
+        private void BuildScaffoldSection(VisualElement root)
+        {
+            var header = new Label("Развёртывание с нуля");
+            header.AddToClassList("api-section__title");
+            header.style.color = Context.Theme.Get(NexusToken.TextNormal);
+            root.Add(header);
+
+            Hint("Создаёт недостающие ОБЩИЕ файлы: рантайм-клиент и шаблон. Существующие " +
+                 "не трогает. Это внешний футпринт servicing-страницы — disable плагина " +
+                 "его не сносит. Обвязку версий (link.xml, asmdef) движок создаёт сам " +
+                 "при генерации.", root);
+
+            var steps = ProjectScaffolder.Inspect();
+
+            for (var i = 0; i < steps.Count; i++)
+            {
+                var st = steps[i];
+
+                var box = Section(st.Title, root);
+                Hint(st.Description, box);
+
+                foreach (var f in st.Files)
+                    Line($"{(f.Exists ? "✓" : "✗")} {f.TargetRel}",
+                        f.Exists ? NexusToken.Ok : NexusToken.Error, box);
+
+                if (st.AllExist)
+                {
+                    Line("✓ развёрнуто", NexusToken.Ok, box);
+                }
+                else
+                {
+                    var idx = i; // захват индекса для лямбды
+                    ActionButton(NexusRole.Primary, $"Создать недостающее ({st.MissingCount})",
+                        () => RunScaffold(idx), box);
+                }
+            }
+
+            // --- Опасная зона: полная очистка ---
+            var cleanup = ProjectScaffolder.InspectCleanup();
+            var danger = Section("Полная очистка", root);
+
+            Hint("Сносит Assets/Api ЦЕЛИКОМ (рантайм-клиент и ВСЕ версии) и " +
+                 "Tools/openapi-templates, сбрасывает снапшоты всех профилей. Конфиг и " +
+                 "список профилей остаются. Для сноса одной версии — «Удалить профиль» " +
+                 "на вкладке Profiles. Действие необратимо.", danger);
+
+            foreach (var c in cleanup)
+                Hint($"{(c.Exists ? "•" : "—")} {c.Rel}{(c.Exists ? "" : "  (нет)")}", danger);
+
+            var clearBtn = ActionButton(NexusRole.Alarm, "Очистить всё (Api + Tools)", RunCleanup, danger);
+            clearBtn.SetEnabled(cleanup.Exists(c => c.Exists));
+        }
+
+        /// <summary>
+        /// Папка Templates задеплоена рядом с кодом страницы; её раскладку знает
+        /// хаб (инвариант #7), поэтому путь резолвим через Context, а не строим
+        /// State/&lt;id&gt;/… руками. null — деплой неполный (нужен Restore плагина).
+        /// </summary>
+        private string DeployedTemplatesDir()
+        {
+            var probe = Context.GetDeployedAssetPath("Templates/api.mustache.txt");
+            if (string.IsNullOrEmpty(probe)) return null;
+            if (!Path.IsPathRooted(probe))
+                probe = Path.Combine(ApiCodegenConfig.ProjectRoot, probe);
+            return File.Exists(probe) ? Path.GetDirectoryName(probe) : null;
+        }
+
+        private void RunScaffold(int stepIndex)
+        {
+            var created = ProjectScaffolder.CreateMissing(stepIndex, DeployedTemplatesDir(), out var error);
+            if (error != null)
+            {
+                Context.SetStatus($"Развёртывание: {error}", StatusKind.Error);
+                return;
+            }
+
+            var msg = $"Создано файлов: {created}.";
+
+            // Шаблон только что развёрнут → допишем его профилям с пустым TemplateDir,
+            // иначе -t не попадёт в их команды и генерация уедет на сток-шаблон.
+            // Заполненные (в т.ч. кастомные) пути не клобберим.
+            if (ProjectScaffolder.Steps[stepIndex].IsTemplateStep && ProjectScaffolder.TemplateDeployed())
+            {
+                var filled = 0;
+                foreach (var p in _config.Profiles)
+                {
+                    if (!string.IsNullOrWhiteSpace(p.TemplateDir)) continue;
+                    p.TemplateDir = ProjectScaffolder.TemplateDirRel;
+                    filled++;
+                }
+                if (filled > 0)
+                {
+                    _config.Save();
+                    msg += $" Шаблон прописан профилям без -t: {filled}.";
+                }
+            }
+
+            AssetDatabase.Refresh();
+            Context.SetStatus(msg, StatusKind.Ok);
+            SelectTab(Tab.Generate); // перестроить вкладку — обновить статус
+        }
+
+        private void RunCleanup()
+        {
+            var ok = EditorUtility.DisplayDialog(
+                "Полная очистка",
+                "Будут безвозвратно удалены:\n" +
+                "• Assets/Api (рантайм-клиент и все версии)\n" +
+                "• Tools/openapi-templates\n" +
+                "• снапшоты генерации всех профилей\n\n" +
+                "Конфиг и список профилей останутся. Продолжить?",
+                "Удалить", "Отмена");
+            if (!ok) return;
+
+            var removed = ProjectScaffolder.CleanupAll(out var error);
+            AssetDatabase.Refresh();
+
+            if (error != null)
+            {
+                Context.SetStatus($"Очистка с ошибкой: {error}", StatusKind.Error);
+            }
+            else
+            {
+                var summary = string.Join(", ", removed);
+                Context.SetStatus($"Очищено: {summary}.", StatusKind.Ok);
+            }
+
+            SelectTab(Tab.Generate); // перестроить вкладку — обновить статус
+        }
+
+        private void RenderChanges(VisualElement parent, ApiCodegenEngine.GenerationResult result,
+            string title = null)
+        {
+            if (result.CodeChanges.Count == 0)
+            {
+                Hint(title == null ? "Код не изменился." : $"{title}: код не изменился.", parent);
+                return;
+            }
+
+            var section = Section(title ?? $"Изменения кода ({result.CodeChanges.Count})", parent);
+            foreach (var ch in result.CodeChanges)
+            {
+                var mark = ch.Kind switch
+                {
+                    CodeDiffer.ChangeKind.Added => "+ ",
+                    CodeDiffer.ChangeKind.Removed => "− ",
+                    _ => "~ "
+                };
+                var delta = ch.Kind == CodeDiffer.ChangeKind.Modified
+                    ? $"  (+{ch.AddedLines}/−{ch.RemovedLines})"
+                    : "";
+                Line($"{mark}{ch.RelPath}{delta}",
+                    ch.Kind == CodeDiffer.ChangeKind.Removed ? NexusToken.Error : NexusToken.TextNormal,
+                    section);
+            }
+        }
+    }
+}

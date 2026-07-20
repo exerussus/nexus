@@ -1,0 +1,195 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Newtonsoft.Json.Linq;
+
+namespace Exerussus.Nexus.Pages.ApiBackend
+{
+    /// <summary>
+    /// Сравнивает спеку прошлой генерации с текущей и классифицирует изменения.
+    /// Это и есть «несостыковки»: что в API уехало с момента сборки клиента,
+    /// и сломает ли это твой код. Уровень детализации — эндпоинты и поля схем,
+    /// без полного моделирования OpenAPI (этого достаточно, чтобы ловить дрейф).
+    /// </summary>
+    public static class DriftAnalyzer
+    {
+        public enum Impact { Safe, Breaking }
+
+        public sealed class Change
+        {
+            public Impact Impact;
+            public string Target;   // "GET /users" или "User.email"
+            public string Detail;   // что именно случилось
+        }
+
+        public sealed class Report
+        {
+            public bool HasBaseline;                       // был ли снапшот для сравнения
+            public List<Change> Changes = new();
+            public int BreakingCount => Changes.Count(c => c.Impact == Impact.Breaking);
+            public bool Empty => Changes.Count == 0;
+        }
+
+        public static Report Compare(string oldSpec, string newSpec)
+        {
+            var report = new Report { HasBaseline = !string.IsNullOrEmpty(oldSpec) };
+            if (!report.HasBaseline) return report;
+
+            JObject oldRoot, newRoot;
+            try
+            {
+                oldRoot = JObject.Parse(oldSpec);
+                newRoot = JObject.Parse(newSpec);
+            }
+            catch
+            {
+                return report; // невалидный JSON ловится раньше
+            }
+
+            DiffEndpoints(oldRoot, newRoot, report);
+            DiffSchemas(oldRoot, newRoot, report);
+            report.Changes.Sort((a, b) => a.Impact == b.Impact
+                ? string.CompareOrdinal(a.Target, b.Target)
+                : (a.Impact == Impact.Breaking ? -1 : 1)); // breaking — наверх
+            return report;
+        }
+
+        // --- Эндпоинты ---
+
+        private static void DiffEndpoints(JObject oldRoot, JObject newRoot, Report report)
+        {
+            var oldOps = CollectOperations(oldRoot);
+            var newOps = CollectOperations(newRoot);
+
+            foreach (var key in oldOps.Except(newOps))
+                report.Changes.Add(new Change
+                {
+                    Impact = Impact.Breaking, Target = key,
+                    Detail = "эндпоинт удалён — вызовы в коде перестанут отвечать"
+                });
+
+            foreach (var key in newOps.Except(oldOps))
+                report.Changes.Add(new Change
+                {
+                    Impact = Impact.Safe, Target = key,
+                    Detail = "новый эндпоинт"
+                });
+        }
+
+        private static HashSet<string> CollectOperations(JObject root)
+        {
+            var set = new HashSet<string>();
+            if (root["paths"] is not JObject paths) return set;
+
+            var methods = new[] { "get", "post", "put", "delete", "patch", "head", "options" };
+            foreach (var path in paths.Properties())
+            {
+                if (path.Value is not JObject item) continue;
+                foreach (var m in methods)
+                    if (item[m] != null)
+                        set.Add($"{m.ToUpperInvariant()} {path.Name}");
+            }
+            return set;
+        }
+
+        // --- Схемы / поля ---
+
+        private static void DiffSchemas(JObject oldRoot, JObject newRoot, Report report)
+        {
+            var oldSchemas = oldRoot["components"]?["schemas"] as JObject ?? new JObject();
+            var newSchemas = newRoot["components"]?["schemas"] as JObject ?? new JObject();
+
+            var oldNames = oldSchemas.Properties().Select(p => p.Name).ToHashSet();
+            var newNames = newSchemas.Properties().Select(p => p.Name).ToHashSet();
+
+            foreach (var removed in oldNames.Except(newNames))
+                report.Changes.Add(new Change
+                {
+                    Impact = Impact.Breaking, Target = removed,
+                    Detail = "модель удалена"
+                });
+
+            foreach (var added in newNames.Except(oldNames))
+                report.Changes.Add(new Change
+                {
+                    Impact = Impact.Safe, Target = added,
+                    Detail = "новая модель"
+                });
+
+            // Поля у схем, присутствующих в обеих спеках.
+            foreach (var name in oldNames.Intersect(newNames))
+                DiffProperties(name, oldSchemas[name] as JObject, newSchemas[name] as JObject, report);
+        }
+
+        private static void DiffProperties(string schemaName, JObject oldSchema, JObject newSchema, Report report)
+        {
+            var oldProps = oldSchema?["properties"] as JObject ?? new JObject();
+            var newProps = newSchema?["properties"] as JObject ?? new JObject();
+            var oldRequired = RequiredSet(oldSchema);
+            var newRequired = RequiredSet(newSchema);
+
+            var oldNames = oldProps.Properties().Select(p => p.Name).ToHashSet();
+            var newNames = newProps.Properties().Select(p => p.Name).ToHashSet();
+
+            // Удалённое поле — ломает десериализацию/доступ.
+            foreach (var removed in oldNames.Except(newNames))
+                report.Changes.Add(new Change
+                {
+                    Impact = Impact.Breaking, Target = $"{schemaName}.{removed}",
+                    Detail = "поле удалено"
+                });
+
+            // Новое поле: required → breaking (сервер ждёт его в запросах), optional → safe.
+            foreach (var added in newNames.Except(oldNames))
+                report.Changes.Add(new Change
+                {
+                    Impact = newRequired.Contains(added) ? Impact.Breaking : Impact.Safe,
+                    Target = $"{schemaName}.{added}",
+                    Detail = newRequired.Contains(added) ? "новое обязательное поле" : "новое опциональное поле"
+                });
+
+            // Смена типа и переход optional → required у существующих полей.
+            foreach (var prop in oldNames.Intersect(newNames))
+            {
+                var oldType = TypeOf(oldProps[prop]);
+                var newType = TypeOf(newProps[prop]);
+                if (oldType != newType)
+                    report.Changes.Add(new Change
+                    {
+                        Impact = Impact.Breaking, Target = $"{schemaName}.{prop}",
+                        Detail = $"тип сменился: {oldType} → {newType}"
+                    });
+
+                if (!oldRequired.Contains(prop) && newRequired.Contains(prop))
+                    report.Changes.Add(new Change
+                    {
+                        Impact = Impact.Breaking, Target = $"{schemaName}.{prop}",
+                        Detail = "поле стало обязательным"
+                    });
+            }
+        }
+
+        private static HashSet<string> RequiredSet(JObject schema)
+        {
+            var req = schema?["required"] as JArray;
+            return req == null
+                ? new HashSet<string>()
+                : req.Select(t => (string)t).Where(s => s != null).ToHashSet();
+        }
+
+        /// <summary>Грубый тип поля: $ref-имя, либо type(+format), либо "any".</summary>
+        private static string TypeOf(JToken prop)
+        {
+            if (prop is not JObject o) return "any";
+            var refName = (string)o["$ref"];
+            if (refName != null) return refName.Split('/').Last();
+
+            var type = (string)o["type"];
+            if (type == null) return "any";
+            var format = (string)o["format"];
+            if (type == "array")
+                return $"array<{TypeOf(o["items"])}>";
+            return format != null ? $"{type}:{format}" : type;
+        }
+    }
+}

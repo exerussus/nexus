@@ -1,0 +1,132 @@
+using System.Collections.Generic;
+using System.Text;
+using System.Threading;
+using Cysharp.Threading.Tasks;
+using Newtonsoft.Json;
+using UnityEngine.Networking;
+
+namespace ProjectApi
+{
+    /// <summary>
+    /// Тонкий базовый клиент для REST-API. Один транспорт на UnityWebRequest —
+    /// работает на всех платформах, включая WebGL (где HttpClient запрещён) и
+    /// IL2CPP. Async через UniTask (zero-alloc), JSON через Newtonsoft.
+    ///
+    /// Обычный сервис без MonoBehaviour и без статического состояния: кладётся
+    /// в DI (Exerussus.DI) и инжектится в эндпоинт-обёртки.
+    /// </summary>
+    public sealed class RestClient
+    {
+        private readonly RestClientOptions _options;
+        private readonly System.Func<string> _tokenProvider;
+
+        public RestClient(RestClientOptions options, System.Func<string> tokenProvider = null)
+        {
+            _options = options;
+            _tokenProvider = tokenProvider;
+        }
+
+        // ---- Единый verb-агностичный вход (его зовут сгенеренные обёртки) ------
+
+        /// <summary>
+        /// Универсальный вызов: любой HTTP-метод, опциональное тело, типизированный ответ.
+        /// Сгенеренные по api.mustache классы дёргают именно его, поэтому шаблон
+        /// не ветвится по глаголу. Query клиент строит в path сам (см. шаблон).
+        /// </summary>
+        public UniTask<T> SendAsync<T>(string method, string path, object body = null,
+            CancellationToken ct = default)
+            => RequestAsync<T>(method, path, query: null, body, ct);
+
+        /// <summary>То же, но без типизированного ответа (204/без тела).</summary>
+        public async UniTask SendAsync(string method, string path, object body = null,
+            CancellationToken ct = default)
+            => await SendCoreAsync(method, path, query: null, body, ct);
+
+        // ---- Удобные типизированные методы (для ручных вызовов) ----------------
+
+        public UniTask<T> GetAsync<T>(string path,
+            IReadOnlyDictionary<string, string> query = null, CancellationToken ct = default)
+            => RequestAsync<T>("GET", path, query, body: null, ct);
+
+        public UniTask<TResp> PostAsync<TReq, TResp>(string path, TReq body, CancellationToken ct = default)
+            => RequestAsync<TResp>("POST", path, query: null, body, ct);
+
+        public UniTask<TResp> PutAsync<TReq, TResp>(string path, TReq body, CancellationToken ct = default)
+            => RequestAsync<TResp>("PUT", path, query: null, body, ct);
+
+        public async UniTask PostAsync<TReq>(string path, TReq body, CancellationToken ct = default)
+            => await SendCoreAsync("POST", path, query: null, body, ct);
+
+        public async UniTask DeleteAsync(string path, CancellationToken ct = default)
+            => await SendCoreAsync("DELETE", path, query: null, body: null, ct);
+
+        // ---- Внутренняя кухня -------------------------------------------------
+
+        private async UniTask<T> RequestAsync<T>(string method, string path,
+            IReadOnlyDictionary<string, string> query, object body, CancellationToken ct)
+        {
+            var responseText = await SendCoreAsync(method, path, query, body, ct);
+            if (string.IsNullOrEmpty(responseText)) return default;
+            return JsonConvert.DeserializeObject<T>(responseText, _options.JsonSettings);
+        }
+
+        private async UniTask<string> SendCoreAsync(string method, string path,
+            IReadOnlyDictionary<string, string> query, object body, CancellationToken ct)
+        {
+            var url = BuildUrl(path, query);
+
+            using var request = new UnityWebRequest(url, method)
+            {
+                downloadHandler = new DownloadHandlerBuffer(),
+                timeout = _options.TimeoutSeconds
+            };
+
+            if (body != null)
+            {
+                var json = JsonConvert.SerializeObject(body, _options.JsonSettings);
+                var bytes = Encoding.UTF8.GetBytes(json);
+                request.uploadHandler = new UploadHandlerRaw(bytes) { contentType = "application/json" };
+            }
+
+            request.SetRequestHeader("Accept", "application/json");
+
+            var token = _tokenProvider?.Invoke();
+            if (!string.IsNullOrEmpty(token))
+                request.SetRequestHeader("Authorization", $"Bearer {token}");
+
+            try
+            {
+                await request.SendWebRequest().ToUniTask(cancellationToken: ct);
+            }
+            catch (UnityWebRequestException ex)
+            {
+                throw ApiException.From(ex.UnityWebRequest);
+            }
+
+            return request.downloadHandler.text;
+        }
+
+        private string BuildUrl(string path, IReadOnlyDictionary<string, string> query)
+        {
+            var sb = new StringBuilder(_options.BaseUrl);
+            if (!path.StartsWith("/")) sb.Append('/');
+            sb.Append(path);
+
+            if (query is { Count: > 0 })
+            {
+                var first = true;
+                foreach (var kv in query)
+                {
+                    if (kv.Value == null) continue;
+                    sb.Append(first ? '?' : '&');
+                    first = false;
+                    sb.Append(UnityWebRequest.EscapeURL(kv.Key));
+                    sb.Append('=');
+                    sb.Append(UnityWebRequest.EscapeURL(kv.Value));
+                }
+            }
+
+            return sb.ToString();
+        }
+    }
+}

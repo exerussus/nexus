@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.Logs
+{
+    /// <summary>
+    /// «Бокс логов». Компонент-с-состоянием, ПРИНАДЛЕЖАЩИЙ плагину Logs (не сервис: у него
+    /// есть поля, переживающие вызов — инвариант #4). Он захватывает логи в момент загрузки
+    /// редактора (независимо от того, открыто ли окно Nexus), держит их в кольцевом буфере
+    /// с лимитом ёмкости и ведёт живой реестр тегов. <see cref="LogsPage"/> — лишь вид над ним.
+    ///
+    /// Гейтинг «off means off»: сборщик скомпилирован и активен только пока плагин ЗАДЕПЛОЕН.
+    /// При отключении плагина его .cs выселяется из State/, [InitializeOnLoad] не срабатывает —
+    /// ноль работы. Ось фичи здесь — «плагин задеплоен», а не «окно открыто».
+    ///
+    /// Настройки (маска сбора, ёмкость) живут в EditorPrefs — это личные настройки, им
+    /// разрешено пережить disable. Сам буфер — рабочие данные (аналог State): он снимается в
+    /// SessionState между доменными перезагрузками, но очищается на disable через OnPluginDisabled.
+    /// </summary>
+    [InitializeOnLoad]
+    public static class LogCollector
+    {
+        private const string PrefPrefix = "Exerussus.Nexus.Logs.Collector.";
+        private const string MaskKey    = PrefPrefix + "collectMask";   // EditorPrefs (int-битмаска)
+        private const string CapKey     = PrefPrefix + "capacity";      // EditorPrefs (int)
+        private const string BufKey     = PrefPrefix + "buffer";        // SessionState (json)
+        private const string SessionKey = PrefPrefix + "session";       // SessionState (int id прогона)
+
+        private const int DefaultMask = 0b1111;   // Debug+Info+Warning+Error — всё собирается
+        private const int DefaultCap  = 1000;
+
+        private static readonly object _lock = new();
+        private static readonly List<LogEntry> _entries = new();
+        // tag -> живой счётчик ссылок, чтобы теги появлялись/исчезали «на лету»
+        private static readonly Dictionary<string, int> _tagCounts =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private static int  _mask;
+        private static int  _capacity;
+        private static int  _session;   // id текущего/последнего PLAY-прогона; ++ в начале Play
+        private static long _version;   // растёт на каждой мутации; страница его опрашивает
+
+        private static volatile bool _isPlaying;  // true только во время Play — гейтит сбор
+
+        static LogCollector()
+        {
+            _mask     = EditorPrefs.GetInt(MaskKey, DefaultMask);
+            _capacity = Mathf.Max(1, EditorPrefs.GetInt(CapKey, DefaultCap));
+            _session  = SessionState.GetInt(SessionKey, 0);
+            _isPlaying = EditorApplication.isPlayingOrWillChangePlaymode;
+
+            RestoreBuffer();
+
+            Application.logMessageReceivedThreaded -= OnLog;
+            Application.logMessageReceivedThreaded += OnLog;
+
+            AssemblyReloadEvents.beforeAssemblyReload -= PersistBuffer;
+            AssemblyReloadEvents.beforeAssemblyReload += PersistBuffer;
+
+            EditorApplication.playModeStateChanged -= OnPlayModeChanged;
+            EditorApplication.playModeStateChanged += OnPlayModeChanged;
+        }
+
+        // Модель сессии для Play-only визуализатора: одна «сессия» на один Play-прогон. id
+        // растёт на ExitingEditMode — то есть в самом НАЧАЛЕ входа в Play, до доменной
+        // перезагрузки и до любых RuntimeInitializeOnLoadMethod / Awake-логов — так что даже
+        // самые ранние стартовые логи несут новый id. Он НЕ растёт при выходе из Play, поэтому
+        // id последнего прогона (== _session) остаётся валидным в Edit mode: это и есть
+        // «последняя сессия», которую показывает страница. _isPlaying отслеживает реальное
+        // состояние прогона и гейтит захват.
+        private static void OnPlayModeChanged(PlayModeStateChange change)
+        {
+            if (change == PlayModeStateChange.ExitingEditMode)
+            {
+                lock (_lock)
+                {
+                    _session++;
+                    SessionState.SetInt(SessionKey, _session);
+                    _version++;   // подтолкнуть страницу переприменить фильтр сессии
+                }
+            }
+
+            _isPlaying = EditorApplication.isPlayingOrWillChangePlaymode;
+        }
+
+        // ----------------------------------------------------------------- захват
+
+        private static void OnLog(string condition, string stackTrace, LogType type)
+        {
+            // Это визуализатор Play-логов: вне Play ничего не захватывается.
+            if (!_isPlaying) return;
+
+            // Парсим вне лока (и, возможно, вне главного потока) — чистая работа со строками.
+            var entry = LogParser.Parse(condition, stackTrace, type, DateTime.Now);
+
+            lock (_lock)
+            {
+                // не выбранный уровень не сохраняется.
+                if ((_mask & (1 << entry.group)) == 0) return;
+
+                entry.session = _session;
+                _entries.Add(entry);
+                AddTagsLocked(entry.tags);
+                TrimLocked();          // при переполнении удаляем самый ранний
+                _version++;
+            }
+        }
+
+        // ----------------------------------------------------------------- публичный API
+
+        public static long Version { get { lock (_lock) return _version; } }
+        public static int  Count   { get { lock (_lock) return _entries.Count; } }
+        public static int  Capacity { get { lock (_lock) return _capacity; } }
+        /// <summary>id текущего Play-прогона, либо последнего, когда мы в Edit mode.</summary>
+        public static int  LastSession { get { lock (_lock) return _session; } }
+
+        /// <summary>Копирует текущий буфер в <paramref name="dest"/> (предварительно очистив).</summary>
+        public static void CopyTo(List<LogEntry> dest)
+        {
+            if (dest == null) return;
+            lock (_lock)
+            {
+                dest.Clear();
+                dest.AddRange(_entries);
+            }
+        }
+
+        /// <summary>Снимок присутствующих сейчас тегов, отсортирован для стабильного порядка чипов.</summary>
+        public static List<string> GetTags()
+        {
+            lock (_lock)
+            {
+                var list = new List<string>(_tagCounts.Keys);
+                list.Sort(StringComparer.OrdinalIgnoreCase);
+                return list;
+            }
+        }
+
+        public static int TagCount(string tag)
+        {
+            lock (_lock)
+                return _tagCounts.TryGetValue(tag, out var c) ? c : 0;
+        }
+
+        public static bool Collects(LogGroup g)
+        {
+            lock (_lock) return (_mask & (1 << (int)g)) != 0;
+        }
+
+        public static void SetCollect(LogGroup g, bool on)
+        {
+            lock (_lock)
+            {
+                if (on) _mask |=  (1 << (int)g);
+                else    _mask &= ~(1 << (int)g);
+                EditorPrefs.SetInt(MaskKey, _mask);
+            }
+        }
+
+        public static void SetCapacity(int cap)
+        {
+            cap = Mathf.Max(1, cap);
+            lock (_lock)
+            {
+                _capacity = cap;
+                EditorPrefs.SetInt(CapKey, cap);
+                TrimLocked();
+                _version++;
+            }
+        }
+
+        public static void Clear()
+        {
+            lock (_lock)
+            {
+                _entries.Clear();
+                _tagCounts.Clear();
+                _version++;
+            }
+        }
+
+        /// <summary>
+        /// Вызывается страницей из OnPrePack при отключении плагина. Рабочие данные (буфер ≈ State)
+        /// не должны пережить disable («off means off»), поэтому стираем буфер и его SessionState-
+        /// снимок. Личные настройки (маска сбора, ёмкость) в EditorPrefs НЕ трогаем — им разрешено
+        /// пережить выключение.
+        /// </summary>
+        public static void OnPluginDisabled()
+        {
+            lock (_lock)
+            {
+                _entries.Clear();
+                _tagCounts.Clear();
+                _version++;
+            }
+            SessionState.EraseString(BufKey);
+        }
+
+        // ----------------------------------------------------------------- внутреннее
+
+        private static void TrimLocked()
+        {
+            // Обычно перебор ровно на один; RemoveRange делает дешёвым и большой сброс ёмкости.
+            var overflow = _entries.Count - _capacity;
+            if (overflow <= 0) return;
+
+            for (int i = 0; i < overflow; i++)
+                RemoveTagsLocked(_entries[i].tags);
+
+            _entries.RemoveRange(0, overflow);
+        }
+
+        private static void AddTagsLocked(string[] tags)
+        {
+            if (tags == null) return;
+            foreach (var t in tags)
+            {
+                _tagCounts.TryGetValue(t, out var c);
+                _tagCounts[t] = c + 1;
+            }
+        }
+
+        private static void RemoveTagsLocked(string[] tags)
+        {
+            if (tags == null) return;
+            foreach (var t in tags)
+            {
+                if (!_tagCounts.TryGetValue(t, out var c)) continue;
+                if (c <= 1) _tagCounts.Remove(t);
+                else        _tagCounts[t] = c - 1;
+            }
+        }
+
+        // -------------------------------------------- персистентность через доменную перезагрузку
+
+        [Serializable]
+        private sealed class BufferDto
+        {
+            public List<LogEntry> entries = new();
+        }
+
+        private static void PersistBuffer()
+        {
+            BufferDto dto;
+            lock (_lock)
+                dto = new BufferDto { entries = new List<LogEntry>(_entries) };
+
+            try { SessionState.SetString(BufKey, JsonUtility.ToJson(dto)); }
+            catch { /* не критично: в худшем случае теряем буфер на этой перезагрузке */ }
+        }
+
+        private static void RestoreBuffer()
+        {
+            var json = SessionState.GetString(BufKey, string.Empty);
+            if (string.IsNullOrEmpty(json)) return;
+
+            try
+            {
+                var dto = JsonUtility.FromJson<BufferDto>(json);
+                if (dto?.entries == null) return;
+
+                _entries.AddRange(dto.entries);
+                foreach (var e in _entries)
+                    AddTagsLocked(e.tags);
+                TrimLocked();
+                _version++;
+            }
+            catch { /* битый снимок — стартуем с чистого листа */ }
+        }
+    }
+}

@@ -1,0 +1,763 @@
+// EcsWorldTrackerPage — обозреватель ECS-миров форка Exerussus.EcsLite.
+// Читает мир ТОЛЬКО на чтение и ТОЛЬКО рефлексией через Exerussus.EcsLite.EcsEditorBridge,
+// поэтому сборка страницы не ссылается на ECS напрямую (изоляция Nexus цела).
+// Никаких GameObject/MonoBehaviour — миры регистрируются хуками внутри самого ECS.
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.EcsWorldTracker {
+    [EditorPage("ecs-world-tracker", "ECS Worlds", PageCategory.Game, order: 20, icon: null)]
+    public sealed class EcsWorldTrackerPage : EditorPageBase {
+        // ── внешняя развёртка ECS-ядра (обслуживающий footprint вне Nexus) ──
+        const string CoreDirRel = "Exerussus.EcsLite";
+        const string CoreFile = "Exerussus.EcsLite.cs";
+        const string CoreSrcAsset = "Exerussus.EcsLite.cs.txt";
+        const string LicenseFile = "LICENSE";
+        const string LicenseAsset = "LICENSE.txt";
+        const int MaxRows = 5000;
+        const int MinIntervalMs = 50;
+
+        enum View { List, Archetypes, Matrix }
+        enum Tab { Overview, Settings }
+
+        readonly EcsBridgeLink _link = new EcsBridgeLink();
+
+        VisualElement _root, _content;
+        Tab _tab = Tab.Overview;
+
+        VisualElement _worldPane, _entityPane, _inspectorPane;
+
+        int _worldIndex = -1, _selId = -1, _selGen = 0;
+        bool _pinned, _watch, _focused;
+        View _view = View.List;
+        int _intervalMs = 1000;                 // 1 Гц по умолчанию — обновляет само
+        string _archExpanded;
+        readonly List<string> _inc = new List<string>();
+        readonly List<string> _exc = new List<string>();
+        string _idFilter = "";
+        readonly List<string> _rows = new List<string>();
+        string _pendingWorldLabel;
+
+        Label _statusCore, _matchLabel, _toolInfo;
+        VisualElement _chipsRow;
+        ListView _entityList;
+
+        double _lastTick;
+        EditorWindow _host;      // окно-хост Nexus — принудительно репейнтим его на тике
+        string _stamp = "—";     // время последнего обновления (индикатор живости)
+
+        // ссылки для обновления значений «на месте» (структуру с кнопками на тике не трогаем)
+        string _worldsShape;
+        VisualElement _worldStatsHost;
+        string _archShape;
+        readonly Dictionary<string, Label> _archCounts = new Dictionary<string, Label>();
+        string _inspSig;
+        readonly List<Label> _inspBodies = new List<Label>();
+
+        Color T(NexusToken tok) => Context.Theme.Get(tok);
+
+        // ── lifecycle ────────────────────────────────────────────────────────────
+        protected override void OnInitialize() => LoadPrefs();
+
+        public override VisualElement BuildUI() {
+            _root = new VisualElement(); _root.AddToClassList("ecs-root"); _root.style.flexGrow = 1;
+            var uss = Context.LoadDeployedAsset<StyleSheet>("EcsWorldTrackerPage.uss");
+            if (uss != null) _root.styleSheets.Add(uss);
+            PaintBg(_root, NexusToken.BgHard);
+            // Подписку на тик вешаем на события панели — их шлёт сам UI Toolkit,
+            // когда элемент реально появляется/уходит с экрана. Не зависит от того,
+            // зовёт ли хаб OnEnter/OnExit.
+            _root.RegisterCallback<AttachToPanelEvent>(OnAttach);
+            _root.RegisterCallback<DetachFromPanelEvent>(OnDetach);
+            Render();
+            return _root;
+        }
+
+        public override void OnEnter() { _link.Bind(); Hook(); EnsureHost(); _lastTick = 0; RefreshAll(); }
+        public override void OnExit() { Unhook(); }
+        public override void OnFocus() { _focused = true; _link.SetProbeActive(true); UpdateToolInfo(); }
+        public override void OnUnfocus() { _focused = false; _link.SetProbeActive(false); UpdateToolInfo(); }
+        public override void OnRefresh() => RefreshAll();
+        public override bool CanClose() => true;
+        public override void OnPrePack() => SavePrefs();
+        protected override void OnDisposing() { Unhook(); _link.SetProbeActive(false); }
+
+        // Дубль подписки на случай, если хаб не звал OnEnter: attach шлёт сам UI Toolkit.
+        void OnAttach(AttachToPanelEvent _) { _link.Bind(); Hook(); EnsureHost(); _lastTick = 0; RefreshAll(); }
+        void OnDetach(DetachFromPanelEvent _) { Unhook(); _host = null; _link.SetProbeActive(false); }
+
+        void Hook() {
+            EditorApplication.update -= Tick; EditorApplication.update += Tick;
+            EditorApplication.playModeStateChanged -= OnPlayMode; EditorApplication.playModeStateChanged += OnPlayMode;
+        }
+        void Unhook() {
+            EditorApplication.update -= Tick;
+            EditorApplication.playModeStateChanged -= OnPlayMode;
+        }
+
+        void OnPlayMode(PlayModeStateChange _) { _host = null; RefreshAll(); RepaintHost(); }
+
+        // Тик из EditorApplication.update: гонит логику И принудительно перерисовывает
+        // окно-хост. Без Repaint изменения видны только после клика — окно UITK само
+        // себя не красит между кадрами, особенно без фокуса.
+        void Tick() {
+            if (_intervalMs <= 0 || _tab != Tab.Overview) return;
+            var now = EditorApplication.timeSinceStartup;
+            if (now - _lastTick < _intervalMs / 1000.0) return;
+            _lastTick = now;
+            RefreshDynamic();
+            RepaintHost();
+        }
+
+        // Находит EditorWindow, в дереве которого лежит наш корень, и красит его —
+        // даже без фокуса. EditorWindow — Unity API, не внутренности Nexus: изоляция цела.
+        void EnsureHost() {
+            if (_host != null || _root == null) return;
+            var top = _root; while (top.parent != null) top = top.parent;
+            foreach (var w in Resources.FindObjectsOfTypeAll<EditorWindow>())
+                if (w != null && w.rootVisualElement == top) { _host = w; return; }
+        }
+        void RepaintHost() {
+            EnsureHost();
+            if (_host != null) _host.Repaint(); else _root?.MarkDirtyRepaint();
+        }
+
+        // ── frame ────────────────────────────────────────────────────────────────
+        void Render() {
+            _statusCore = null;
+            _root.Clear();
+            _root.Add(BuildToolbar());
+            _content = new VisualElement(); _content.AddToClassList("ecs-content"); _content.style.flexGrow = 1;
+            _root.Add(_content);
+            if (_tab == Tab.Overview) BuildOverview(); else BuildSettings();
+        }
+
+        VisualElement BuildToolbar() {
+            var tb = new VisualElement(); tb.AddToClassList("ecs-toolbar"); BorderColor(tb, NexusToken.Border);
+            tb.Add(TabButton("Обзор", Tab.Overview));
+            tb.Add(TabButton("Настройки", Tab.Settings));
+            tb.Add(Spacer());
+            _toolInfo = new Label(); _toolInfo.AddToClassList("ecs-row-sub"); _toolInfo.style.marginRight = 8;
+            tb.Add(_toolInfo);
+            tb.Add(Context.Ui.Button(NexusRole.Common, "Refresh", RefreshAll));
+            UpdateToolInfo();
+            return tb;
+        }
+
+        Button TabButton(string label, Tab tab) {
+            var active = _tab == tab;
+            return Context.Ui.Button(active ? NexusRole.Primary : NexusRole.Ghost, label, () => { _tab = tab; Render(); });
+        }
+
+        void UpdateToolInfo() {
+            if (_toolInfo == null) return;
+            var on = _link.Available;
+            _toolInfo.text = (on ? "ECS online" : "ECS offline") + " · " + (_focused ? "focus" : "idle") + " · " + RateLabel() + " · ↻ " + _stamp;
+            _toolInfo.style.color = T(on ? NexusToken.TextDim : NexusToken.Warning);
+        }
+
+        string RateLabel() => _intervalMs <= 0 ? "вручную" : (1000f / _intervalMs).ToString("0.##", CultureInfo.InvariantCulture) + " Гц";
+
+        // ── OVERVIEW ───────────────────────────────────────────────────────────────
+        void BuildOverview() {
+            var body = new VisualElement(); body.AddToClassList("ecs-body");
+            _worldPane = Pane("ecs-world-pane"); BorderColor(_worldPane, NexusToken.Border);
+            _entityPane = Pane("ecs-entity-pane"); BorderColor(_entityPane, NexusToken.Border);
+            _inspectorPane = Pane("ecs-inspector-pane");
+            body.Add(_worldPane); body.Add(_entityPane); body.Add(_inspectorPane);
+            _content.Add(body);
+            RefreshWorlds(); RefreshEntities(); RefreshInspector();
+        }
+
+        VisualElement Pane(string cls) { var p = new VisualElement(); p.AddToClassList("ecs-pane"); p.AddToClassList(cls); return p; }
+
+        void RefreshAll() { RefreshCoreStatus(); RefreshWorlds(); RefreshEntities(); RefreshInspector(); Stamp(); UpdateToolInfo(); }
+
+        void RefreshDynamic() {
+            if (!_link.Available) return;
+            UpdateWorldsLive();
+            UpdateEntitiesLive();
+            if (_watch) UpdateInspectorLive();
+            Stamp();
+            UpdateToolInfo();
+        }
+
+        void Stamp() => _stamp = DateTime.Now.ToString("HH:mm:ss");
+
+        void RefreshWorlds() {
+            if (_worldPane == null) return;
+            _worldPane.Clear(); _worldStatsHost = null;
+            _worldPane.Add(Title("WORLDS"));
+            if (!_link.Available) { _worldsShape = null; _worldPane.Add(Empty("ECS-ядро не найдено.\nОткрой «Настройки» → «Развернуть ядро», затем войди в play mode.")); return; }
+            var n = _link.WorldCount();
+            if (n == 0) { _worldsShape = "0"; _worldPane.Add(Empty("Живых миров нет.\nВойди в play mode — миры регистрируются сами.")); _worldIndex = -1; return; }
+            if (_worldIndex < 0 || _worldIndex >= n) _worldIndex = ResolveWorldIndex(n);
+
+            string curGroup = null;
+            var scroll = new ScrollView(); scroll.AddToClassList("ecs-scroll");
+            for (var i = 0; i < n; i++) {
+                var group = _link.WorldGroup(i);
+                if (group != curGroup) { curGroup = group; if (!string.IsNullOrEmpty(group)) scroll.Add(Dim(group)); }
+                scroll.Add(WorldRow(i));
+            }
+            _worldPane.Add(scroll);
+            _worldStatsHost = new VisualElement();          // карточка статы без кнопок — её и обновляем на тике
+            _worldStatsHost.Add(WorldStatsCard(_worldIndex));
+            _worldPane.Add(_worldStatsHost);
+            _worldsShape = WorldsShape(n);
+        }
+
+        // «форма» списка миров: количество + метки. Пересобираем строки (в них клик) только при её смене.
+        string WorldsShape(int n) {
+            var parts = new string[n];
+            for (var i = 0; i < n; i++) parts[i] = _link.WorldLabel(i);
+            return n + "|" + string.Join("|", parts);
+        }
+
+        void UpdateWorldsLive() {
+            if (_worldPane == null || !_link.Available) return;
+            var n = _link.WorldCount();
+            if (WorldsShape(n) != _worldsShape) { RefreshWorlds(); return; }   // редко: набор миров изменился
+            if (_worldStatsHost != null && _worldIndex >= 0 && _worldIndex < n) {
+                _worldStatsHost.Clear();
+                _worldStatsHost.Add(WorldStatsCard(_worldIndex));             // без кнопок — строки миров не трогаем
+            }
+        }
+
+        int ResolveWorldIndex(int n) {
+            if (!string.IsNullOrEmpty(_pendingWorldLabel))
+                for (var i = 0; i < n; i++) if (_link.WorldLabel(i) == _pendingWorldLabel) return i;
+            return 0;
+        }
+
+        VisualElement WorldRow(int i) {
+            var row = new VisualElement(); row.AddToClassList("ecs-row");
+            var sel = i == _worldIndex;
+            PaintBg(row, sel ? NexusToken.Selection : NexusToken.BgSoft);
+            var st = _link.WorldStats(i);
+            var name = new Label(_link.WorldName(i)); name.style.color = T(sel ? NexusToken.OnAccent : NexusToken.TextNormal);
+            var sub = new Label(st[0] + " ent · " + st[3] + " pools"); sub.AddToClassList("ecs-row-sub");
+            sub.style.color = T(sel ? NexusToken.OnAccent : NexusToken.TextDim);
+            var col = new VisualElement(); col.Add(name); col.Add(sub); row.Add(col);
+            if (!_link.WorldAlive(i)) row.Add(Context.Ui.Badge(NexusRole.Muted, "dead"));
+            row.RegisterCallback<ClickEvent>(_ => { _worldIndex = i; _archExpanded = null; RefreshWorlds(); RefreshEntities(); RefreshInspector(); });
+            return row;
+        }
+
+        VisualElement WorldStatsCard(int i) {
+            var card = Context.Ui.Card();
+            var st = _link.WorldStats(i);
+            long bytes = SumPoolBytes(i);
+            card.Add(KV("alive", st[0].ToString()));
+            card.Add(KV("used / cap", st[1] + " / " + st[2]));
+            card.Add(Bar(st[2] == 0 ? 0f : (float)st[1] / st[2]));
+            card.Add(KV("pools", st[3].ToString()));
+            card.Add(KV("mem (est)", bytes > 0 ? FormatBytes(bytes) : "~"));
+            return card;
+        }
+
+        long SumPoolBytes(int i) {
+            long sum = 0;
+            foreach (var r in _link.PoolTable(i)) {
+                var p = r.Split(EcsBridgeLink.US);
+                if (p.Length == 3 && long.TryParse(p[2], out var b)) sum += b;
+            }
+            return sum;
+        }
+
+        // ── entities pane ──────────────────────────────────────────────────────────
+        void RefreshEntities() {
+            if (_entityPane == null) return;
+            _entityPane.Clear();
+            _entityPane.Add(Title("ENTITIES"));
+            if (!_link.Available || _worldIndex < 0) { _entityPane.Add(Empty("—")); return; }
+            _entityPane.Add(ViewTabs());
+            if (_view == View.Matrix) { var c = Context.Ui.Card(); c.Add(Dim("Плотный вид (матрица) — v2")); _entityPane.Add(c); return; }
+            if (_view == View.Archetypes && _archExpanded == null) { BuildArchetypes(); return; }
+            BuildQueryBar();
+            BuildEntityList();
+        }
+
+        VisualElement ViewTabs() {
+            var tabs = new VisualElement(); tabs.AddToClassList("ecs-viewtabs");
+            AddTab(tabs, "List", View.List); AddTab(tabs, "Archetypes", View.Archetypes); AddTab(tabs, "Matrix", View.Matrix);
+            return tabs;
+        }
+
+        void AddTab(VisualElement host, string label, View v) {
+            host.Add(Context.Ui.Button(_view == v ? NexusRole.Primary : NexusRole.Ghost, label, () => { _view = v; _archExpanded = null; RefreshEntities(); }));
+        }
+
+        void BuildArchetypes() {
+            _archCounts.Clear();
+            var scroll = new ScrollView(); scroll.AddToClassList("ecs-scroll");
+            var rows = _link.Archetypes(_worldIndex);
+            if (rows.Length == 0) scroll.Add(Empty("нет сущностей"));
+            foreach (var r in rows) {
+                var p = r.Split(EcsBridgeLink.US);
+                var csv = p[0]; var count = p.Length > 1 ? p[1] : "0";
+                var row = new VisualElement(); row.AddToClassList("ecs-row"); PaintBg(row, NexusToken.BgSoft);
+                var lbl = new Label(string.IsNullOrEmpty(csv) ? "(без компонентов)" : csv.Replace(",", ", "));
+                lbl.style.color = T(NexusToken.TextNormal); lbl.style.whiteSpace = WhiteSpace.Normal; lbl.style.flexShrink = 1;
+                row.Add(lbl);
+                var pill = CountPill(count); _archCounts[csv] = pill; row.Add(pill);
+                row.RegisterCallback<ClickEvent>(_ => { _archExpanded = csv; RefreshEntities(); });
+                scroll.Add(row);
+            }
+            _entityPane.Add(scroll);
+            _archShape = ArchShape(rows);
+        }
+
+        // счётчик в строке архетипа — собственный Label (не Ui.Badge), чтобы менять текст на месте
+        Label CountPill(string text) {
+            var l = new Label(text); l.AddToClassList("ecs-chip"); PaintBg(l, NexusToken.AccentSoft);
+            l.style.color = T(NexusToken.Accent); l.style.flexShrink = 0;
+            return l;
+        }
+
+        // «форма» архетипов — только набор сигнатур (без счётчиков), чтобы ловить появление/исчезание типов
+        string ArchShape(string[] rows) {
+            var keys = new string[rows.Length];
+            for (var i = 0; i < rows.Length; i++) keys[i] = rows[i].Split(EcsBridgeLink.US)[0];
+            Array.Sort(keys, StringComparer.Ordinal);
+            return string.Join("\n", keys);
+        }
+
+        void UpdateEntitiesLive() {
+            if (_entityPane == null || !_link.Available || _worldIndex < 0) return;
+            if (_view == View.Matrix) return;
+            if (_view == View.List || _archExpanded != null) {   // ListView: обновляем данные на месте
+                if (_entityList != null) { RunQuery(); UpdateMatch(); }
+                return;
+            }
+            // архетипы: набор сигнатур сменился → структурная пересборка (редко), иначе только счётчики
+            var rows = _link.Archetypes(_worldIndex);
+            if (ArchShape(rows) != _archShape) { RefreshEntities(); return; }
+            foreach (var r in rows) {
+                var p = r.Split(EcsBridgeLink.US);
+                if (_archCounts.TryGetValue(p[0], out var pill)) pill.text = p.Length > 1 ? p[1] : "0";
+            }
+        }
+
+        void BuildQueryBar() {
+            if (_archExpanded != null)
+                _entityPane.Add(Context.Ui.Button(NexusRole.Ghost, "← все архетипы", () => { _archExpanded = null; RefreshEntities(); }));
+
+            _chipsRow = new VisualElement(); _chipsRow.AddToClassList("ecs-chips"); BorderColor(_chipsRow, NexusToken.Border);
+            RenderChips(); _entityPane.Add(_chipsRow);
+
+            var add = new VisualElement(); add.AddToClassList("ecs-inline"); add.style.marginBottom = 6;
+            var input = Context.Ui.Input("", _ => { }); input.style.flexGrow = 1; add.Add(input);
+            add.Add(Context.Ui.Button(NexusRole.Success, "+incl", () => { AddChip(input.value, _inc); input.value = ""; }));
+            add.Add(Context.Ui.Button(NexusRole.Alarm, "−excl", () => { AddChip(input.value, _exc); input.value = ""; }));
+            _entityPane.Add(add);
+
+            var idRow = new VisualElement(); idRow.AddToClassList("ecs-inline"); idRow.style.marginBottom = 6;
+            idRow.Add(Dim("id"));
+            var idInput = Context.Ui.Input(_idFilter, v => { _idFilter = v; RunQuery(); UpdateMatch(); }); idInput.style.flexGrow = 1; idRow.Add(idInput);
+            _matchLabel = new Label(); _matchLabel.AddToClassList("ecs-row-sub"); _matchLabel.style.color = T(NexusToken.TextDim); _matchLabel.style.marginLeft = 6;
+            idRow.Add(_matchLabel); _entityPane.Add(idRow);
+        }
+
+        void AddChip(string raw, List<string> list) {
+            var t = (raw ?? "").Trim();
+            if (t.Length == 0 || list.Contains(t)) return;
+            list.Add(t); RenderChips(); RunQuery(); UpdateMatch();
+        }
+
+        void RenderChips() {
+            if (_chipsRow == null) return;
+            _chipsRow.Clear();
+            AddChipViews(_inc, NexusToken.AccentSoft, NexusToken.Accent, "+");
+            AddChipViews(_exc, NexusToken.ErrorSoft, NexusToken.Error, "−");
+            if (_inc.Count + _exc.Count == 0) _chipsRow.Add(Dim("фильтр по компонентам…"));
+            else _chipsRow.Add(Context.Ui.Button(NexusRole.Ghost, "clear", () => { _inc.Clear(); _exc.Clear(); RenderChips(); RunQuery(); UpdateMatch(); }));
+        }
+
+        void AddChipViews(List<string> list, NexusToken bg, NexusToken fg, string sign) {
+            foreach (var name in list) {
+                var chip = new VisualElement(); chip.AddToClassList("ecs-chip"); PaintBg(chip, bg);
+                var l = new Label(sign + " " + name); l.style.color = T(fg); chip.Add(l);
+                var x = new Label(" ✕"); x.style.color = T(fg);
+                x.RegisterCallback<ClickEvent>(_ => { list.Remove(name); RenderChips(); RunQuery(); UpdateMatch(); });
+                chip.Add(x); _chipsRow.Add(chip);
+            }
+        }
+
+        void BuildEntityList() {
+            RunQuery();
+            _entityList = new ListView { fixedItemHeight = 22, selectionType = SelectionType.Single };
+            _entityList.AddToClassList("ecs-entity-list");
+            _entityList.itemsSource = _rows;
+            _entityList.makeItem = () => { var l = new Label(); l.AddToClassList("ecs-mono"); l.style.paddingLeft = 6; l.style.color = T(NexusToken.TextNormal); return l; };
+            _entityList.bindItem = (e, i) => ((Label)e).text = RowLabel(_rows[i]);
+            _entityList.selectionChanged += OnEntityPicked;
+            _entityPane.Add(_entityList);
+            UpdateMatch();
+        }
+
+        void RunQuery() {
+            if (!_link.Available || _worldIndex < 0) {
+                if (_rows.Count > 0) { _rows.Clear(); _entityList?.Rebuild(); }
+                return;
+            }
+            var res = _archExpanded != null
+                ? _link.SignatureEntities(_worldIndex, _archExpanded, MaxRows)
+                : _link.Query(_worldIndex, string.Join(",", _inc), string.Join(",", _exc), _idFilter ?? "", MaxRows);
+            if (SameRows(res)) return;               // данные не изменились — не пересобираем список
+            _rows.Clear(); _rows.AddRange(res);
+            _entityList?.Rebuild();
+        }
+
+        bool SameRows(string[] res) {
+            if (res.Length != _rows.Count) return false;
+            for (var i = 0; i < res.Length; i++) if (res[i] != _rows[i]) return false;
+            return true;
+        }
+
+        void UpdateMatch() { if (_matchLabel != null) _matchLabel.text = _rows.Count + (_rows.Count >= MaxRows ? "+ match" : " match"); }
+
+        string RowLabel(string row) {
+            var p = row.Split(EcsBridgeLink.US);
+            return p.Length < 3 ? row : "#" + p[0] + ":" + p[1] + "   " + p[2] + " comp";
+        }
+
+        void OnEntityPicked(IEnumerable<object> _) {
+            var idx = _entityList.selectedIndex;
+            if (idx < 0 || idx >= _rows.Count) return;
+            var p = _rows[idx].Split(EcsBridgeLink.US);
+            if (p.Length >= 2 && int.TryParse(p[0], out var id) && int.TryParse(p[1], out var gen)) { _selId = id; _selGen = gen; RefreshInspector(); }
+        }
+
+        // ── inspector pane ─────────────────────────────────────────────────────────
+        void RefreshInspector() {              // структурная сборка (кнопки pin/watch/+incl/→ref живут тут)
+            if (_inspectorPane == null) return;
+            _inspectorPane.Clear(); _inspBodies.Clear(); _inspSig = null;
+            _inspectorPane.Add(Title("INSPECTOR"));
+            if (!_link.Available || _worldIndex < 0 || _selId < 0) { _inspectorPane.Add(Empty("выбери сущность")); return; }
+
+            var head = new VisualElement(); head.AddToClassList("ecs-inline"); head.style.marginBottom = 6;
+            var h = new Label("entity #" + _selId + ":" + _selGen); h.style.color = T(NexusToken.TextNormal); h.style.flexGrow = 1; head.Add(h);
+            head.Add(Context.Ui.Button(_pinned ? NexusRole.Primary : NexusRole.Ghost, "pin", () => { _pinned = !_pinned; RefreshInspector(); }));
+            head.Add(Context.Ui.Button(_watch ? NexusRole.Primary : NexusRole.Ghost, "watch", () => { _watch = !_watch; RefreshInspector(); }));
+            _inspectorPane.Add(head);
+
+            if (!_link.EntityAliveGen(_worldIndex, _selId, _selGen)) {
+                _inspSig = "ghost:" + _selId + ":" + _selGen;
+                _inspectorPane.Add(Context.Ui.StatusPill(StatusKind.Warning, "сущность уничтожена (ghost)"));
+                return;
+            }
+
+            var comps = _link.Components(_worldIndex, _selId);
+            var scroll = new ScrollView(); scroll.AddToClassList("ecs-scroll");
+            foreach (var r in comps) {
+                var p = r.Split(EcsBridgeLink.US);
+                scroll.Add(ComponentCard(p[0], p.Length > 1 ? p[1] : ""));
+            }
+            _inspectorPane.Add(scroll);
+            _inspSig = InspSig(comps);
+        }
+
+        // watch: перечитываем значения в существующие карточки; структуру пересобираем только если
+        // сменилась сущность/набор компонентов (иначе кнопки уничтожались бы на каждом тике → софт-лок).
+        void UpdateInspectorLive() {
+            if (_inspectorPane == null || !_link.Available || _worldIndex < 0 || _selId < 0) return;
+            if (!_link.EntityAliveGen(_worldIndex, _selId, _selGen)) {
+                var g = "ghost:" + _selId + ":" + _selGen;
+                if (_inspSig != g) RefreshInspector();
+                return;
+            }
+            var comps = _link.Components(_worldIndex, _selId);
+            if (InspSig(comps) != _inspSig) { RefreshInspector(); return; }
+            for (var i = 0; i < comps.Length && i < _inspBodies.Count; i++) {
+                var p = comps[i].Split(EcsBridgeLink.US);
+                _inspBodies[i].text = BodyText(p.Length > 1 ? p[1] : "");
+            }
+        }
+
+        string InspSig(string[] comps) {
+            var names = new string[comps.Length];
+            for (var i = 0; i < comps.Length; i++) names[i] = comps[i].Split(EcsBridgeLink.US)[0];
+            return _selId + ":" + _selGen + "|" + string.Join("|", names);
+        }
+
+        VisualElement ComponentCard(string typeName, string body) {
+            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
+            var headRow = new VisualElement(); headRow.AddToClassList("ecs-card-head");
+            var tn = new Label(typeName); tn.style.color = T(NexusToken.TextNormal); headRow.Add(tn);
+            headRow.Add(Context.Ui.Button(NexusRole.Ghost, "+incl", () => AddChip(typeName, _inc)));
+            card.Add(headRow);
+
+            var bodyLbl = new Label(BodyText(body)); bodyLbl.AddToClassList("ecs-card-body"); bodyLbl.AddToClassList("ecs-mono");
+            bodyLbl.style.color = T(NexusToken.TextDim); bodyLbl.style.whiteSpace = WhiteSpace.Normal;
+            card.Add(bodyLbl);
+            _inspBodies.Add(bodyLbl);
+
+            var refs = ParseRefs(body);          // переходы по ссылкам — структурные кнопки (тик их не трогает)
+            if (refs.Count > 0) {
+                var rr = new VisualElement(); rr.AddToClassList("ecs-inline"); rr.style.flexWrap = Wrap.Wrap; rr.style.marginTop = 4;
+                foreach (var e in refs) {
+                    int id = e.Key, gen = e.Value;
+                    rr.Add(Context.Ui.Button(NexusRole.Info, "→ #" + id + ":" + gen, () => { _selId = id; _selGen = gen; RefreshInspector(); }));
+                }
+                card.Add(rr);
+            }
+            return card;
+        }
+
+        static string BodyText(string body) => string.IsNullOrEmpty(body) ? "(empty)" : body.Replace("→ENT:", "→ #");
+
+        List<KeyValuePair<int, int>> ParseRefs(string body) {
+            var list = new List<KeyValuePair<int, int>>();
+            var idx = 0;
+            while ((idx = body.IndexOf("→ENT:", idx, StringComparison.Ordinal)) >= 0) {
+                idx += 5;
+                var end = idx;
+                while (end < body.Length && (char.IsDigit(body[end]) || body[end] == ':')) end++;
+                var parts = body.Substring(idx, end - idx).Split(':');
+                if (parts.Length >= 2 && int.TryParse(parts[0], out var id) && int.TryParse(parts[1], out var gen))
+                    list.Add(new KeyValuePair<int, int>(id, gen));
+                idx = end;
+            }
+            return list;
+        }
+
+        // ── SETTINGS ────────────────────────────────────────────────────────────────
+        void BuildSettings() {
+            var scroll = new ScrollView(); scroll.AddToClassList("ecs-settings");
+            scroll.Add(SettingsCore());
+            scroll.Add(SettingsRefresh());
+            scroll.Add(SettingsNaming());
+            _content.Add(scroll);
+        }
+
+        VisualElement SettingsCore() {
+            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
+            var title = new Label("ECS-ядро"); title.AddToClassList("ecs-settings-title"); title.style.color = T(NexusToken.TextNormal); card.Add(title);
+            var desc = new Label("Форк Exerussus.EcsLite едет в плагине и разворачивается наружу, в Assets/. Это внешний footprint — он не стирается при выключении страницы.");
+            desc.AddToClassList("ecs-settings-desc"); desc.style.color = T(NexusToken.TextDim); card.Add(desc);
+            _statusCore = new Label(); _statusCore.AddToClassList("ecs-row-sub"); card.Add(_statusCore);
+            var row = new VisualElement(); row.AddToClassList("ecs-inline"); row.style.marginTop = 8;
+            row.Add(Context.Ui.Button(NexusRole.Primary, "Развернуть ядро", DeployCore));
+            row.Add(Context.Ui.Button(NexusRole.Alarm, "Удалить", RemoveCore));
+            card.Add(row);
+            RefreshCoreStatus();
+            return card;
+        }
+
+        VisualElement SettingsRefresh() {
+            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
+            var title = new Label("Автообновление"); title.AddToClassList("ecs-settings-title"); title.style.color = T(NexusToken.TextNormal); card.Add(title);
+            var desc = new Label("Обновляет данные, пока окно открыто — даже без фокуса. «Вручную» отключает автообновление (работает кнопка Refresh).");
+            desc.AddToClassList("ecs-settings-desc"); desc.style.color = T(NexusToken.TextDim); card.Add(desc);
+
+            var presets = new VisualElement(); presets.AddToClassList("ecs-presets");
+            AddPreset(presets, "Вручную", 0);
+            AddPreset(presets, "1 Гц", 1000);
+            AddPreset(presets, "4 Гц", 250);
+            AddPreset(presets, "10 Гц", 100);
+            card.Add(presets);
+
+            var custom = new VisualElement(); custom.AddToClassList("ecs-inline");
+            custom.Add(Dim("Своя частота, Гц:"));
+            var hz = Context.Ui.Input(_intervalMs > 0 ? (1000f / _intervalMs).ToString("0.##", CultureInfo.InvariantCulture) : "", _ => { });
+            hz.style.width = 70; custom.Add(hz);
+            custom.Add(Context.Ui.Button(NexusRole.Common, "Применить", () => ApplyHz(hz.value)));
+            card.Add(custom);
+
+            var now = new Label("Сейчас: " + RateLabel()); now.AddToClassList("ecs-row-sub"); now.style.color = T(NexusToken.TextDim); now.style.marginTop = 6;
+            card.Add(now);
+            return card;
+        }
+
+        void AddPreset(VisualElement host, string label, int ms) {
+            var active = _intervalMs == ms;
+            host.Add(Context.Ui.Button(active ? NexusRole.Primary : NexusRole.Ghost, label, () => { _intervalMs = ms; _lastTick = 0; UpdateToolInfo(); Render(); }));
+        }
+
+        void ApplyHz(string raw) {
+            var s = (raw ?? "").Trim().Replace(',', '.');
+            if (float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var hz) && hz > 0f) {
+                _intervalMs = Mathf.Max(MinIntervalMs, Mathf.RoundToInt(1000f / hz));
+                _lastTick = 0; UpdateToolInfo(); Render();
+                Context.SetStatus("Частота обновления: " + RateLabel(), StatusKind.Ok);
+            } else {
+                Context.SetStatus("Введи положительное число (Гц), например 2 или 0.5.", StatusKind.Warning);
+            }
+        }
+
+        VisualElement SettingsNaming() {
+            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
+            var title = new Label("Имена миров"); title.AddToClassList("ecs-settings-title"); title.style.color = T(NexusToken.TextNormal); card.Add(title);
+            var desc = new Label("Имя можно задать прямо в конструкторе — оно станет меткой мира в дереве. Имя из EcsSystems.AddWorld(name) перекрывает его.");
+            desc.AddToClassList("ecs-settings-desc"); desc.style.color = T(NexusToken.TextDim); card.Add(desc);
+            var code = new Label("var combat = new EcsWorld(name: \"combat\");\n// или:  new EcsWorld(cfg, \"combat\");\nstring n = combat.GetName();");
+            code.AddToClassList("ecs-code"); code.AddToClassList("ecs-mono"); code.style.color = T(NexusToken.TextNormal); PaintBg(code, NexusToken.BgHard);
+            card.Add(code);
+            return card;
+        }
+
+        // ── core deploy (servicing external footprint) ───────────────────────────────
+        string CoreDirAbs => Path.Combine(Application.dataPath, CoreDirRel);
+        string CoreFileAbs => Path.Combine(CoreDirAbs, CoreFile);
+
+        void RefreshCoreStatus() {
+            if (_statusCore == null) return;
+            if (File.Exists(CoreFileAbs)) { _statusCore.text = "развёрнуто · Assets/" + CoreDirRel + "/" + CoreFile; _statusCore.style.color = T(NexusToken.Ok); }
+            else { _statusCore.text = "не развёрнуто — нужен форк ECS в проекте"; _statusCore.style.color = T(NexusToken.Warning); }
+        }
+
+        void DeployCore() {
+            try {
+                var srcCs = ReadCompanion(CoreSrcAsset);
+                if (srcCs == null) { Context.SetStatus("Компаньон " + CoreSrcAsset + " не найден в развёртке страницы.", StatusKind.Error); return; }
+                Directory.CreateDirectory(CoreDirAbs);
+                File.WriteAllText(CoreFileAbs, srcCs);
+                var lic = ReadCompanion(LicenseAsset);
+                if (lic != null) File.WriteAllText(Path.Combine(CoreDirAbs, LicenseFile), lic);
+                AssetDatabase.Refresh();
+                RefreshCoreStatus(); UpdateToolInfo();
+                Context.SetStatus("ECS-ядро развёрнуто в Assets/" + CoreDirRel + "/. Войди в play mode для обзора.", StatusKind.Ok);
+            } catch (Exception e) { Context.SetStatus("Не удалось развернуть ядро: " + e.Message, StatusKind.Error); }
+        }
+
+        void RemoveCore() {
+            if (!Directory.Exists(CoreDirAbs)) { Context.SetStatus("Удалять нечего.", StatusKind.Info); return; }
+            var ok = EditorUtility.DisplayDialog("Удалить ECS-ядро?",
+                "Будет удалена ТОЛЬКО папка Assets/" + CoreDirRel + "/ (её создала эта страница). " +
+                "Игра, ссылающаяся на этот ECS, перестанет компилироваться, пока ядро не вернуть.", "Удалить", "Отмена");
+            if (!ok) return;
+            try {
+                if (!AssetDatabase.DeleteAsset("Assets/" + CoreDirRel)) Directory.Delete(CoreDirAbs, true);
+                AssetDatabase.Refresh(); RefreshCoreStatus(); UpdateToolInfo();
+                Context.SetStatus("ECS-ядро удалено.", StatusKind.Ok);
+            } catch (Exception e) { Context.SetStatus("Не удалось удалить: " + e.Message, StatusKind.Error); }
+        }
+
+        string ReadCompanion(string assetName) {
+            try {
+                var p = Context.GetDeployedAssetPath(assetName);
+                if (!string.IsNullOrEmpty(p) && File.Exists(p)) return File.ReadAllText(p);
+                var ta = Context.LoadDeployedAsset<TextAsset>(assetName);
+                return ta != null ? ta.text : null;
+            } catch { return null; }
+        }
+
+        // ── prefs ─────────────────────────────────────────────────────────────────────
+        [Serializable]
+        class ViewPrefs { public int schema; public string world; public List<string> inc; public List<string> exc; public string idf; public int view; public int intervalMs = 1000; }
+        const int PrefsSchema = 2;   // <2 — старые префы, где «вручную» было дефолтом не по выбору
+
+        void SavePrefs() {
+            try {
+                var p = new ViewPrefs {
+                    schema = PrefsSchema,
+                    world = _worldIndex >= 0 && _link.Available ? _link.WorldLabel(_worldIndex) : _pendingWorldLabel,
+                    inc = new List<string>(_inc), exc = new List<string>(_exc), idf = _idFilter, view = (int)_view, intervalMs = _intervalMs
+                };
+                File.WriteAllText(Context.GetUserConfigPath("view.json"), JsonUtility.ToJson(p, true));
+            } catch { }
+        }
+
+        void LoadPrefs() {
+            try {
+                var path = Context.GetUserConfigPath("view.json");
+                if (!File.Exists(path)) return;
+                var p = JsonUtility.FromJson<ViewPrefs>(File.ReadAllText(path));
+                if (p == null) return;
+                _pendingWorldLabel = p.world;
+                if (p.inc != null) { _inc.Clear(); _inc.AddRange(p.inc); }
+                if (p.exc != null) { _exc.Clear(); _exc.AddRange(p.exc); }
+                _idFilter = p.idf ?? "";
+                _view = (View)Mathf.Clamp(p.view, 0, 2);
+                // старые префы (schema<2) игнорируем по частоте — там 0 остался от прежнего дефолта
+                _intervalMs = p.schema >= PrefsSchema ? p.intervalMs : 1000;
+            } catch { }
+        }
+
+        // ── ui helpers ──────────────────────────────────────────────────────────────
+        Label Title(string t) { var l = new Label(t); l.AddToClassList("ecs-pane-title"); l.style.color = T(NexusToken.TextFaint); return l; }
+        Label Dim(string t) { var l = new Label(t); l.AddToClassList("ecs-row-sub"); l.style.color = T(NexusToken.TextDim); l.style.marginRight = 6; return l; }
+        Label Empty(string t) { var l = new Label(t); l.AddToClassList("ecs-empty"); l.style.color = T(NexusToken.TextDim); return l; }
+        VisualElement Spacer() { var s = new VisualElement(); s.AddToClassList("ecs-spacer"); return s; }
+
+        VisualElement KV(string k, string v) {
+            var row = new VisualElement(); row.style.flexDirection = FlexDirection.Row; row.style.justifyContent = Justify.SpaceBetween;
+            var kk = new Label(k); kk.style.color = T(NexusToken.TextDim); kk.style.fontSize = 12;
+            var vv = new Label(v); vv.style.color = T(NexusToken.TextNormal); vv.style.fontSize = 12;
+            row.Add(kk); row.Add(vv); return row;
+        }
+
+        VisualElement Bar(float ratio) {
+            var bar = new VisualElement(); bar.AddToClassList("ecs-bar"); PaintBg(bar, NexusToken.Border);
+            var fill = new VisualElement(); fill.AddToClassList("ecs-bar-fill"); PaintBg(fill, NexusToken.Accent);
+            fill.style.width = Length.Percent(Mathf.Clamp01(ratio) * 100f);
+            bar.Add(fill); return bar;
+        }
+
+        void PaintBg(VisualElement e, NexusToken tok) { if (e != null) e.style.backgroundColor = T(tok); }
+        void BorderColor(VisualElement e, NexusToken tok) {
+            if (e == null) return; var c = T(tok);
+            e.style.borderTopColor = c; e.style.borderBottomColor = c; e.style.borderLeftColor = c; e.style.borderRightColor = c;
+        }
+
+        static string FormatBytes(long b) {
+            if (b >= 1048576) return (b / 1048576f).ToString("0.0") + " MB";
+            if (b >= 1024) return (b / 1024f).ToString("0.0") + " KB";
+            return b + " B";
+        }
+    }
+
+    // Рефлексия-мост к Exerussus.EcsLite.EcsEditorBridge. Кэш MethodInfo — инстанс-состояние
+    // страницы (не static-сервис), инвариант Nexus соблюдён.
+    sealed class EcsBridgeLink {
+        public const char US = '\u001F';
+        Type _bridge, _probe;
+        FieldInfo _active;
+        readonly Dictionary<string, MethodInfo> _m = new Dictionary<string, MethodInfo>();
+        bool _bound;
+
+        public bool Available => _bridge != null;
+
+        public void Bind() {
+            if (_bound) return; _bound = true;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()) {
+                if (_bridge == null) _bridge = asm.GetType("Exerussus.EcsLite.EcsEditorBridge", false);
+                if (_probe == null) _probe = asm.GetType("Exerussus.EcsLite.EcsEditorProbe", false);
+                if (_bridge != null && _probe != null) break;
+            }
+            if (_probe != null) _active = _probe.GetField("Active", BindingFlags.Public | BindingFlags.Static);
+        }
+
+        public void SetProbeActive(bool v) { try { _active?.SetValue(null, v); } catch { } }
+
+        MethodInfo M(string name) {
+            if (_bridge == null) return null;
+            if (_m.TryGetValue(name, out var mi)) return mi;
+            mi = _bridge.GetMethod(name, BindingFlags.Public | BindingFlags.Static); _m[name] = mi; return mi;
+        }
+        object Call(string name, params object[] args) { try { return M(name)?.Invoke(null, args); } catch { return null; } }
+        object Prop(string name) { try { return _bridge?.GetProperty(name, BindingFlags.Public | BindingFlags.Static)?.GetValue(null); } catch { return null; } }
+
+        public int WorldCount() => Prop("WorldCount") as int? ?? 0;
+        public string WorldLabel(int i) => Call("WorldLabel", i) as string ?? "?";
+        public string WorldGroup(int i) => Call("WorldGroup", i) as string ?? "";
+        public string WorldName(int i) => Call("WorldName", i) as string ?? "?";
+        public bool WorldAlive(int i) => Call("WorldAlive", i) as bool? ?? false;
+        public int[] WorldStats(int i) => Call("WorldStats", i) as int[] ?? new[] { 0, 0, 0, 0 };
+        public string[] PoolTable(int i) => Call("PoolTable", i) as string[] ?? Array.Empty<string>();
+        public string[] Query(int i, string inc, string exc, string idf, int max) => Call("Query", i, inc, exc, idf, max) as string[] ?? Array.Empty<string>();
+        public string[] Archetypes(int i) => Call("Archetypes", i) as string[] ?? Array.Empty<string>();
+        public string[] SignatureEntities(int i, string csv, int max) => Call("SignatureEntities", i, csv, max) as string[] ?? Array.Empty<string>();
+        public string[] Components(int i, int id) => Call("Components", i, id) as string[] ?? Array.Empty<string>();
+        public int EntityGen(int i, int id) => Call("EntityGen", i, id) as int? ?? 0;
+        public bool EntityAliveGen(int i, int id, int gen) => Call("EntityAliveGen", i, id, gen) as bool? ?? false;
+    }
+}

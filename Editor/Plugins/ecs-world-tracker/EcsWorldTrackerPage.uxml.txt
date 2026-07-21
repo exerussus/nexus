@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ui:UXML xmlns:ui="UnityEngine.UIElements">
+    <ui:VisualElement name="root" class="ecs-root">
+        <ui:VisualElement name="toolbar" class="ecs-toolbar" />
+        <ui:VisualElement name="core-strip" class="ecs-core-strip" />
+        <ui:VisualElement name="body" class="ecs-body">
+            <ui:VisualElement name="world-pane" class="ecs-pane ecs-world-pane" />
+            <ui:VisualElement name="entity-pane" class="ecs-pane ecs-entity-pane" />
+            <ui:VisualElement name="inspector-pane" class="ecs-pane ecs-inspector-pane" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

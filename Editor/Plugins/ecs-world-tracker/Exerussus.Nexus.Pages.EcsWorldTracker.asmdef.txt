@@ -1,0 +1,15 @@
+{
+    "name": "Exerussus.Nexus.Pages.EcsWorldTracker",
+    "rootNamespace": "Exerussus.Nexus.Pages.EcsWorldTracker",
+    "references": [
+        "Exerussus.Nexus.Abstractions"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "autoReferenced": false,
+    "noEngineReferences": false
+}

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "guid": "e4f7c2a1-9b3d-4c6e-8a12-7d5f0b9e1c34",
+  "id": "ecs-world-tracker",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.EcsWorldTracker.EcsWorldTrackerPage",
+  "kind": "servicing",
+  "display": {
+    "name": "ECS Worlds",
+    "category": "Game",
+    "order": 20,
+    "icon": null
+  },
+  "requires": [],
+  "packageRequires": [],
+  "deploy": [
+    { "from": "EcsWorldTrackerPage.cs.txt", "to": "EcsWorldTrackerPage.cs" },
+    { "from": "EcsWorldTrackerPage.uss.txt", "to": "EcsWorldTrackerPage.uss" },
+    { "from": "Exerussus.Nexus.Pages.EcsWorldTracker.asmdef.txt", "to": "Exerussus.Nexus.Pages.EcsWorldTracker.asmdef" },
+    { "from": "Exerussus.EcsLite.cs.txt", "to": "Exerussus.EcsLite.cs.txt" }
+  ]
+}

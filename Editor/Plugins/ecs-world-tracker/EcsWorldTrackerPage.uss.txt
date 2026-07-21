@@ -1,0 +1,79 @@
+/* ECS Worlds — только раскладка и метрики. Цвета красит C# через
+   Context.Theme.Get(token), чтобы смена палитры Nexus доставала и сюда.
+   min-height:0 на flex-детях обязателен — иначе внутренний скролл не сжимается. */
+
+.ecs-root { flex-grow: 1; flex-direction: column; min-height: 0; }
+.ecs-content { flex-grow: 1; flex-direction: column; min-height: 0; }
+
+.ecs-toolbar {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+    border-bottom-width: 1px;
+    flex-shrink: 0;
+}
+.ecs-spacer { flex-grow: 1; }
+
+.ecs-body { flex-grow: 1; flex-direction: row; min-height: 0; }
+
+.ecs-pane { flex-direction: column; padding: 8px; min-height: 0; overflow: hidden; }
+.ecs-world-pane { width: 210px; min-width: 170px; border-right-width: 1px; }
+.ecs-entity-pane { flex-grow: 1; flex-basis: 0; border-right-width: 1px; }
+.ecs-inspector-pane { flex-grow: 1.15; flex-basis: 0; }
+
+.ecs-pane-title { font-size: 10px; margin-bottom: 6px; letter-spacing: 1px; flex-shrink: 0; }
+
+.ecs-row {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 7px;
+    border-radius: 5px;
+    margin-bottom: 2px;
+    flex-shrink: 0;
+}
+.ecs-row-sub { font-size: 11px; }
+
+.ecs-chips {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 5px;
+    border-radius: 6px;
+    border-width: 1px;
+    margin-bottom: 6px;
+    flex-shrink: 0;
+}
+.ecs-chip {
+    flex-direction: row;
+    align-items: center;
+    padding: 1px 7px;
+    border-radius: 9px;
+    margin: 2px 3px 2px 0;
+    font-size: 11px;
+}
+
+.ecs-viewtabs { flex-direction: row; margin-bottom: 8px; flex-shrink: 0; }
+
+.ecs-entity-list { flex-grow: 1; min-height: 0; }
+
+.ecs-card { padding: 10px; border-radius: 8px; border-width: 1px; margin-bottom: 8px; flex-shrink: 0; }
+.ecs-card-head { flex-direction: row; justify-content: space-between; align-items: center; }
+.ecs-card-body { font-size: 12px; margin-top: 6px; margin-left: 2px; white-space: normal; }
+
+.ecs-mono { font-size: 12px; }
+
+.ecs-bar { height: 4px; border-radius: 2px; margin: 4px 0 2px 0; }
+.ecs-bar-fill { height: 4px; border-radius: 2px; }
+
+.ecs-empty { padding: 14px 4px; white-space: normal; font-size: 12px; -unity-text-align: upper-left; }
+
+.ecs-scroll { flex-grow: 1; min-height: 0; }
+
+.ecs-settings { flex-grow: 1; min-height: 0; padding: 10px; }
+.ecs-settings-title { font-size: 13px; margin-bottom: 8px; }
+.ecs-settings-desc { font-size: 11px; white-space: normal; margin-bottom: 8px; }
+.ecs-presets { flex-direction: row; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+.ecs-inline { flex-direction: row; align-items: center; }
+.ecs-code { font-size: 12px; white-space: normal; padding: 8px; border-radius: 6px; margin-top: 4px; }

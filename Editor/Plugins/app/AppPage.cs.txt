@@ -5,8 +5,7 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
-using App.Core;
-using App.Services.Navigator;
+using Exerussus.AppCore.Navigation;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -21,14 +20,14 @@ namespace Exerussus.Nexus.Pages.App
         // Собственный стиль страницы — companion-ассет плагина: грузится через Context, путь не хардкодим.
         private const string PageUssName = "AppPage.uss";
 
-        // Опциональные поля аффиксов в NavigationSetting (рефлексия). Нет полей — работаем на дефолтах.
+        // Опциональные поля аффиксов в NavigationSettings (рефлексия). Нет полей — работаем на дефолтах.
         private static readonly FieldInfo SettingPagePrefixField   = AffixField("prefix");
         private static readonly FieldInfo SettingPagePostfixField  = AffixField("postfix");
         private static readonly FieldInfo SettingPopupPrefixField  = AffixField("popupPrefix");
         private static readonly FieldInfo SettingPopupPostfixField = AffixField("popupPostfix");
 
         private static FieldInfo AffixField(string name) =>
-            typeof(NavigationSetting).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+            typeof(NavigationSettings).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
 
         // USS class должен оставаться валидным селектором.
         private static readonly Regex ClassRx =
@@ -41,8 +40,8 @@ namespace Exerussus.Nexus.Pages.App
 
         private static readonly char[] WS = { ' ', '\t', '\n', '\r' };
 
-        // Источник истины по id — теперь типизированный SO из app.core (db больше нет).
-        private NavigationSetting _setting;
+        // Источник истины по id — типизированный SO из app-core (db больше нет).
+        private NavigationSettings _setting;
         private NavigationData    _navData;
 
         private Registry _pageReg;
@@ -74,11 +73,11 @@ namespace Exerussus.Nexus.Pages.App
             public Func<IReadOnlyList<string>>   ReadStored;
             public Action<IEnumerable<string>>   WriteStored;
 
-            public Func<string, long> HashOf;         // new PageUID/PopupUID(id).Id
-            public string UidTypeName;                 // "PageUID"/"PopupUID" — для комментариев в uss
+            public Func<string, long> HashOf;         // new PageId/PopupId(id).Id
+            public string UidTypeName;                 // "PageId"/"PopupId" — для комментариев в uss
             public string DefaultPrefix, DefaultPostfix;
             public FieldInfo PrefixField, PostfixField;
-            public NavigationSetting.EntryKind EntryKind;
+            public NavigationSettings.EntryKind EntryKind;
 
             public string Prefix, Postfix;
             public string OriginalPrefix, OriginalPostfix;
@@ -183,7 +182,7 @@ namespace Exerussus.Nexus.Pages.App
 
             var hint = new Label(
                 "Each id generates one USS class: prefix + id.ToLower() + postfix, into the same Navigation.uss. " +
-                "At runtime the id becomes a PageUID/PopupUID. On Apply, renamed or removed ids ask how to migrate " +
+                "At runtime the id becomes a PageId/PopupId. On Apply, renamed or removed ids ask how to migrate " +
                 "the old class across all UXML files.");
             hint.AddToClassList("nav-hint");
             _editorRoot.Add(hint);
@@ -205,16 +204,16 @@ namespace Exerussus.Nexus.Pages.App
             _pageReg = new Registry
             {
                 Name           = "page",
-                SectionTitle   = "Pages (PageUID source)",
+                SectionTitle   = "Pages (PageId source)",
                 ReadStored     = () => _navData != null ? _navData.Pages : Array.Empty<string>(),
                 WriteStored    = ids => _navData?.EditorSetPages(ids),
-                HashOf         = id => new PageUID(id).Id,
-                UidTypeName    = "PageUID",
+                HashOf         = id => new PageId(id).Id,
+                UidTypeName    = "PageId",
                 DefaultPrefix  = "to-",
                 DefaultPostfix = "__navigation",
                 PrefixField    = SettingPagePrefixField,
                 PostfixField   = SettingPagePostfixField,
-                EntryKind      = NavigationSetting.EntryKind.Page,
+                EntryKind      = NavigationSettings.EntryKind.Page,
             };
             _pageReg.Prefix  = _pageReg.OriginalPrefix  = _pageReg.DefaultPrefix;
             _pageReg.Postfix = _pageReg.OriginalPostfix = _pageReg.DefaultPostfix;
@@ -222,16 +221,16 @@ namespace Exerussus.Nexus.Pages.App
             _popupReg = new Registry
             {
                 Name           = "popup",
-                SectionTitle   = "Popups (PopupUID source)",
+                SectionTitle   = "Popups (PopupId source)",
                 ReadStored     = () => _navData != null ? _navData.Popups : Array.Empty<string>(),
                 WriteStored    = ids => _navData?.EditorSetPopups(ids),
-                HashOf         = id => new PopupUID(id).Id,
-                UidTypeName    = "PopupUID",
+                HashOf         = id => new PopupId(id).Id,
+                UidTypeName    = "PopupId",
                 DefaultPrefix  = "open-",
                 DefaultPostfix = "__navigation",
                 PrefixField    = SettingPopupPrefixField,
                 PostfixField   = SettingPopupPostfixField,
-                EntryKind      = NavigationSetting.EntryKind.Popup,
+                EntryKind      = NavigationSettings.EntryKind.Popup,
             };
             _popupReg.Prefix  = _popupReg.OriginalPrefix  = _popupReg.DefaultPrefix;
             _popupReg.Postfix = _popupReg.OriginalPostfix = _popupReg.DefaultPostfix;
@@ -525,9 +524,9 @@ namespace Exerussus.Nexus.Pages.App
             _popupReg.WriteStored(idsPopups);
             EditorUtility.SetDirty(_navData);
 
-            // ---- 3. NavigationSetting (entries обоих видов + аффиксы) ----
+            // ---- 3. NavigationSettings (entries обоих видов + аффиксы) ----
             UnityEditor.Undo.RecordObject(_setting, "Edit Navigation Links");
-            var entries = new List<NavigationSetting.NavigationEntry>();
+            var entries = new List<NavigationSettings.NavigationEntry>();
             AppendEntries(entries, _pageReg, idsPages);
             AppendEntries(entries, _popupReg, idsPopups);
             _setting.EditorSetEntries(entries);
@@ -585,7 +584,7 @@ namespace Exerussus.Nexus.Pages.App
         // независимо от того, менялся ли USS-класс и есть ли он в uxml.
         private static void CollectIdRenames(Registry reg, List<(string oldId, string newId, bool isPopup)> acc)
         {
-            bool isPopup = reg.EntryKind == NavigationSetting.EntryKind.Popup;
+            bool isPopup = reg.EntryKind == NavigationSettings.EntryKind.Popup;
             foreach (var row in reg.Rows)
             {
                 if (string.IsNullOrEmpty(row.OriginalId)) continue;   // новая строка
@@ -668,11 +667,11 @@ namespace Exerussus.Nexus.Pages.App
             return ids;
         }
 
-        private static void AppendEntries(List<NavigationSetting.NavigationEntry> entries, Registry reg, List<string> ids)
+        private static void AppendEntries(List<NavigationSettings.NavigationEntry> entries, Registry reg, List<string> ids)
         {
             foreach (var id in ids)
             {
-                entries.Add(new NavigationSetting.NavigationEntry
+                entries.Add(new NavigationSettings.NavigationEntry
                 {
                     ClassName = Compose(reg.Prefix, reg.Postfix, id),
                     Bound     = true,
@@ -703,7 +702,7 @@ namespace Exerussus.Nexus.Pages.App
                         Label    = reg.Name,
                         OldClass = oldClass,
                         NewClass = newClass,
-                        IsPopup  = reg.EntryKind == NavigationSetting.EntryKind.Popup,
+                        IsPopup  = reg.EntryKind == NavigationSettings.EntryKind.Popup,
                         OldId    = row.OriginalId,
                         NewId    = newId
                     });
@@ -827,7 +826,7 @@ namespace Exerussus.Nexus.Pages.App
 
         private void WriteAffix(Registry reg)
         {
-            // нет полей в NavigationSetting → не персистим (работаем на дефолтах в рамках сессии)
+            // нет полей в NavigationSettings → не персистим (работаем на дефолтах в рамках сессии)
             reg.PrefixField?.SetValue(_setting, reg.Prefix);
             reg.PostfixField?.SetValue(_setting, reg.Postfix);
         }
@@ -871,14 +870,14 @@ namespace Exerussus.Nexus.Pages.App
 
         // ------------------------------------------------------------- state
 
-        private NavigationSetting LoadOrCreateSetting()
+        private NavigationSettings LoadOrCreateSetting()
         {
-            var s = AssetDatabase.LoadAssetAtPath<NavigationSetting>(AppPaths.SettingPath);
+            var s = AssetDatabase.LoadAssetAtPath<NavigationSettings>(AppPaths.SettingPath);
             if (s != null)
                 return s;
 
             EnsureFolder(AppPaths.ResourcesDir);
-            s = ScriptableObject.CreateInstance<NavigationSetting>();
+            s = ScriptableObject.CreateInstance<NavigationSettings>();
             AssetDatabase.CreateAsset(s, AppPaths.SettingPath);
             AssetDatabase.SaveAssets();
             Context.SetStatus($"Created {AppPaths.SettingPath}.", StatusKind.Ok);
@@ -1007,7 +1006,7 @@ namespace Exerussus.Nexus.Pages.App
             _navData = LoadOrCreateNavigationData();
             LoadAll();
             ClearDirty();
-            Context.SetStatus("Reloaded from NavigationData + NavigationSetting.", StatusKind.Info);
+            Context.SetStatus("Reloaded from NavigationData + NavigationSettings.", StatusKind.Info);
         }
 
         public override bool CanClose()

@@ -11,7 +11,7 @@
 //    • generated — чисто-генерируемые выходы (перезаписываются на Apply/Generate):
 //                    Navigation.uss, NavTargets.cs, NavigationName.cs.
 //                    ТОЛЬКО их разрешено удалять кнопкой Clean.
-//    • config    — NavigationData / NavigationSetting: создаются страницей, но хранят
+//    • config    — NavigationData / NavigationSettings: создаются страницей, но хранят
 //                    отредактированные данные (id, entries, аффиксы) → не трогаем.
 //    • authored  — скаффолд + рукопись: контейнеры, AppStyle/AppTheme/App Settings,
 //                    UISoundLibrary, Assets/App/Pages|Popups. Только статус.
@@ -66,7 +66,7 @@ namespace Exerussus.Nexus.Pages.App
             _extCleanBtn.AddToClassList("nav-btn");
             _extCleanBtn.tooltip =
                 "Deletes ONLY the regenerable outputs (Navigation.uss, NavTargets.cs, NavigationName.cs). " +
-                "Authored & config data — NavigationData, NavigationSetting, containers, theme, page/popup UXML — " +
+                "Authored & config data — NavigationData, NavigationSettings, containers, theme, page/popup UXML — " +
                 "is never touched.";
             toolbar.Add(_extCleanBtn);
 
@@ -131,7 +131,7 @@ namespace Exerussus.Nexus.Pages.App
 
                 // --- config (создаётся страницей, хранит данные → не трогаем) ---
                 new() { Label = "NavigationData.asset (config)",    Path = AppPaths.NavigationDataPath, Kind = ExtKind.Config },
-                new() { Label = "NavigationSetting.asset (config)", Path = AppPaths.SettingPath,        Kind = ExtKind.Config },
+                new() { Label = $"{Path.GetFileName(AppPaths.SettingPath)} (config)", Path = AppPaths.SettingPath, Kind = ExtKind.Config },
 
                 // --- authored / scaffold (только статус) ---
                 new() { Label = "AppStyle.uss (authored)",       Path = AppPaths.AppStylePath,       Kind = ExtKind.Authored },
@@ -200,7 +200,7 @@ namespace Exerussus.Nexus.Pages.App
             var msg =
                 "These regenerated files will be deleted:\n\n  " +
                 string.Join("\n  ", targets) +
-                "\n\nAuthored & config data (NavigationData, NavigationSetting, containers, theme, page/popup UXML) " +
+                "\n\nAuthored & config data (NavigationData, NavigationSettings, containers, theme, page/popup UXML) " +
                 "is NOT touched. You can recreate these via Apply / Generation. Proceed?";
 
             if (!EditorUtility.DisplayDialog("App — clean generated outputs", msg, "Delete", "Cancel"))

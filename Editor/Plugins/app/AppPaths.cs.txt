@@ -42,12 +42,17 @@ namespace Exerussus.Nexus.Pages.App
             // namespace генерируемого кода (NavTargets / NavigationName)
             public string generatedNamespace   = "App.Navigation";
 
+            // namespace генерируемых контроллеров (AppControllerGenerator).
+            // Раньше был захардкожен как "App.Core" — именем пакета app-core, которого
+            // больше нет: его неймспейсы теперь начинаются с Exerussus.AppCore.
+            public string controllersNamespace = "App.Core";
+
             // имена файлов
             public string navUssName           = "Navigation.uss";
             public string appStyleName         = "AppStyle.uss";
             public string appThemeName         = "AppTheme.tss";
             public string appSettingsName      = "App Settings.asset";
-            public string navigationSettingName = "NavigationSetting.asset";
+            public string navigationSettingName = "NavigationSettings.asset";
             public string navigationDataName   = "NavigationData.asset";
             public string uiSoundLibraryName   = "UISoundLibrary.asset";
             public string defaultContainerName = "Default.uxml";
@@ -115,6 +120,7 @@ namespace Exerussus.Nexus.Pages.App
 
         // ---- генерируемый код ----
         public static string GenNamespace  => Cfg.generatedNamespace;
+        public static string ControllersNamespace => Cfg.controllersNamespace;
         public static string UidFileName   => Cfg.uidFileName;
         public static string NameFileName  => Cfg.nameFileName;
 

@@ -14,19 +14,19 @@ namespace Exerussus.Nexus.Deployment
     /// </summary>
     public static class NexusPaths
     {
-        public const string VendorFolder = "Exerussus.Nexus";
+        public const string VendorFolder = "Plugins/Exerussus.Nexus";
 
         /// <summary>Папка развёрнутого кода — ОТДЕЛЬНО от основной папки Nexus,
         /// чтобы Nexus можно было обновлять/держать read-only (в т.ч. как пакет),
         /// а State коммитить независимо.</summary>
-        public const string StatesFolder    = "NexusStates";
+        public const string StatesFolder    = "Plugins/NexusStates";
         public const string StatesAssetRoot = "Assets/" + StatesFolder;
 
         /// <summary>Абсолютный корень проекта (родитель Assets/).</summary>
         public static string ProjectRoot =>
             Directory.GetParent(Application.dataPath)!.FullName;
 
-        // ---- проектное, коммитится (Assets/Exerussus.Nexus/Editor) ----
+        // ---- проектное, коммитится (Assets/Plugins/Exerussus.Nexus/Editor) ----
 
         /// <summary>Asset-относительный корень движка (для AssetDatabase-операций).</summary>
         public const string EditorAssetRoot = "Assets/" + VendorFolder + "/Editor";

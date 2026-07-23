@@ -287,9 +287,9 @@ namespace Exerussus.Nexus.Pages.App
         {
             error = null;
 
-            var tRunner = ResolveType("App.AppRunner", "AppRunner");
-            var tPage   = ResolveType("App.Core.AppPage", "AppPage");
-            var tPopup  = ResolveType("App.Core.AppPopup", "AppPopup");
+            var tRunner = ResolveType("Exerussus.AppCore.AppRunner");
+            var tPage   = ResolveType("Exerussus.AppCore.Views.AppPage");
+            var tPopup  = ResolveType("Exerussus.AppCore.Views.AppPopup");
 
             if (tRunner == null) { error = "Type 'AppRunner' not found in loaded assemblies."; return false; }
             if (tPage == null && tPopup == null) { error = "Neither 'AppPage' nor 'AppPopup' type found."; return false; }
@@ -804,7 +804,7 @@ namespace Exerussus.Nexus.Pages.App
                     if (found != null) break;
                 }
 
-                if (found == null)   // fallback: по короткому имени
+                if (found == null && !nm.Contains('.'))   // fallback: по короткому имени
                 {
                     var simple = nm.Contains('.') ? nm.Substring(nm.LastIndexOf('.') + 1) : nm;
                     foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())

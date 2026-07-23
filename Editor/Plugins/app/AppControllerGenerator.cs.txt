@@ -11,8 +11,9 @@
 //  Имя класса = имя uxml без слов "Page"/"Popup" в PascalCase + суффикс
 //  ("PageController" / "PopupController").  Существующий файл не затирается без спроса.
 //
-//  Базовые классы AppPageController/AppPopupController лежат в App.Abstractions —
-//  поэтому в генерируемый код добавлен using App.Abstractions.
+//  Базовые классы AppPageController/AppPopupController лежат в Exerussus.AppCore.Views —
+//  поэтому в генерируемый код добавлен using Exerussus.AppCore.Views.
+//  Namespace генерируемого класса берётся из AppPaths.ControllersNamespace.
 // ============================================================
 
 using System;
@@ -176,12 +177,12 @@ namespace Exerussus.Nexus.Pages.App
             bool anyButtons = elements.Any(e => e.IsButton);
 
             var sb = new StringBuilder();
-            sb.AppendLine("using App.Abstractions;");
+            sb.AppendLine("using Exerussus.AppCore.Views;");
             sb.AppendLine("using Cysharp.Threading.Tasks;");
             sb.AppendLine("using UnityEngine;");
             sb.AppendLine("using UnityEngine.UIElements;");
             sb.AppendLine();
-            sb.AppendLine("namespace App.Core");
+            sb.AppendLine($"namespace {AppPaths.ControllersNamespace}");
             sb.AppendLine("{");
             sb.AppendLine($"    public class {className} : {baseType}");
             sb.AppendLine("    {");

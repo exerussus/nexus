@@ -14,10 +14,10 @@ plugin **never** deletes them. The page owns that footprint explicitly — see t
 ## Tabs
 
 - **Editor** — page/popup id registry (source of truth = `NavigationData`), affixes,
-  Apply (writes ids, NavigationSetting entries, regenerates `Navigation.uss`, migrates
+  Apply (writes ids, NavigationSettings entries, regenerates `Navigation.uss`, migrates
   USS classes across UXML on rename/delete, renames page asset files/folders).
 - **Graph** — navigation graph of the active scene (added separately).
-- **Generation** — code-gen (`NavTargets.cs` = PageUID/PopupUID consts; `NavigationName.cs`
+- **Generation** — code-gen (`NavTargets.cs` = PageId/PopupId consts; `NavigationName.cs`
   = element names from `generate-link`), page/popup templates, and **App scaffold** (below).
 - **Hooks** — action-hook library (UserSettings) inserting `display:none` hooks into `mainContainer`.
 - **Nav classes** — standard nav classes (`to-back-page__navigation`) into `Navigation.uss`.
@@ -35,7 +35,8 @@ never overwrites authored files:
 - `UIToolkit/App Settings.asset` — `PanelSettings` (scale-with-screen 1920×1080), `themeStyleSheet` → `AppTheme.tss`.
 - `Resources/UISoundLibrary.asset` — empty default UI sound library.
 - `Resources/NavigationData.asset` — the page/popup id registry (replaces the old `db` DataBase).
-- `Resources/NavigationSetting.asset` — routing config (className → target + Kind).
+- `Resources/NavigationSettings.asset` — routing config (className → target + Kind).
+  (Existing projects keep whatever name is already in `app.config.json`.)
 
 ## Paths config (committed)
 
@@ -45,7 +46,7 @@ on the page's Refresh). Defaults match the layout above. See `AppPaths.cs`.
 
 ## External footprint (survives disable)
 
-- `Resources/NavigationData.asset`, `Resources/NavigationSetting.asset` — config (authored data).
+- `Resources/NavigationData.asset`, `Resources/NavigationSettings.asset` — config (authored data).
 - `Styles/Navigation.uss`, `Navigation/Generated/NavTargets.cs`, `Navigation/Generated/NavigationName.cs`
   — generated (regenerable). **Only these three are removable from External files.**
 - Containers, AppStyle/AppTheme/App Settings, UISoundLibrary, `Pages/**`, `Popups/**` — authored, status-only.
@@ -74,14 +75,18 @@ UPM git packages installed two-phase on Apply:
 
 ## Assembly references (`Exerussus.Nexus.Pages.App.asmdef`, Editor-only)
 
-`Exerussus.Nexus.Abstractions`, `app.core`. (`db` and `app.abstractions` removed —
-audio/input go through `SoundAdapter`/`InputAdapter`, and `App.Abstractions` now lives
-inside `app.core`.)
+`Exerussus.Nexus.Abstractions`, `Exerussus.AppCore`. (`db` and `app.abstractions` removed —
+audio/input go through `SoundAdapter`/`InputAdapter`.)
+
+Namespaces consumed from app-core 2.0: `Exerussus.AppCore` (`AppRunner`),
+`Exerussus.AppCore.Navigation` (`NavigationData`, `NavigationSettings`, `PageId`, `PopupId`),
+`Exerussus.AppCore.Views` (`AppPage`, `AppPopup`, controllers), `Exerussus.AppCore.Audio`
+(`UISoundLibrary`).
 
 ## Companion runtime types (live in app-core, not in this plugin)
 
 - `NavigationData` — id registry SO + standalone `[PagesDropdown]`/`[PopupsDropdown]` attributes.
-- `NavigationDropdownDrawer` — dedicated Odin drawer for those attributes (app-core editor asmdef).
+- `NavigationIdDrawer` — dedicated Odin drawer for those attributes (app-core editor asmdef).
 
 ## UI language note
 

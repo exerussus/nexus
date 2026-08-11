@@ -1,0 +1,21 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" editor-extension-mode="True">
+    <!-- Стиль подключает код через Context.LoadDeployedAsset — путей здесь нет. -->
+    <!-- Тулбарные кнопки строит код фабрикой Context.Ui и кладёт в scenarios-toolbar-buttons. -->
+    <ui:VisualElement name="scenarios-root" class="scenarios-root">
+        <ui:VisualElement name="scenarios-toolbar" class="scenarios-toolbar">
+            <ui:VisualElement name="scenarios-toolbar-buttons" class="scenarios-toolbar-buttons"/>
+            <ui:VisualElement class="scenarios-tb-spacer"/>
+            <uie:ObjectField name="scenarios-drop-field" label="Add" allow-scene-objects="false" tooltip="Перетащите SceneAsset, чтобы добавить в список" class="scenarios-drop"/>
+        </ui:VisualElement>
+        <ui:VisualElement name="scenarios-options" class="scenarios-options">
+            <ui:Toggle name="scenarios-toggle-ask-save" label="Ask to save before switch" tooltip="Перед переключением сцены спрашивать о сохранении изменений" class="scenarios-toggle"/>
+            <ui:Toggle name="scenarios-toggle-return" label="Return to original after Play" tooltip="Если перед Play открывалась другая сцена — после Stop вернуть исходную" class="scenarios-toggle"/>
+        </ui:VisualElement>
+        <ui:VisualElement name="scenarios-list-container" class="scenarios-list-container">
+            <ui:ListView name="scenarios-list" reorderable="true" virtualization-method="FixedHeight" fixed-item-height="28" class="scenarios-list"/>
+        </ui:VisualElement>
+        <ui:VisualElement name="scenarios-empty" class="scenarios-empty">
+            <ui:Label name="scenarios-empty-label" text="Список пуст. Перетащите SceneAsset в поле Add сверху или нажмите &quot;+ Open Scenes&quot;." class="scenarios-empty-label"/>
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

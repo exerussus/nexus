@@ -1,0 +1,1042 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
+
+namespace Exerussus.Nexus.Pages.Scenarios
+{
+    /// <summary>
+    /// Страница Scenarios: быстрый список сцен проекта с действиями Switch (открыть
+    /// в Edit Mode) и Play (открыть и запустить Play Mode по прикреплённому
+    /// сценарию), плюс опциональный возврат к исходной сцене после остановки Play.
+    ///
+    /// Constitutive-страница: вся фича замкнута на себе, наружу ничего не торчит.
+    /// Данные — персональный JSON в UserSettings (через Context.GetUserConfigPath):
+    /// не в git, переживает Restore/Disable, не живёт в волатильном State/.
+    ///
+    /// Сценарии запуска — через внешний пакет com.exerussus.scenario
+    /// (ставится хабом по packageRequires). Связь ТОЛЬКО данными: страница пишет
+    /// intent в SessionState, исполняет его Scenario.Editor. Кодовой ссылки нет
+    /// намеренно — asmdef страницы остаётся Abstractions-only, а рантайм игры
+    /// не зависит от волатильной State-сборки.
+    /// </summary>
+    [EditorPage("scenarios", "Scenarios", PageCategory.Infrastructure, order: 10, icon: null)]
+    public sealed class ScenariosPage : EditorPageBase
+    {
+        // ---------------------------------------------------------------------
+        // Данные
+        // ---------------------------------------------------------------------
+
+        private const string ConfigFileName = "scenarios.json";
+
+        // ── Контракт данных с пакетом com.exerussus.scenario ──
+        // Ключи intent в SessionState; литералы продублированы в ScenarioIntent
+        // на стороне пакета. Несовместимая правка формата = поднять версию с обеих
+        // сторон — bootstrap пакета громко отклонит рассинхрон.
+        private const int    ScenarioContractVersion  = 2;
+        private const string ScenarioIntentArmedKey   = "Exerussus.Scenario.Intent.Armed";
+        private const string ScenarioIntentGuidKey    = "Exerussus.Scenario.Intent.ScenarioGuid";
+        private const string ScenarioIntentSceneKey   = "Exerussus.Scenario.Intent.ScenePath";
+        private const string ScenarioIntentVersionKey = "Exerussus.Scenario.Intent.ContractVersion";
+        private const string ScenarioEditorAssembly   = "Scenario.Editor";
+        private const string ScenarioTypeFilter       = "t:LaunchScenario";
+
+        // Мемо неизменного в пределах domain'а факта «сборка пакета загружена»
+        // (появиться посреди domain'а сборка не может — установка = reload).
+        private bool? _scenarioPackageInstalled;
+
+        // Плоский DTO вместо ScriptableObject: State/ вайпается хабом, поэтому
+        // ассету рядом с кодом здесь не место. JSON в UserSettings — штатный
+        // персональный слот страницы.
+        [Serializable]
+        private sealed class ScenariosData
+        {
+            // Версия схемы файла. 2 — переименование Scenes→Scenarios: поле
+            // ArgSetGuid записи стало ScenarioGuid (файл переехал в scenarios/).
+            public int SchemaVersion = 2;
+            public List<SceneEntry> Scenes = new List<SceneEntry>();
+            public bool AskToSaveBeforeSwitch = true;
+            public bool ReturnToOriginalAfterPlay = false;
+        }
+
+        [Serializable]
+        private sealed class SceneEntry
+        {
+            // Отображаемое имя; пусто — берётся имя ассета сцены.
+            public string DisplayName;
+            // Сцена хранится как GUID ассета — переименования/перемещения не ломают запись.
+            public string SceneGuid;
+            // GUID ассета LaunchScenario (пакет com.exerussus.scenario);
+            // пусто — запуск без сценария, то есть без аргументов.
+            public string ScenarioGuid;
+        }
+
+        private ScenariosData _data;
+
+        // ---------------------------------------------------------------------
+        // UI-ссылки
+        // ---------------------------------------------------------------------
+
+        private VisualElement _root;
+        private VisualElement _toolbar;
+        private VisualElement _options;
+        private VisualElement _listContainer;
+        private VisualElement _emptyHint;
+        private Label _emptyLabel;
+        private ListView _listView;
+        private ObjectField _dropField;
+        private Toggle _askSaveToggle;
+        private Toggle _returnToggle;
+
+        // ---------------------------------------------------------------------
+        // BuildUI
+        // ---------------------------------------------------------------------
+
+        public override VisualElement BuildUI()
+        {
+            _root = new VisualElement();
+            _root.style.flexGrow = 1;
+
+            // Компаньоны грузим строго по имени — папку резолвит хаб.
+            // Страница не знает и не строит путей вида State/<id>/ (инвариант #7).
+            var tree = Context.LoadDeployedAsset<VisualTreeAsset>("ScenariosPage.uxml");
+            if (tree != null) tree.CloneTree(_root);
+            else BuildFallbackUI();
+
+            var sheet = Context.LoadDeployedAsset<StyleSheet>("ScenariosPage.uss");
+            if (sheet != null) _root.styleSheets.Add(sheet);
+
+            CacheElements();
+            BuildToolbarButtons();
+            WireControls();
+            ApplyTheme();
+
+            LoadConfig();
+            RefreshUI();
+            return _root;
+        }
+
+        private void CacheElements()
+        {
+            _toolbar       = _root.Q<VisualElement>("scenarios-toolbar");
+            _options       = _root.Q<VisualElement>("scenarios-options");
+            _listContainer = _root.Q<VisualElement>("scenarios-list-container");
+            _emptyHint     = _root.Q<VisualElement>("scenarios-empty");
+            _emptyLabel    = _root.Q<Label>("scenarios-empty-label");
+            _listView      = _root.Q<ListView>("scenarios-list");
+            _dropField     = _root.Q<ObjectField>("scenarios-drop-field");
+            _askSaveToggle = _root.Q<Toggle>("scenarios-toggle-ask-save");
+            _returnToggle  = _root.Q<Toggle>("scenarios-toggle-return");
+        }
+
+        private void BuildToolbarButtons()
+        {
+            // Экшн-кнопки строим фабрикой Context.Ui — hover/pressed и цвета
+            // приходят из активной палитры, руками ничего не красим.
+            var host = _root.Q<VisualElement>("scenarios-toolbar-buttons");
+            if (host == null) return;
+
+            var btnReload = Context.Ui.Button(NexusRole.Ghost, "Reload", ReloadConfigAndRefresh);
+            btnReload.name = "scenarios-btn-reload";
+            btnReload.tooltip = "Перечитать конфиг с диска и обновить список";
+            btnReload.AddToClassList("scenarios-tb-btn");
+            host.Add(btnReload);
+
+            var btnConfig = Context.Ui.Button(NexusRole.Ghost, "Config", RevealConfigFile);
+            btnConfig.name = "scenarios-btn-config";
+            btnConfig.tooltip = "Показать файл настроек (scenarios.json) в проводнике";
+            btnConfig.AddToClassList("scenarios-tb-btn");
+            host.Add(btnConfig);
+
+            var btnAddOpen = Context.Ui.Button(NexusRole.Common, "+ Open Scenes", AddCurrentlyOpenScenes);
+            btnAddOpen.name = "scenarios-btn-add-open";
+            btnAddOpen.tooltip = "Добавить в список все открытые сейчас сцены";
+            btnAddOpen.AddToClassList("scenarios-tb-btn");
+            host.Add(btnAddOpen);
+        }
+
+        private void WireControls()
+        {
+            if (_dropField != null)
+            {
+                _dropField.objectType = typeof(SceneAsset);
+                _dropField.allowSceneObjects = false;
+                _dropField.RegisterValueChangedCallback(OnDropFieldChanged);
+            }
+
+            if (_askSaveToggle != null) _askSaveToggle.RegisterValueChangedCallback(OnAskSaveChanged);
+            if (_returnToggle  != null) _returnToggle.RegisterValueChangedCallback(OnReturnChanged);
+
+            if (_listView != null)
+            {
+                _listView.makeItem   = MakeRow;
+                _listView.bindItem   = BindRow;
+                _listView.unbindItem = UnbindRow;
+                _listView.selectionType = SelectionType.None;
+                _listView.itemIndexChanged += OnReorder;
+            }
+        }
+
+        /// <summary>
+        /// Все цвета — только из токенов активной палитры (Context.Theme).
+        /// В USS осталась чистая геометрия: литералы цвета на странице запрещены.
+        /// </summary>
+        private void ApplyTheme()
+        {
+            var t = Context.Theme;
+
+            _root.style.backgroundColor = t.Get(NexusToken.BgHard);
+            _root.style.color = t.Get(NexusToken.TextNormal);
+
+            if (_toolbar != null)
+            {
+                _toolbar.style.backgroundColor = t.Get(NexusToken.BgRaised);
+                _toolbar.style.borderBottomColor = t.Get(NexusToken.Divider);
+            }
+
+            if (_options != null)
+            {
+                _options.style.borderBottomColor = t.Get(NexusToken.Divider);
+            }
+
+            if (_listContainer != null)
+            {
+                _listContainer.style.borderTopColor    = t.Get(NexusToken.Border);
+                _listContainer.style.borderBottomColor = t.Get(NexusToken.Border);
+                _listContainer.style.borderLeftColor   = t.Get(NexusToken.Border);
+                _listContainer.style.borderRightColor  = t.Get(NexusToken.Border);
+            }
+
+            if (_emptyLabel != null)   _emptyLabel.style.color   = t.Get(NexusToken.TextDim);
+            if (_askSaveToggle != null) _askSaveToggle.style.color = t.Get(NexusToken.TextDim);
+            if (_returnToggle  != null) _returnToggle.style.color  = t.Get(NexusToken.TextDim);
+        }
+
+        /// <summary>
+        /// Если UXML не задеплоился — собираем минимально работающий UI кодом.
+        /// Имена элементов те же, что в UXML, чтобы Q&lt;&gt;-поиск сработал.
+        /// </summary>
+        private void BuildFallbackUI()
+        {
+            var toolbar = new VisualElement { name = "scenarios-toolbar" };
+            toolbar.style.flexDirection = FlexDirection.Row;
+            toolbar.style.alignItems = Align.Center;
+            toolbar.style.paddingLeft = toolbar.style.paddingRight = 8;
+            toolbar.style.paddingTop = toolbar.style.paddingBottom = 6;
+            toolbar.style.borderBottomWidth = 1;
+
+            var buttons = new VisualElement { name = "scenarios-toolbar-buttons" };
+            buttons.style.flexDirection = FlexDirection.Row;
+            toolbar.Add(buttons);
+
+            var spacer = new VisualElement();
+            spacer.style.flexGrow = 1;
+            toolbar.Add(spacer);
+
+            var drop = new ObjectField("Add") { name = "scenarios-drop-field" };
+            drop.style.minWidth = 220;
+            toolbar.Add(drop);
+            _root.Add(toolbar);
+
+            var options = new VisualElement { name = "scenarios-options" };
+            options.style.flexDirection = FlexDirection.Row;
+            options.style.flexWrap = Wrap.Wrap;
+            options.style.paddingLeft = options.style.paddingRight = 8;
+            options.style.paddingTop = options.style.paddingBottom = 4;
+            options.style.borderBottomWidth = 1;
+            options.Add(new Toggle("Ask to save before switch")     { name = "scenarios-toggle-ask-save" });
+            options.Add(new Toggle("Return to original after Play") { name = "scenarios-toggle-return" });
+            _root.Add(options);
+
+            var listContainer = new VisualElement { name = "scenarios-list-container" };
+            listContainer.style.flexGrow = 1;
+            listContainer.style.marginLeft = listContainer.style.marginRight = 4;
+            listContainer.style.marginTop = listContainer.style.marginBottom = 4;
+            listContainer.style.borderTopWidth = listContainer.style.borderBottomWidth = 1;
+            listContainer.style.borderLeftWidth = listContainer.style.borderRightWidth = 1;
+            var list = new ListView
+            {
+                name = "scenarios-list",
+                reorderable = true,
+                virtualizationMethod = CollectionVirtualizationMethod.FixedHeight,
+                fixedItemHeight = 28
+            };
+            list.style.flexGrow = 1;
+            listContainer.Add(list);
+            _root.Add(listContainer);
+
+            var empty = new VisualElement { name = "scenarios-empty" };
+            empty.style.alignItems = Align.Center;
+            empty.style.justifyContent = Justify.Center;
+            empty.style.paddingTop = empty.style.paddingBottom = 24;
+            var emptyLabel = new Label("Список пуст. Перетащите SceneAsset в поле Add сверху или нажмите \"+ Open Scenes\".")
+            {
+                name = "scenarios-empty-label"
+            };
+            emptyLabel.style.whiteSpace = WhiteSpace.Normal;
+            empty.Add(emptyLabel);
+            _root.Add(empty);
+        }
+
+        // ---------------------------------------------------------------------
+        // Lifecycle
+        // ---------------------------------------------------------------------
+
+        public override void OnEnter()
+        {
+            // Редакторные C#-события живут только между Enter и Exit;
+            // хост гарантирует парность, domain reload сбрасывает и то и другое.
+            EditorSceneManager.activeSceneChangedInEditMode += OnActiveSceneChanged;
+            EditorApplication.playModeStateChanged          += OnPlayModeStateChanged;
+
+            // Конфиг могли править извне между заходами — переподтянуть.
+            if (_data == null) LoadConfig();
+            RefreshUI();
+        }
+
+        public override void OnExit()
+        {
+            EditorSceneManager.activeSceneChangedInEditMode -= OnActiveSceneChanged;
+            EditorApplication.playModeStateChanged          -= OnPlayModeStateChanged;
+        }
+
+        public override void OnFocus()
+        {
+            // Дёшево перепроверить активную/битые сцены после возврата фокуса.
+            _listView?.RefreshItems();
+        }
+
+        public override void OnRefresh()
+        {
+            AssetDatabase.Refresh();
+            LoadConfig();
+            RefreshUI();
+            Context.SetStatus("Scenarios: обновлено", StatusKind.Info);
+        }
+
+        public override void OnPrePack()
+        {
+            // Данные и так сохраняются на каждом изменении; перед pack — контрольный flush.
+            SaveConfig();
+        }
+
+        protected override void OnDisposing()
+        {
+            // Подстраховка — на случай если OnExit не успел.
+            EditorSceneManager.activeSceneChangedInEditMode -= OnActiveSceneChanged;
+            EditorApplication.playModeStateChanged          -= OnPlayModeStateChanged;
+        }
+
+        // ---------------------------------------------------------------------
+        // Конфиг: load / save
+        // ---------------------------------------------------------------------
+
+        private string ConfigPath => Context.GetUserConfigPath(ConfigFileName);
+
+        private void LoadConfig()
+        {
+            _data = null;
+            var path = ConfigPath;
+            if (File.Exists(path))
+            {
+                try
+                {
+                    var loaded = new ScenariosData();
+                    EditorJsonUtility.FromJsonOverwrite(File.ReadAllText(path), loaded);
+                    _data = loaded;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogException(e);
+                    Context.SetStatus("Scenarios: конфиг повреждён — создан новый", StatusKind.Warning);
+                }
+            }
+
+            if (_data == null)
+            {
+                _data = new ScenariosData();
+                SaveConfig();
+            }
+        }
+
+        private void SaveConfig()
+        {
+            if (_data == null) return;
+            try
+            {
+                var path = ConfigPath;
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(path, EditorJsonUtility.ToJson(_data, prettyPrint: true));
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                Context.SetStatus($"Scenarios: ошибка сохранения — {e.Message}", StatusKind.Error);
+            }
+        }
+
+        private void ReloadConfigAndRefresh()
+        {
+            LoadConfig();
+            RefreshUI();
+            Context.SetStatus("Scenarios: конфиг перечитан", StatusKind.Info);
+        }
+
+        private void RevealConfigFile()
+        {
+            // Замена старого Ping Config: ассета больше нет, показываем JSON в проводнике.
+            if (_data == null) LoadConfig();
+            if (!File.Exists(ConfigPath)) SaveConfig();
+            EditorUtility.RevealInFinder(ConfigPath);
+        }
+
+        // ---------------------------------------------------------------------
+        // Разрешение сцен
+        // ---------------------------------------------------------------------
+
+        private static SceneAsset ResolveScene(SceneEntry entry, out string path)
+        {
+            path = null;
+            if (entry == null || string.IsNullOrEmpty(entry.SceneGuid)) return null;
+            var p = AssetDatabase.GUIDToAssetPath(entry.SceneGuid);
+            if (string.IsNullOrEmpty(p)) return null;
+            var asset = AssetDatabase.LoadAssetAtPath<SceneAsset>(p);
+            if (asset == null) return null;
+            path = p;
+            return asset;
+        }
+
+        private bool TryGetEntry(int index, out SceneEntry entry, out string path, out string displayName)
+        {
+            entry = null; path = null; displayName = null;
+            if (_data == null || index < 0 || index >= _data.Scenes.Count) return false;
+            entry = _data.Scenes[index];
+            var asset = ResolveScene(entry, out path);
+            if (asset == null)
+            {
+                Context.SetStatus("Scenarios: запись повреждена — сцена не найдена", StatusKind.Error);
+                return false;
+            }
+            displayName = string.IsNullOrWhiteSpace(entry.DisplayName) ? asset.name : entry.DisplayName;
+            return true;
+        }
+
+        // ---------------------------------------------------------------------
+        // UI refresh
+        // ---------------------------------------------------------------------
+
+        private void RefreshUI()
+        {
+            if (_data == null) return;
+
+            if (_askSaveToggle != null) _askSaveToggle.SetValueWithoutNotify(_data.AskToSaveBeforeSwitch);
+            if (_returnToggle  != null) _returnToggle.SetValueWithoutNotify(_data.ReturnToOriginalAfterPlay);
+
+            // Drop field всегда пустой — это «добавлятор», не хранилище.
+            _dropField?.SetValueWithoutNotify(null);
+
+            if (_listView != null)
+            {
+                _listView.itemsSource = _data.Scenes;
+                _listView.Rebuild();
+            }
+
+            bool hasItems = _data.Scenes != null && _data.Scenes.Count > 0;
+            if (_emptyHint != null)     _emptyHint.style.display     = hasItems ? DisplayStyle.None : DisplayStyle.Flex;
+            if (_listContainer != null) _listContainer.style.display = hasItems ? DisplayStyle.Flex : DisplayStyle.None;
+        }
+
+        // ---------------------------------------------------------------------
+        // Строка списка
+        // ---------------------------------------------------------------------
+
+        private VisualElement MakeRow()
+        {
+            var row = new VisualElement();
+            row.AddToClassList("scenarios-row");
+
+            // Индекс строки живёт в row.userData; кнопки читают его на клике.
+            // Обработчики создаются один раз — при bind ничего не пере-подписываем.
+            int Index() => row.userData is int i ? i : -1;
+
+            var marker = new VisualElement { name = "marker" };
+            marker.AddToClassList("scenarios-row-active-marker");
+            row.Add(marker);
+
+            var label = new Label { name = "label" };
+            label.AddToClassList("scenarios-row-name");
+            row.Add(label);
+
+            // Бейдж сценария; клик — дропдаун выбора сценария.
+            // Кнопка ссылается на себя в обработчике — объявляем до создания.
+            Button btnScenario = null;
+            btnScenario = Context.Ui.Button(NexusRole.Ghost, "Scenario: —", () => ShowScenarioMenu(Index(), btnScenario));
+            btnScenario.name = "btn-scenario";
+            btnScenario.AddToClassList("scenarios-row-btn-scenario");
+            row.Add(btnScenario);
+
+            var btnSwitch = Context.Ui.Button(NexusRole.Common, "Switch", () => SwitchToScene(Index()));
+            btnSwitch.name = "btn-switch";
+            btnSwitch.tooltip = "Открыть сцену в редакторе";
+            btnSwitch.AddToClassList("scenarios-row-btn");
+            row.Add(btnSwitch);
+
+            var btnPlay = Context.Ui.Button(NexusRole.Success, "Play", () => PlayScene(Index()));
+            btnPlay.name = "btn-play";
+            btnPlay.tooltip = "Открыть сцену и запустить Play Mode";
+            btnPlay.AddToClassList("scenarios-row-btn");
+            row.Add(btnPlay);
+
+            var btnPing = Context.Ui.Button(NexusRole.Ghost, "\u25CE", () => PingEntry(Index()));
+            btnPing.name = "btn-ping";
+            btnPing.tooltip = "Подсветить ассет сцены в Project window";
+            btnPing.AddToClassList("scenarios-row-btn-icon");
+            row.Add(btnPing);
+
+            var btnRemove = Context.Ui.Button(NexusRole.Alarm, "\u2715", () => RemoveEntry(Index()));
+            btnRemove.name = "btn-remove";
+            btnRemove.tooltip = "Удалить из списка";
+            btnRemove.AddToClassList("scenarios-row-btn-icon");
+            row.Add(btnRemove);
+
+            return row;
+        }
+
+        private void BindRow(VisualElement row, int index)
+        {
+            if (_data == null || index < 0 || index >= _data.Scenes.Count) return;
+            row.userData = index;
+
+            var entry = _data.Scenes[index];
+            var asset = ResolveScene(entry, out var scenePath);
+            bool missing = asset == null;
+            bool isActive = !missing && string.Equals(
+                scenePath, EditorSceneManager.GetActiveScene().path, StringComparison.Ordinal);
+
+            var t = Context.Theme;
+
+            // Фон строки: активная — мягкая заливка акцентом, иначе лёгкая полоска зеброй.
+            // Полоски рисуем сами (штатные alternating backgrounds красятся скином
+            // редактора, а палитра Nexus автономна).
+            if (isActive)
+                row.style.backgroundColor = t.Get(NexusToken.AccentSoft);
+            else if ((index & 1) == 1)
+                row.style.backgroundColor = t.Get(NexusToken.BgSoft);
+            else
+                row.style.backgroundColor = Color.clear;
+
+            var marker = row.Q<VisualElement>("marker");
+            if (marker != null)
+                marker.style.backgroundColor = isActive ? t.Get(NexusToken.Accent) : (Color)Color.clear;
+
+            var label = row.Q<Label>("label");
+            if (label != null)
+            {
+                string display = missing
+                    ? "(missing scene)"
+                    : (string.IsNullOrWhiteSpace(entry.DisplayName) ? asset.name : entry.DisplayName);
+                label.text = display;
+
+                label.RemoveFromClassList("scenarios-row-name-missing");
+                label.RemoveFromClassList("scenarios-row-name-active");
+                if (missing)
+                {
+                    label.AddToClassList("scenarios-row-name-missing");
+                    label.style.color = t.Get(NexusToken.Error);
+                }
+                else
+                {
+                    if (isActive) label.AddToClassList("scenarios-row-name-active");
+                    label.style.color = t.Get(NexusToken.TextNormal);
+                }
+            }
+
+            var btnScenario = row.Q<Button>("btn-scenario");
+            if (btnScenario != null)
+            {
+                if (string.IsNullOrEmpty(entry.ScenarioGuid))
+                {
+                    btnScenario.text = "Scenario: \u2014";
+                    btnScenario.tooltip = "Сценарий запуска не задан (клик — выбрать)";
+                }
+                else
+                {
+                    string scenarioName = ResolveScenarioName(entry.ScenarioGuid, out var scenarioPath);
+                    if (scenarioName == null)
+                    {
+                        btnScenario.text = "Scenario: ?";
+                        btnScenario.tooltip = "Сценарий не найден — ассет удалён? (клик — сменить)";
+                    }
+                    else
+                    {
+                        btnScenario.text = $"Scenario: {scenarioName}";
+                        btnScenario.tooltip = $"Сценарий: {scenarioPath} (клик — сменить)";
+                    }
+                }
+                btnScenario.SetEnabled(!missing);
+            }
+
+            bool canRun = !missing && !EditorApplication.isPlayingOrWillChangePlaymode;
+            row.Q<Button>("btn-switch")?.SetEnabled(canRun);
+            row.Q<Button>("btn-play")?.SetEnabled(canRun);
+            row.Q<Button>("btn-ping")?.SetEnabled(!missing);
+        }
+
+        private void UnbindRow(VisualElement row, int index)
+        {
+            // Обработчики стабильны (dispatch через userData) — достаточно сбросить индекс.
+            row.userData = -1;
+        }
+
+        private void OnReorder(int from, int to)
+        {
+            // ListView сам переставил элементы itemsSource — фиксируем на диск и перебиндиваем.
+            SaveConfig();
+            _listView?.RefreshItems();
+        }
+
+        // ---------------------------------------------------------------------
+        // Тумблеры
+        // ---------------------------------------------------------------------
+
+        private void OnAskSaveChanged(ChangeEvent<bool> evt)
+        {
+            if (_data == null) return;
+            _data.AskToSaveBeforeSwitch = evt.newValue;
+            SaveConfig();
+        }
+
+        private void OnReturnChanged(ChangeEvent<bool> evt)
+        {
+            if (_data == null) return;
+            _data.ReturnToOriginalAfterPlay = evt.newValue;
+            SaveConfig();
+        }
+
+        // ---------------------------------------------------------------------
+        // Добавление
+        // ---------------------------------------------------------------------
+
+        private void OnDropFieldChanged(ChangeEvent<UnityEngine.Object> evt)
+        {
+            var asset = evt.newValue as SceneAsset;
+            if (asset == null) return; // поле очистили программно — игнор
+            AddSceneAsset(asset);
+            // Сразу очищаем, чтобы поле работало как drop-slot.
+            _dropField.SetValueWithoutNotify(null);
+        }
+
+        private void AddSceneAsset(SceneAsset asset)
+        {
+            if (_data == null || asset == null) return;
+
+            var path = AssetDatabase.GetAssetPath(asset);
+            var guid = AssetDatabase.AssetPathToGUID(path);
+            if (string.IsNullOrEmpty(guid))
+            {
+                Context.SetStatus("Scenarios: не удалось получить GUID сцены", StatusKind.Error);
+                return;
+            }
+
+            for (int i = 0; i < _data.Scenes.Count; i++)
+            {
+                if (_data.Scenes[i] != null && string.Equals(_data.Scenes[i].SceneGuid, guid, StringComparison.Ordinal))
+                {
+                    Context.SetStatus($"Scenarios: '{asset.name}' уже в списке", StatusKind.Warning);
+                    return;
+                }
+            }
+
+            _data.Scenes.Add(new SceneEntry { SceneGuid = guid, DisplayName = "" });
+            SaveConfig();
+            RefreshUI();
+            Context.SetStatus($"Scenarios: добавлена '{asset.name}'", StatusKind.Ok);
+        }
+
+        private void AddCurrentlyOpenScenes()
+        {
+            if (_data == null) return;
+
+            int added = 0;
+            for (int i = 0; i < EditorSceneManager.sceneCount; i++)
+            {
+                var scene = EditorSceneManager.GetSceneAt(i);
+                if (string.IsNullOrEmpty(scene.path)) continue; // несохранённая
+                var guid = AssetDatabase.AssetPathToGUID(scene.path);
+                if (string.IsNullOrEmpty(guid)) continue;
+
+                bool exists = false;
+                for (int j = 0; j < _data.Scenes.Count; j++)
+                {
+                    if (_data.Scenes[j] != null && string.Equals(_data.Scenes[j].SceneGuid, guid, StringComparison.Ordinal))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (exists) continue;
+
+                _data.Scenes.Add(new SceneEntry { SceneGuid = guid, DisplayName = "" });
+                added++;
+            }
+
+            if (added > 0)
+            {
+                SaveConfig();
+                RefreshUI();
+                Context.SetStatus($"Scenarios: добавлено {added}", StatusKind.Ok);
+            }
+            else
+            {
+                Context.SetStatus("Scenarios: нечего добавлять (все открытые сцены уже в списке или несохранены)", StatusKind.Info);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Действия строки
+        // ---------------------------------------------------------------------
+
+        private void RemoveEntry(int index)
+        {
+            if (_data == null || index < 0 || index >= _data.Scenes.Count) return;
+            var entry = _data.Scenes[index];
+            var asset = ResolveScene(entry, out _);
+            string name = asset != null ? asset.name : "(missing)";
+            _data.Scenes.RemoveAt(index);
+            SaveConfig();
+            RefreshUI();
+            Context.SetStatus($"Scenarios: удалена '{name}'", StatusKind.Info);
+        }
+
+        private void PingEntry(int index)
+        {
+            if (_data == null || index < 0 || index >= _data.Scenes.Count) return;
+            var asset = ResolveScene(_data.Scenes[index], out _);
+            if (asset == null) return;
+            EditorGUIUtility.PingObject(asset);
+            Selection.activeObject = asset;
+        }
+
+        // ---------------------------------------------------------------------
+        // Сценарии запуска (пакет com.exerussus.scenario, связь только данными)
+        // ---------------------------------------------------------------------
+
+        private bool IsScenarioPackageInstalled()
+        {
+            if (_scenarioPackageInstalled.HasValue) return _scenarioPackageInstalled.Value;
+
+            // Probe без вызовов: просто есть ли сборка пакета в domain'е.
+            bool found = false;
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                if (string.Equals(assemblies[i].GetName().Name, ScenarioEditorAssembly, StringComparison.Ordinal))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            _scenarioPackageInstalled = found;
+            return found;
+        }
+
+        /// <summary>Имя и путь сценария по GUID; null — не найден (ассет удалён).</summary>
+        private static string ResolveScenarioName(string scenarioGuid, out string assetPath)
+        {
+            assetPath = null;
+            if (string.IsNullOrEmpty(scenarioGuid)) return null;
+            var path = AssetDatabase.GUIDToAssetPath(scenarioGuid);
+            if (string.IsNullOrEmpty(path)) return null;
+            assetPath = path;
+            return Path.GetFileNameWithoutExtension(path);
+        }
+
+        private void ShowScenarioMenu(int index, VisualElement anchor)
+        {
+            if (_data == null || index < 0 || index >= _data.Scenes.Count || anchor == null) return;
+            var entry = _data.Scenes[index];
+            if (entry == null) return;
+
+            var menu = new GenericDropdownMenu();
+
+            if (!IsScenarioPackageInstalled())
+            {
+                menu.AddDisabledItem("Scenario не установлен", false);
+                menu.AddDisabledItem("Пакет: com.exerussus.scenario", false);
+            }
+            else
+            {
+                menu.AddItem("(нет)", string.IsNullOrEmpty(entry.ScenarioGuid),
+                    () => SetEntryScenario(index, null));
+
+                // Сценарии ищем строкой по имени типа — кодовой ссылки на пакет у страницы нет.
+                var guids = AssetDatabase.FindAssets(ScenarioTypeFilter);
+                if (guids.Length > 0) menu.AddSeparator(string.Empty);
+                for (int i = 0; i < guids.Length; i++)
+                {
+                    var guid = guids[i];
+                    var path = AssetDatabase.GUIDToAssetPath(guid);
+                    if (string.IsNullOrEmpty(path)) continue;
+                    bool isChecked = string.Equals(entry.ScenarioGuid, guid, StringComparison.Ordinal);
+                    menu.AddItem(Path.GetFileNameWithoutExtension(path), isChecked,
+                        () => SetEntryScenario(index, guid));
+                }
+
+                if (!string.IsNullOrEmpty(entry.ScenarioGuid))
+                {
+                    menu.AddSeparator(string.Empty);
+                    menu.AddItem("Показать сценарий в Project", false, () => PingScenario(index));
+                }
+            }
+
+            menu.DropDown(anchor.worldBound, anchor, anchored: true);
+        }
+
+        private void SetEntryScenario(int index, string scenarioGuid)
+        {
+            if (_data == null || index < 0 || index >= _data.Scenes.Count) return;
+            var entry = _data.Scenes[index];
+            if (entry == null) return;
+
+            entry.ScenarioGuid = scenarioGuid;
+            SaveConfig();
+            _listView?.RefreshItems();
+
+            Context.SetStatus(
+                string.IsNullOrEmpty(scenarioGuid)
+                    ? "Scenarios: сценарий снят"
+                    : $"Scenarios: сценарий — '{ResolveScenarioName(scenarioGuid, out _)}'",
+                StatusKind.Info);
+        }
+
+        private void PingScenario(int index)
+        {
+            if (_data == null || index < 0 || index >= _data.Scenes.Count) return;
+            var entry = _data.Scenes[index];
+            if (entry == null || ResolveScenarioName(entry.ScenarioGuid, out var path) == null) return;
+            var asset = AssetDatabase.LoadMainAssetAtPath(path);
+            if (asset == null) return;
+            EditorGUIUtility.PingObject(asset);
+            Selection.activeObject = asset;
+        }
+
+        private static void ClearScenarioIntent()
+        {
+            SessionState.EraseBool(ScenarioIntentArmedKey);
+            SessionState.EraseString(ScenarioIntentGuidKey);
+            SessionState.EraseString(ScenarioIntentSceneKey);
+            SessionState.EraseInt(ScenarioIntentVersionKey);
+        }
+
+        private void SwitchToScene(int index)
+        {
+            if (!TryGetEntry(index, out _, out var path, out var displayName)) return;
+
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            {
+                Context.SetStatus("Scenarios: нельзя переключать сцену в Play Mode", StatusKind.Warning);
+                return;
+            }
+
+            if (_data.AskToSaveBeforeSwitch && !EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
+            {
+                Context.SetStatus("Scenarios: переключение отменено пользователем", StatusKind.Info);
+                return;
+            }
+
+            try
+            {
+                EditorSceneManager.OpenScene(path, OpenSceneMode.Single);
+                Context.SetStatus($"Scenarios: открыта '{displayName}'", StatusKind.Ok);
+            }
+            catch (Exception e)
+            {
+                Context.SetStatus($"Scenarios: ошибка открытия — {e.Message}", StatusKind.Error);
+                Debug.LogException(e);
+            }
+
+            RefreshUI();
+        }
+
+        private void PlayScene(int index)
+        {
+            if (!TryGetEntry(index, out var entry, out var path, out var displayName)) return;
+
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            {
+                Context.SetStatus("Scenarios: уже в Play Mode", StatusKind.Warning);
+                return;
+            }
+
+            // Запомнить текущую активную сцену для возможного return-after-play.
+            string currentActivePath = EditorSceneManager.GetActiveScene().path;
+
+            // Если целевая сцена не открыта — открыть.
+            if (!string.Equals(currentActivePath, path, StringComparison.Ordinal))
+            {
+                if (_data.AskToSaveBeforeSwitch && !EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
+                {
+                    Context.SetStatus("Scenarios: запуск отменён пользователем", StatusKind.Info);
+                    return;
+                }
+
+                try
+                {
+                    EditorSceneManager.OpenScene(path, OpenSceneMode.Single);
+                }
+                catch (Exception e)
+                {
+                    Context.SetStatus($"Scenarios: ошибка открытия — {e.Message}", StatusKind.Error);
+                    Debug.LogException(e);
+                    return;
+                }
+            }
+
+            // Аргументы: страница только пишет intent (данные) — исполняет его
+            // bootstrap пакета Scenario на ExitingEditMode. Никакого Execute здесь.
+            bool scenarioArmed = false;
+            string scenarioName = null;
+            string degradeReason = null;
+            if (!string.IsNullOrEmpty(entry.ScenarioGuid))
+            {
+                if (!IsScenarioPackageInstalled())
+                {
+                    degradeReason = "Scenario не установлен, запуск без сценария";
+                }
+                else
+                {
+                    scenarioName = ResolveScenarioName(entry.ScenarioGuid, out _);
+                    if (scenarioName == null)
+                    {
+                        degradeReason = "сценарий не найден, запуск без аргументов";
+                    }
+                    else
+                    {
+                        SessionState.SetString(ScenarioIntentGuidKey, entry.ScenarioGuid);
+                        SessionState.SetString(ScenarioIntentSceneKey, path);
+                        SessionState.SetInt(ScenarioIntentVersionKey, ScenarioContractVersion);
+                        SessionState.SetBool(ScenarioIntentArmedKey, true);
+                        scenarioArmed = true;
+                    }
+                }
+            }
+            if (!scenarioArmed)
+            {
+                // Гасим возможный stale intent от прошлого запуска.
+                ClearScenarioIntent();
+            }
+
+            // Возврат ведёт статический хук (переживает domain reload через SessionState);
+            // инстанс страницы вход в Play не переживает, поэтому логика не здесь.
+            if (_data.ReturnToOriginalAfterPlay
+                && !string.IsNullOrEmpty(currentActivePath)
+                && !string.Equals(currentActivePath, path, StringComparison.Ordinal))
+            {
+                SceneReturnHook.Arm(currentActivePath);
+            }
+            else
+            {
+                SceneReturnHook.Disarm();
+            }
+
+            EditorApplication.isPlaying = true;
+
+            if (scenarioArmed)
+                Context.SetStatus($"Scenarios: запуск '{displayName}' (сценарий: {scenarioName})", StatusKind.Ok);
+            else if (degradeReason != null)
+                Context.SetStatus($"Scenarios: запуск '{displayName}' — {degradeReason}", StatusKind.Warning);
+            else
+                Context.SetStatus($"Scenarios: запуск '{displayName}'", StatusKind.Ok);
+        }
+
+        // ---------------------------------------------------------------------
+        // Редакторные события
+        // ---------------------------------------------------------------------
+
+        private void OnActiveSceneChanged(UnityEngine.SceneManagement.Scene from, UnityEngine.SceneManagement.Scene to)
+        {
+            // Подсветка активной строки.
+            _listView?.RefreshItems();
+        }
+
+        private void OnPlayModeStateChanged(PlayModeStateChange change)
+        {
+            // Только UI: enable-состояние кнопок и маркер активной сцены.
+            // Сам возврат к исходной сцене делает SceneReturnHook.
+            _listView?.RefreshItems();
+        }
+    }
+
+    /// <summary>
+    /// Возврат к исходной сцене после остановки Play Mode.
+    ///
+    /// Вынесен в [InitializeOnLoad]-хук, потому что инстанс страницы не переживает
+    /// domain reload при входе/выходе из Play — а SessionState переживает.
+    /// Состояние живёт целиком в SessionState (владелец — сессия редактора),
+    /// статических полей у класса нет.
+    ///
+    /// «Off means off» соблюдён: класс деплоится вместе с плагином и при evict
+    /// перестаёт существовать; пока плагин включён, хук делает ровно одну проверку
+    /// флага на смену Play Mode.
+    /// </summary>
+    [InitializeOnLoad]
+    internal static class SceneReturnHook
+    {
+        // Ключи — свои, плагинные; это не путь хаба и не view-state страницы.
+        private const string PathKey  = "Exerussus.Nexus.Scenarios.ReturnPath";
+        private const string ArmedKey = "Exerussus.Nexus.Scenarios.ReturnArmed";
+
+        static SceneReturnHook()
+        {
+            EditorApplication.playModeStateChanged -= OnStateChanged;
+            EditorApplication.playModeStateChanged += OnStateChanged;
+        }
+
+        /// <summary>Вызывается страницей прямо перед EditorApplication.isPlaying = true.</summary>
+        public static void Arm(string originalScenePath)
+        {
+            SessionState.SetString(PathKey, originalScenePath);
+            SessionState.SetBool(ArmedKey, true);
+        }
+
+        public static void Disarm()
+        {
+            SessionState.EraseString(PathKey);
+            SessionState.EraseBool(ArmedKey);
+        }
+
+        private static void OnStateChanged(PlayModeStateChange change)
+        {
+            if (change != PlayModeStateChange.EnteredEditMode) return;
+            if (!SessionState.GetBool(ArmedKey, false)) return;
+
+            string original = SessionState.GetString(PathKey, null);
+            Disarm();
+
+            if (string.IsNullOrEmpty(original)) return;
+            if (string.Equals(original, EditorSceneManager.GetActiveScene().path, StringComparison.Ordinal)) return;
+
+            // Сцену могли удалить за время Play — проверим существование.
+            if (AssetDatabase.LoadAssetAtPath<SceneAsset>(original) == null)
+            {
+                Debug.LogWarning($"[Nexus.Scenarios] Исходная сцена '{original}' больше не существует — возврат отменён.");
+                return;
+            }
+
+            try
+            {
+                EditorSceneManager.OpenScene(original, OpenSceneMode.Single);
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+            }
+        }
+    }
+}

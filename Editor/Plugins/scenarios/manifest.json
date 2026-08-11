@@ -1,0 +1,28 @@
+{
+    "schemaVersion": 1,
+    "guid": "a77f6e15-f655-4ef3-b777-4d27029766ff",
+    "id": "scenarios",
+    "version": "2.0",
+    "typeName": "Exerussus.Nexus.Pages.Scenarios.ScenariosPage",
+    "kind": "constitutive",
+    "display": {
+        "name": "Scenarios",
+        "category": "Infrastructure",
+        "order": 10,
+        "icon": null
+    },
+    "requires": [],
+    "packageRequires": [
+        {
+            "name": "com.exerussus.scenario",
+            "gitUrl": "https://github.com/Exerussus/com.exerussus.scenario.git",
+            "assembly": "Scenario.Editor"
+        }
+    ],
+    "deploy": [
+        { "from": "ScenariosPage.cs.txt", "to": "ScenariosPage.cs" },
+        { "from": "ScenariosPage.uxml.txt", "to": "ScenariosPage.uxml" },
+        { "from": "ScenariosPage.uss.txt", "to": "ScenariosPage.uss" },
+        { "from": "ScenariosPage.asmdef.txt", "to": "ScenariosPage.asmdef" }
+    ]
+}

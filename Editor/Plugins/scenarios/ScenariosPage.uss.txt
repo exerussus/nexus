@@ -1,0 +1,119 @@
+/* Только геометрия. Все цвета страница берёт из токенов палитры
+   через Context.Theme / Context.Ui — литералов цвета здесь быть не должно. */
+
+.scenarios-root {
+    flex-grow: 1;
+    flex-direction: column;
+}
+
+.scenarios-toolbar {
+    flex-direction: row;
+    align-items: center;
+    padding: 6px 8px;
+    border-bottom-width: 1px;
+}
+
+.scenarios-toolbar-buttons {
+    flex-direction: row;
+    align-items: center;
+}
+
+.scenarios-tb-btn {
+    margin-right: 4px;
+    height: 22px;
+}
+
+.scenarios-tb-spacer {
+    flex-grow: 1;
+}
+
+.scenarios-drop {
+    min-width: 220px;
+}
+
+.scenarios-options {
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 4px 8px;
+    border-bottom-width: 1px;
+}
+
+.scenarios-toggle {
+    margin-right: 16px;
+}
+
+.scenarios-list-container {
+    flex-grow: 1;
+    margin: 4px;
+    border-width: 1px;
+    border-radius: 4px;
+}
+
+.scenarios-list {
+    flex-grow: 1;
+}
+
+.scenarios-empty {
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.scenarios-empty-label {
+    -unity-text-align: middle-center;
+    white-space: normal;
+}
+
+.scenarios-row {
+    flex-direction: row;
+    align-items: center;
+    padding: 0 6px;
+    height: 28px;
+}
+
+.scenarios-row-active-marker {
+    width: 4px;
+    height: 18px;
+    margin-right: 6px;
+    border-radius: 2px;
+}
+
+.scenarios-row-name {
+    flex-grow: 1;
+    -unity-text-align: middle-left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-right: 6px;
+}
+
+.scenarios-row-name-missing {
+    -unity-font-style: italic;
+}
+
+.scenarios-row-name-active {
+    -unity-font-style: bold;
+}
+
+.scenarios-row-btn-scenario {
+    height: 20px;
+    min-width: 64px;
+    max-width: 170px;
+    margin-left: 2px;
+    margin-right: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.scenarios-row-btn {
+    height: 20px;
+    min-width: 56px;
+    margin-left: 2px;
+}
+
+.scenarios-row-btn-icon {
+    height: 20px;
+    min-width: 24px;
+    width: 24px;
+    margin-left: 2px;
+    -unity-text-align: middle-center;
+}

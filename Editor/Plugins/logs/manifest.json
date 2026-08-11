@@ -1,22 +1,26 @@
 {
   "schemaVersion": 1,
-  "guid": "0b6c4f9e-2d71-4a3e-9b8c-1f2a3c4d5e6f",
+  "guid": "039a4d6456e6431190f9271b89e5d47b",
   "id": "logs",
   "version": "1.0",
   "typeName": "Exerussus.Nexus.Pages.Logs.LogsPage",
+  "kind": "constitutive",
   "display": {
     "name": "Logs",
     "category": "Infrastructure",
     "order": 20,
     "icon": "d_UnityEditor.ConsoleWindow"
   },
-  "kind": "constitutive",
-  "requires": [
-    { "service": "logformat", "range": "1.0" }
-  ],
+  "requires": [],
+  "packageRequires": [],
   "deploy": [
     { "from": "Exerussus.Nexus.Pages.Logs.asmdef.txt", "to": "Exerussus.Nexus.Pages.Logs.asmdef" },
+    { "from": "LogModel.cs.txt", "to": "LogModel.cs" },
+    { "from": "LogCollector.cs.txt", "to": "LogCollector.cs" },
     { "from": "LogsPage.cs.txt", "to": "LogsPage.cs" },
-    { "from": "LogsPage.uxml.txt", "to": "LogsPage.uxml" }
+    { "from": "LogsPage.Filters.cs.txt", "to": "LogsPage.Filters.cs" },
+    { "from": "LogsPage.List.cs.txt", "to": "LogsPage.List.cs" },
+    { "from": "LogsPage.Theme.cs.txt", "to": "LogsPage.Theme.cs" },
+    { "from": "LogsPage.uss.txt", "to": "LogsPage.uss" }
   ]
 }

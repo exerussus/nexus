@@ -2,8 +2,7 @@
     "name": "Exerussus.Nexus.Pages.Logs",
     "rootNamespace": "Exerussus.Nexus.Pages.Logs",
     "references": [
-        "Exerussus.Nexus.Abstractions",
-        "Exerussus.Nexus.Services"
+        "Exerussus.Nexus.Abstractions"
     ],
     "includePlatforms": [
         "Editor"
@@ -12,7 +11,7 @@
     "allowUnsafeCode": false,
     "overrideReferences": false,
     "precompiledReferences": [],
-    "autoReferenced": true,
+    "autoReferenced": false,
     "defineConstraints": [],
     "versionDefines": [],
     "noEngineReferences": false

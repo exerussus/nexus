@@ -1,83 +1,418 @@
-using Exerussus.Nexus.Abstractions;
-using Exerussus.Nexus.Services;
+using System;
+using System.Collections.Generic;
+using UnityEditor;
 using UnityEngine;
 using UnityEngine.UIElements;
+using Exerussus.Nexus.Abstractions;
 
 namespace Exerussus.Nexus.Pages.Logs
 {
     /// <summary>
-    /// Образец constitutive-страницы. Лежит инертно в Plugins, при развёртке
-    /// компилируется в свою сборку Exerussus.Nexus.Pages.Logs (ссылается на
-    /// Abstractions + Services). ЗАВИСИТ от сервиса logformat (manifest.requires) —
-    /// и реально его зовёт: dependency-gate не даст развернуть страницу, если
-    /// сервиса нет, а компилятор не соберёт её код без сборки Services.
+    /// Страница «Сборщик логов» — вид над всегда-живым (пока плагин задеплоен)
+    /// <see cref="LogCollector"/>. Разбита на partial-файлы: здесь — общее состояние,
+    /// верхний тулбар и лайфцикл; LogsPage.Theme.cs — покраска по токенам палитры Nexus;
+    /// LogsPage.Filters.cs — переключатели сбора/показа + чипы тегов + предикат фильтра;
+    /// LogsPage.List.cs — рендер строк и кликабельные стеки.
     ///
-    /// Наследуется от EditorPageBase: Context и Track даёт база, подписка на шину
-    /// снимается сама в OnDispose.
+    /// Constitutive-страница: вся генерация/данные внутри плагина, disable их стирает.
+    /// Цвета берутся из Context.Theme.Get(token) (страница не видит ассембли Theme), USS —
+    /// только под раскладку.
     /// </summary>
     [EditorPage("logs", "Logs", PageCategory.Infrastructure, order: 20, icon: "d_UnityEditor.ConsoleWindow")]
-    public sealed class LogsPage : EditorPageBase
+    public sealed partial class LogsPage : EditorPageBase
     {
-        private Label _echo;
+        private const double MinRebuildInterval = 0.12; // с — схлопываем всплески логов до ~8 fps
+        private const int    MinFont = 8;
+        private const int    MaxFont = 22;
+
+        private static readonly LogGroup[] AllGroups =
+            { LogGroup.Debug, LogGroup.Info, LogGroup.Warning, LogGroup.Error };
+
+        // ---- состояние вида (персистится через SessionState / EditorPrefs) ----
+        private int    _showMask = 0b1111;
+        private string _search   = string.Empty;
+        private bool   _autoScroll = true;
+        private bool   _collapse;                    // схлопывать подряд идущие одинаковые строки (×N)
+        private bool   _paused;                      // заморозить вид; сбор продолжается
+        private bool   _lastSessionOnly = true;      // показывать только последний/текущий Play-прогон
+        private int    _fontPx = 11;                 // размер текста строки (px); A- / A+ масштабируют
+        private readonly HashSet<string> _activeTags = new(StringComparer.OrdinalIgnoreCase);
+
+        // ---- зеркало данных ----
+        private readonly List<LogEntry> _all = new();
+        private long   _seenVersion = -1;
+        private double _lastRebuild;
+        private bool   _polling;                     // подписан ли EditorApplication.update (ось фокуса)
+
+        // ---- ссылки UI ----
+        private VisualElement _root;
+        private ScrollView _list;
+        private TextField  _capField;
+        private TextField  _searchField;
+        private Label      _titleLabel;
+        private Label      _countLabel;
+        private Button     _autoBtn;
+        private Button     _collapseBtn;
+        private Button     _pauseBtn;
+        private Label      _fontLabel;
+        private readonly List<Label> _dimLabels = new();   // приглушённые подписи — перекрашиваются разом
+        private readonly Dictionary<LogGroup, Button> _showBtns    = new();
+        private readonly Dictionary<LogGroup, Button> _collectBtns = new();
+
+        // ------------------------------------------------------------------ build
 
         public override VisualElement BuildUI()
         {
-            var root = new VisualElement { style = { flexGrow = 1f } };
+            _root = new VisualElement();
+            _root.AddToClassList("logc-page");
 
-            // вызов сервиса logformat — доказывает, что зависимость живая;
-            // цвет берём из темы через Context (страница тематизируется, оставаясь изолированной)
-            root.Add(new Label(LogFormatService.Stamp("Logs page (M5 — service + theme)"))
-            {
-                style =
-                {
-                    unityFontStyleAndWeight = FontStyle.Bold,
-                    color = Context.Theme.Get(NexusToken.Accent),
-                },
-            });
+            var ss = Context.LoadDeployedAsset<StyleSheet>("LogsPage.uss");
+            if (ss != null) _root.styleSheets.Add(ss);
 
-            _echo = new Label("ждём событие шины…") { style = { marginTop = 6f, color = Context.Theme.Get(NexusToken.TextDim) } };
-            root.Add(_echo);
+            LoadViewState();        // до построения переключателей, чтобы визуал был верным
 
-            // загрузка СОБСТВЕННОГО развёрнутого UXML по имени — путь резолвит хаб
-            // (страница не знает про State/<id>); если не нашёлся — мягко пропускаем
-            var tree = Context.LoadDeployedAsset<VisualTreeAsset>("LogsPage.uxml");
-            if (tree != null) root.Add(tree.Instantiate());
+            BuildToolbar();
+            BuildCollectBar();      // LogsPage.Filters.cs
+            BuildFilterBar();       // LogsPage.Filters.cs
+            BuildTagBar();          // LogsPage.Filters.cs
 
-            // подписка с авто-отпиской через Track; обработчик тоже зовёт сервис
-            Track(Context.Bus.Subscribe<string>(msg =>
-            {
-                if (_echo != null) _echo.text = LogFormatService.Stamp(msg);
-            }));
+            _list = new ScrollView(ScrollViewMode.Vertical);
+            _list.AddToClassList("logc-list");
+            _root.Add(_list);
 
-            // типовые кнопки берём из фабрики по РОЛИ — единый стиль, без ручной раскраски
-            var actions = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 8f } };
-            actions.Add(Context.Ui.Button(NexusRole.Primary, "Publish ping",
-                () => Context.Bus.Publish("ping from Logs")));
-            actions.Add(Context.Ui.Button(NexusRole.Alarm, "Очистить",
-                () => { if (_echo != null) _echo.text = "—"; }));
-            actions.Add(Context.Ui.Badge(NexusRole.Success, "demo"));
-            root.Add(actions);
-
-            return root;
+            ApplyStaticTheme();     // LogsPage.Theme.cs — покрасить статичную отделку
+            SyncToggleVisuals();
+            return _root;
         }
 
-        private int _focusCount;
+        private void BuildToolbar()
+        {
+            var bar = new VisualElement();
+            bar.AddToClassList("logc-toolbar");
 
-        // ось «активная вкладка»
-        public override void OnEnter() => Context.SetStatus("Logs активна (вкладка выбрана).", StatusKind.Info);
-        public override void OnExit()  => Context.SetStatus(string.Empty);
+            _titleLabel = new Label("Сборщик логов");
+            _titleLabel.AddToClassList("logc-title");
+            _titleLabel.tooltip = "Захватывает логи Console только в Play mode — просмотрщик для запущенной игры.";
 
-        // ось «окно в фокусе при активной вкладке» — здесь возобновляют/останавливают
-        // высокочастотную работу (пуллинг, слежение за выделением)
+            _countLabel = new Label();
+            _countLabel.AddToClassList("logc-count");
+
+            var spacer = new VisualElement();
+            spacer.AddToClassList("logc-spacer");
+
+            var maxLabel = new Label("Макс");
+            maxLabel.AddToClassList("logc-inline-label");
+            _dimLabels.Add(maxLabel);
+
+            _capField = new TextField { value = LogCollector.Capacity.ToString() };
+            _capField.AddToClassList("logc-cap-field");
+            _capField.tooltip = "Максимум хранимых логов. При переполнении удаляется самый ранний.";
+            _capField.RegisterCallback<FocusOutEvent>(_ => CommitCapacity());
+            _capField.RegisterCallback<KeyDownEvent>(evt =>
+            {
+                if (evt.keyCode == KeyCode.Return || evt.keyCode == KeyCode.KeypadEnter)
+                    CommitCapacity();
+            });
+
+            _autoBtn = MakeButton("Автопрокрутка", ToggleAutoScroll);   // LogsPage.Theme.cs
+
+            // ---- размер текста (A- / A+) ----
+            var fontDown = MakeButton("A-", () => FontDelta(-1));
+            fontDown.tooltip = "Меньше текст логов";
+
+            _fontLabel = new Label(_fontPx.ToString());
+            _fontLabel.AddToClassList("logc-font");
+
+            var fontUp = MakeButton("A+", () => FontDelta(+1));
+            fontUp.tooltip = "Крупнее текст логов";
+
+            _collapseBtn = MakeButton("Свернуть", ToggleCollapse);
+            _collapseBtn.tooltip = "Сворачивать подряд идущие одинаковые логи в одну строку (×N).";
+
+            _pauseBtn = MakeButton("Пауза", TogglePause);
+            _pauseBtn.tooltip = "Заморозить вид. Сбор продолжается в фоне.";
+
+            var exportBtn = MakeButton("Экспорт", ExportLogs);
+            exportBtn.tooltip = "Сохранить отфильтрованные логи в .txt.";
+
+            var clearBtn = MakeButton("Очистить", ClearLogs);
+
+            bar.Add(_titleLabel);
+            bar.Add(_countLabel);
+            bar.Add(spacer);
+            bar.Add(fontDown);
+            bar.Add(_fontLabel);
+            bar.Add(fontUp);
+            bar.Add(_collapseBtn);
+            bar.Add(_pauseBtn);
+            bar.Add(_autoBtn);
+            bar.Add(maxLabel);
+            bar.Add(_capField);
+            bar.Add(exportBtn);
+            bar.Add(clearBtn);
+            _root.Add(bar);
+        }
+
+        // ------------------------------------------------------------- lifecycle
+
+        protected override void OnInitialize()
+        {
+            // Лениво: ничего тяжёлого. Реальная работа — с первого OnEnter/OnFocus.
+        }
+
+        public override void OnEnter()
+        {
+            _seenVersion = -1;                       // форсируем первую перестройку
+            RefreshFromCollector();
+        }
+
         public override void OnFocus()
         {
-            _focusCount++;
-            if (_echo != null) _echo.text = LogFormatService.Stamp($"в фокусе — слежу (циклов: {_focusCount})");
+            // Высокочастотная работа (поллинг) живёт на оси фокуса.
+            ApplyStaticTheme();                      // догнать возможную смену палитры
+            StartPolling();
+            RefreshFromCollector();                  // догнать всё, что накопилось
         }
 
         public override void OnUnfocus()
         {
-            if (_echo != null) _echo.text = LogFormatService.Stamp("фон — слежение приостановлено (вкладка ещё активна)");
+            StopPolling();                           // окно не в фокусе / вкладку прячут — стоп
         }
+
+        public override void OnExit()
+        {
+            StopPolling();
+            SaveViewState();
+        }
+
+        public override void OnRefresh()
+        {
+            RefreshFromCollector();
+            Context.SetStatus(
+                $"Логи: {_all.Count} собрано, {VisibleCount()} показано.", StatusKind.Info);
+        }
+
+        public override bool CanClose() => true;
+
+        public override void OnPrePack()
+        {
+            // Последний шанс перед упаковкой в Preserve на disable.
+            SaveViewState();
+            LogCollector.OnPluginDisabled();         // рабочие данные не переживают off
+        }
+
+        protected override void OnDisposing()
+        {
+            StopPolling();
+        }
+
+        private void StartPolling()
+        {
+            if (_polling) return;
+            _polling = true;
+            EditorApplication.update += OnEditorUpdate;
+        }
+
+        private void StopPolling()
+        {
+            if (!_polling) return;
+            _polling = false;
+            EditorApplication.update -= OnEditorUpdate;
+        }
+
+        private void OnEditorUpdate()
+        {
+            if (_paused) { UpdatePausedCount(); return; }
+
+            if (LogCollector.Version == _seenVersion) return;
+
+            var now = EditorApplication.timeSinceStartup;
+            if (now - _lastRebuild < MinRebuildInterval) return;   // дросселируем всплески
+
+            RefreshFromCollector();
+        }
+
+        // ---------------------------------------------------------------- refresh
+
+        private void RefreshFromCollector()
+        {
+            _seenVersion = LogCollector.Version;
+            _lastRebuild = EditorApplication.timeSinceStartup;
+
+            LogCollector.CopyTo(_all);
+
+            RebuildTagBarIfChanged();   // LogsPage.Filters.cs
+            RebuildList();              // LogsPage.List.cs
+            UpdateCounts();
+        }
+
+        private void UpdateCounts()
+        {
+            var perGroup = new int[4];
+            foreach (var e in _all)
+                if (e.group >= 0 && e.group < 4) perGroup[e.group]++;
+
+            foreach (var g in AllGroups)
+                _showBtns[g].text = $"{GroupLabel(g)} {perGroup[(int)g]}";
+
+            if (_countLabel != null)
+                _countLabel.text = $"{_all.Count} собрано · {VisibleCount()} показано";
+        }
+
+        // --------------------------------------------------------- toolbar actions
+
+        private void CommitCapacity()
+        {
+            if (int.TryParse(_capField.value, out var cap) && cap > 0)
+            {
+                LogCollector.SetCapacity(cap);
+                _capField.SetValueWithoutNotify(LogCollector.Capacity.ToString());
+                RefreshFromCollector();
+                Context.SetStatus($"Ёмкость установлена: {LogCollector.Capacity}.", StatusKind.Info);
+            }
+            else
+            {
+                // вернуть реальное значение
+                _capField.SetValueWithoutNotify(LogCollector.Capacity.ToString());
+                Context.SetStatus("Ёмкость должна быть положительным целым.", StatusKind.Warning);
+            }
+        }
+
+        private void ClearLogs()
+        {
+            LogCollector.Clear();
+            RefreshFromCollector();
+            Context.SetStatus("Бокс логов очищен.", StatusKind.Info);
+        }
+
+        private void ToggleAutoScroll()
+        {
+            _autoScroll = !_autoScroll;
+            SetThemedOn(_autoBtn, _autoScroll);                       // LogsPage.Theme.cs
+            EditorPrefs.SetBool(Context.GetSessionKey("autoScroll"), _autoScroll);
+            if (_autoScroll) ScrollToBottom();                        // LogsPage.List.cs
+        }
+
+        private void ToggleCollapse()
+        {
+            _collapse = !_collapse;
+            SetThemedOn(_collapseBtn, _collapse);
+            EditorPrefs.SetBool(Context.GetSessionKey("collapse"), _collapse);
+            RebuildList();
+            UpdateCounts();
+        }
+
+        private void TogglePause()
+        {
+            _paused = !_paused;
+            SessionState.SetBool(Context.GetSessionKey("paused"), _paused);
+            _pauseBtn.text = _paused ? "Возобновить" : "Пауза";
+            SetThemedOn(_pauseBtn, _paused);
+            _pausedCountCache = null;
+
+            if (_paused)
+            {
+                UpdatePausedCount();
+                Context.SetStatus("Живой вид на паузе — сбор продолжается.", StatusKind.Info);
+            }
+            else
+            {
+                RefreshFromCollector();   // догнать всё пропущенное
+                Context.SetStatus("Живой вид возобновлён.", StatusKind.Info);
+            }
+        }
+
+        private string _pausedCountCache;
+
+        private void UpdatePausedCount()
+        {
+            if (_countLabel == null) return;
+            var txt = $"{LogCollector.Count} собрано · пауза";
+            if (_pausedCountCache == txt) return;
+            _pausedCountCache = txt;
+            _countLabel.text  = txt;
+        }
+
+        private void FontDelta(int d)
+        {
+            var v = Mathf.Clamp(_fontPx + d, MinFont, MaxFont);
+            if (v == _fontPx) return;
+            _fontPx = v;
+            if (_fontLabel != null) _fontLabel.text = _fontPx.ToString();
+            EditorPrefs.SetInt(Context.GetSessionKey("fontPx"), _fontPx);
+            RebuildList();   // строки подхватят новый размер при перестройке
+        }
+
+        // ----------------------------------------------------------- toggle visuals
+
+        private void SyncToggleVisuals()
+        {
+            foreach (var g in AllGroups)
+            {
+                SetThemedOn(_collectBtns[g], LogCollector.Collects(g));
+                SetThemedOn(_showBtns[g], (_showMask & (1 << (int)g)) != 0);
+            }
+            SetThemedOn(_autoBtn, _autoScroll);
+            SetThemedOn(_collapseBtn, _collapse);
+            if (_pauseBtn != null)
+            {
+                SetThemedOn(_pauseBtn, _paused);
+                _pauseBtn.text = _paused ? "Возобновить" : "Пауза";
+            }
+            SetThemedOn(_sessionBtn, _lastSessionOnly);
+            if (_fontLabel != null) _fontLabel.text = _fontPx.ToString();
+        }
+
+        // --------------------------------------------------------------- view state
+
+        private void LoadViewState()
+        {
+            _showMask   = SessionState.GetInt(Context.GetSessionKey("showMask"), 0b1111);
+            _search     = SessionState.GetString(Context.GetSessionKey("search"), string.Empty);
+            _autoScroll = EditorPrefs.GetBool(Context.GetSessionKey("autoScroll"), true);
+            _collapse   = EditorPrefs.GetBool(Context.GetSessionKey("collapse"), false);
+            _paused     = SessionState.GetBool(Context.GetSessionKey("paused"), false);
+            _lastSessionOnly = SessionState.GetBool(Context.GetSessionKey("lastSession"), true);
+            _fontPx     = Mathf.Clamp(
+                EditorPrefs.GetInt(Context.GetSessionKey("fontPx"), 11), MinFont, MaxFont);
+
+            _activeTags.Clear();
+            var packed = SessionState.GetString(Context.GetSessionKey("tags"), string.Empty);
+            if (!string.IsNullOrEmpty(packed))
+                foreach (var t in packed.Split('\u0001'))
+                    if (t.Length > 0) _activeTags.Add(t);
+        }
+
+        private void SaveViewState()
+        {
+            SessionState.SetInt(Context.GetSessionKey("showMask"), _showMask);
+            SessionState.SetString(Context.GetSessionKey("search"), _search ?? string.Empty);
+            SessionState.SetString(Context.GetSessionKey("tags"), string.Join("\u0001", _activeTags));
+            EditorPrefs.SetBool(Context.GetSessionKey("autoScroll"), _autoScroll);
+            EditorPrefs.SetBool(Context.GetSessionKey("collapse"), _collapse);
+            SessionState.SetBool(Context.GetSessionKey("paused"), _paused);
+            SessionState.SetBool(Context.GetSessionKey("lastSession"), _lastSessionOnly);
+            EditorPrefs.SetInt(Context.GetSessionKey("fontPx"), _fontPx);
+        }
+
+        // ------------------------------------------------------------------ helpers
+
+        private static string GroupLabel(LogGroup g) => g switch
+        {
+            LogGroup.Debug   => "Debug",
+            LogGroup.Info    => "Info",
+            LogGroup.Warning => "Warning",
+            LogGroup.Error   => "Error",
+            _                => g.ToString(),
+        };
+
+        private static string GroupClass(LogGroup g) => g switch
+        {
+            LogGroup.Debug   => "debug",
+            LogGroup.Info    => "info",
+            LogGroup.Warning => "warning",
+            LogGroup.Error   => "error",
+            _                => "info",
+        };
     }
 }

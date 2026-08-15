@@ -630,7 +630,9 @@ namespace Exerussus.Nexus.Pages.App
         private static string AppStyleContent() =>
             "/* AppStyle.uss — общий стиль приложения.\n" +
             "   По умолчанию прокидывается <Style>-ом в каждый контейнер (AppStarter/Default/LoadingScreen).\n" +
-            "   Изначально пуст — расширяй под проект. */\n";
+            "   Изначально пуст — расширяй под проект. */\n\n" + 
+            ".generate-link {}\n" +
+            ".signal-button {}";
 
         private static string AppThemeContent() =>
             "@import url(\"unity-theme://default\");\n\nVisualElement {\n}\n";

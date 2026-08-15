@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 //  AppPage.External.cs — вкладка «External files».
 //
 //  AppPage — обслуживающая (servicing) страница Nexus: её рабочий продукт живёт ВНЕ
@@ -9,7 +9,7 @@
 //
 //  Классификация следа:
 //    • generated — чисто-генерируемые выходы (перезаписываются на Apply/Generate):
-//                    Navigation.uss, NavTargets.cs, NavigationName.cs.
+//                    Navigation.uss, NavTargets.cs.
 //                    ТОЛЬКО их разрешено удалять кнопкой Clean.
 //    • config    — NavigationData / NavigationSettings: создаются страницей, но хранят
 //                    отредактированные данные (id, entries, аффиксы) → не трогаем.
@@ -65,7 +65,7 @@ namespace Exerussus.Nexus.Pages.App
             _extCleanBtn = new Button(CleanGeneratedOutputs) { text = "Clean generated outputs" };
             _extCleanBtn.AddToClassList("nav-btn");
             _extCleanBtn.tooltip =
-                "Deletes ONLY the regenerable outputs (Navigation.uss, NavTargets.cs, NavigationName.cs). " +
+                "Deletes ONLY the regenerable outputs (Navigation.uss, NavTargets.cs). " +
                 "Authored & config data — NavigationData, NavigationSettings, containers, theme, page/popup UXML — " +
                 "is never touched.";
             toolbar.Add(_extCleanBtn);
@@ -127,7 +127,6 @@ namespace Exerussus.Nexus.Pages.App
                 // --- generated (удаляемые Clean) ---
                 new() { Label = "Navigation.uss (generated)",   Path = AppPaths.NavUssPath,                              Kind = ExtKind.Generated },
                 new() { Label = "NavTargets.cs (generated)",     Path = $"{AppPaths.GenDir}/{AppPaths.UidFileName}.cs",   Kind = ExtKind.Generated },
-                new() { Label = "NavigationName.cs (generated)", Path = $"{AppPaths.GenDir}/{AppPaths.NameFileName}.cs",  Kind = ExtKind.Generated },
 
                 // --- config (создаётся страницей, хранит данные → не трогаем) ---
                 new() { Label = "NavigationData.asset (config)",    Path = AppPaths.NavigationDataPath, Kind = ExtKind.Config },

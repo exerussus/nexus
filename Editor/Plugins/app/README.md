@@ -17,8 +17,10 @@ plugin **never** deletes them. The page owns that footprint explicitly — see t
   Apply (writes ids, NavigationSettings entries, regenerates `Navigation.uss`, migrates
   USS classes across UXML on rename/delete, renames page asset files/folders).
 - **Graph** — navigation graph of the active scene (added separately).
-- **Generation** — code-gen (`NavTargets.cs` = PageId/PopupId consts; `NavigationName.cs`
-  = element names from `generate-link`), page/popup templates, and **App scaffold** (below).
+- **Generation** — code-gen (`NavTargets.cs` = PageId/PopupId consts), page/popup templates,
+  and **App scaffold** (below). Element names are not generated: elements marked `generate-link`
+  are picked up by the controller generator (uxml context menu → Create Page/Popup Controller),
+  which emits typed fields straight into the controller.
 - **Hooks** — action-hook library (UserSettings) inserting `display:none` hooks into `mainContainer`.
 - **Nav classes** — standard nav classes (`to-back-page__navigation`) into `Navigation.uss`.
 - **External files** — footprint status + cleanup of regenerable outputs only.
@@ -47,8 +49,8 @@ on the page's Refresh). Defaults match the layout above. See `AppPaths.cs`.
 ## External footprint (survives disable)
 
 - `Resources/NavigationData.asset`, `Resources/NavigationSettings.asset` — config (authored data).
-- `Styles/Navigation.uss`, `Navigation/Generated/NavTargets.cs`, `Navigation/Generated/NavigationName.cs`
-  — generated (regenerable). **Only these three are removable from External files.**
+- `Styles/Navigation.uss`, `Navigation/Generated/NavTargets.cs`
+  — generated (regenerable). **Only these two are removable from External files.**
 - Containers, AppStyle/AppTheme/App Settings, UISoundLibrary, `Pages/**`, `Popups/**` — authored, status-only.
 
 ## Inside the plugin (wiped on disable, packed into Preserve)

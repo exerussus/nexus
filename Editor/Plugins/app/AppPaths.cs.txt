@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 //  AppPaths.cs — единый источник путей и имён внешнего следа App.
 //
 //  ПРОЕКТНЫЙ конфиг (общий, коммитится в git): Assets/App/app.config.json.
@@ -39,7 +39,7 @@ namespace Exerussus.Nexus.Pages.App
             public string popupsDir            = "Popups";
             public string generatedDir         = "Navigation/Generated";
 
-            // namespace генерируемого кода (NavTargets / NavigationName)
+            // namespace генерируемого кода (NavTargets)
             public string generatedNamespace   = "App.Navigation";
 
             // namespace генерируемых контроллеров (AppControllerGenerator).
@@ -59,9 +59,8 @@ namespace Exerussus.Nexus.Pages.App
             public string appStarterName       = "AppStarter.uxml";
             public string loadingScreenName    = "LoadingScreen.uxml";
 
-            // имена генерируемых .cs (без расширения)
+            // имя генерируемого .cs (без расширения)
             public string uidFileName          = "NavTargets";
-            public string nameFileName         = "NavigationName";
         }
 
         private static Config _cfg;
@@ -122,7 +121,6 @@ namespace Exerussus.Nexus.Pages.App
         public static string GenNamespace  => Cfg.generatedNamespace;
         public static string ControllersNamespace => Cfg.controllersNamespace;
         public static string UidFileName   => Cfg.uidFileName;
-        public static string NameFileName  => Cfg.nameFileName;
 
         // ---- конкретные файлы ----
         public static string NavUssPath         => Combine(StylesDir,    Cfg.navUssName);

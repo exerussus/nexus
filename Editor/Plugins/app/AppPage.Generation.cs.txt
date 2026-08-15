@@ -1,10 +1,7 @@
-// ============================================================
+﻿// ============================================================
 //  AppPage.Generation.cs — вкладка «Generation».
 //
 //  Блоки:
-//    • "Generate element names" — по UXML текущих AppPage/AppPopup в сцене берёт
-//      элементы с uss-классом-маркером "generate-link" и пишет их name'ы одним файлом
-//      NavigationName.cs (вложенный класс на страницу/попап).
 //    • "Generate PageId / PopupId" — по id из NavigationData полностью перезаписывает
 //      NavTargets.cs (PageId на страницы, PopupId на попапы). [Переименовано из
 //      NavigationLink, чтобы не конфликтовать с рантайм-классом роутинга.]
@@ -27,10 +24,7 @@ using Exerussus.Nexus.Abstractions;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Reflection;
 using System.Text;
-using System.Xml.Linq;
 using Exerussus.AppCore.Audio;
 using Exerussus.AppCore.Navigation;
 using UnityEditor;
@@ -41,9 +35,6 @@ namespace Exerussus.Nexus.Pages.App
 {
     public sealed partial class AppPage
     {
-        // uss-класс-маркер: элемент с ним попадает в сгенерированные имена
-        private const string GenerateLinkClass = "generate-link";
-
         // ----------------------------------------------------- UI поля
         private TextField  _genLog;
         private ScrollView _tplList;
@@ -70,28 +61,19 @@ namespace Exerussus.Nexus.Pages.App
 
             var desc = new Label(
                 "Code generation into " + AppPaths.GenDir + ". " +
-                "UIDs are taken from NavigationData ids; element names — from the UXML of AppPage / AppPopup " +
-                "in the active scene (only elements carrying the \"" + GenerateLinkClass + "\" USS class). " +
-                "Files are fully rewritten; nothing is generated when there is nothing to write.");
+                "UIDs are taken from NavigationData ids. " +
+                "The file is fully rewritten; nothing is generated when there is nothing to write.");
             desc.AddToClassList("nav-gen-desc");
             _genRoot.Add(desc);
 
             var actions = new VisualElement();
             actions.AddToClassList("nav-gen-actions");
 
-            var namesBtn = new Button(GenerateElementNames) { text = "Generate element names" };
-            namesBtn.AddToClassList("nav-btn");
-
             var uidBtn = new Button(GenerateUids) { text = "Generate PageId / PopupId" };
             uidBtn.AddToClassList("nav-btn");
+            uidBtn.AddToClassList("nav-btn--apply");
 
-            var bothBtn = new Button(GenerateAll) { text = "Generate both" };
-            bothBtn.AddToClassList("nav-btn");
-            bothBtn.AddToClassList("nav-btn--apply");
-
-            actions.Add(namesBtn);
             actions.Add(uidBtn);
-            actions.Add(bothBtn);
             _genRoot.Add(actions);
 
             // ---- page / popup templates ----
@@ -142,18 +124,6 @@ namespace Exerussus.Nexus.Pages.App
         {
             if (_genLog != null) _genLog.value = text;
             Context.SetStatus(text.Replace("\n", "  "), kind);
-        }
-
-        private void GenerateAll()
-        {
-            var sb = new StringBuilder();
-            bool okNames = GenerateElementNames(sb);
-            sb.AppendLine();
-            bool okUids = GenerateUids(sb);
-
-            AssetDatabase.Refresh();
-            SetGenLog(sb.ToString().TrimEnd(),
-                okNames && okUids ? StatusKind.Ok : StatusKind.Warning);
         }
 
         // ============================================================ шаблоны страниц/попапов
@@ -708,183 +678,6 @@ namespace Exerussus.Nexus.Pages.App
             return n;
         }
 
-        // ============================================================ генерация имён элементов
-
-        private void GenerateElementNames()
-        {
-            var sb = new StringBuilder();
-            bool ok = GenerateElementNames(sb);
-            AssetDatabase.Refresh();
-            SetGenLog(sb.ToString().TrimEnd(), ok ? StatusKind.Ok : StatusKind.Warning);
-        }
-
-        private bool GenerateElementNames(StringBuilder log)
-        {
-            if (!ScanComponentsForNames(out var sources, out var scanError))
-            {
-                log.AppendLine("Names: " + (scanError ?? "no AppRunner / no AppPage·AppPopup in the active scene") +
-                               " — " + AppPaths.NameFileName + ".cs left untouched.");
-                return false;
-            }
-
-            var classes      = new List<(string name, List<(string ident, string value)> members)>();
-            var usedClassIds = new HashSet<string>(StringComparer.Ordinal);
-            int totalMembers = 0, skippedUnnamed = 0, pagesEmpty = 0, badUxml = 0;
-
-            foreach (var src in sources)
-            {
-                if (src.uxmlMissing) { badUxml++; continue; }
-
-                List<(string name, string value)> raw;
-                try { raw = ExtractGenerateLinks(src.uxmlText, ref skippedUnnamed); }
-                catch (Exception e)
-                {
-                    badUxml++;
-                    log.AppendLine($"Names: cannot parse UXML of \"{src.id}\" ({src.uxmlPath}) — {e.Message}");
-                    continue;
-                }
-
-                if (raw.Count == 0) { pagesEmpty++; continue; }
-
-                var classId = Unique(usedClassIds, ToTypeIdentNonEmpty(src.id, src.isPopup ? "Popup" : "Page"));
-
-                var members   = new List<(string ident, string value)>();
-                var usedConst = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var (name, _) in raw)
-                {
-                    var ident = Unique(usedConst, ToConstIdent(name));
-                    members.Add((ident, name));
-                    totalMembers++;
-                }
-                classes.Add((classId, members));
-            }
-
-            if (classes.Count == 0)
-            {
-                log.AppendLine($"Names: no elements with \".{GenerateLinkClass}\" found" +
-                               (badUxml > 0 ? $" ({badUxml} UXML unreadable)" : "") +
-                               $" — {AppPaths.NameFileName}.cs left untouched.");
-                return false;
-            }
-
-            var body = new StringBuilder();
-            body.AppendLine("// <auto-generated> Generated by App (Nexus) editor. Do not edit by hand. </auto-generated>");
-            body.AppendLine($"namespace {AppPaths.GenNamespace}");
-            body.AppendLine("{");
-            body.AppendLine($"    public static partial class {AppPaths.NameFileName}");
-            body.AppendLine("    {");
-
-            for (int i = 0; i < classes.Count; i++)
-            {
-                var (cname, members) = classes[i];
-                body.AppendLine($"        public static class {cname}");
-                body.AppendLine("        {");
-                foreach (var (ident, value) in members)
-                    body.AppendLine($"            public const string {ident} = \"{Escape(value)}\";");
-                body.AppendLine("        }");
-                if (i < classes.Count - 1) body.AppendLine();
-            }
-
-            body.AppendLine("    }");
-            body.AppendLine("}");
-
-            if (!TryWrite(AppPaths.NameFileName, body.ToString(), out var path, out var err))
-            {
-                log.AppendLine("Names: write failed — " + err);
-                return false;
-            }
-
-            var note = new StringBuilder();
-            note.Append($"Names: {classes.Count} class(es), {totalMembers} element(s) -> {path}");
-            if (skippedUnnamed > 0) note.Append($"; {skippedUnnamed} marked element(s) without name skipped");
-            if (pagesEmpty     > 0) note.Append($"; {pagesEmpty} page(s) with no marked elements");
-            if (badUxml        > 0) note.Append($"; {badUxml} UXML unreadable");
-            log.AppendLine(note.ToString());
-            return true;
-        }
-
-        // Элементы с class содержащим "generate-link"; возвращаем (name, name). Без name — считаем и пропускаем.
-        private static List<(string name, string value)> ExtractGenerateLinks(string uxml, ref int skippedUnnamed)
-        {
-            var result = new List<(string, string)>();
-            if (string.IsNullOrEmpty(uxml)) return result;
-
-            var doc = XDocument.Parse(uxml, LoadOptions.None);
-            foreach (var el in doc.Descendants())
-            {
-                var cls = (string)el.Attribute("class");
-                if (string.IsNullOrEmpty(cls)) continue;
-
-                bool marked = cls.Split(WS, StringSplitOptions.RemoveEmptyEntries)
-                                 .Any(t => t == GenerateLinkClass);
-                if (!marked) continue;
-
-                var name = (string)el.Attribute("name");
-                if (string.IsNullOrWhiteSpace(name)) { skippedUnnamed++; continue; }
-                result.Add((name.Trim(), name.Trim()));
-            }
-            return result;
-        }
-
-        // ============================================================ скан сцены (общий для имён и графа)
-
-        private readonly struct GenSource
-        {
-            public readonly string id;
-            public readonly bool   isPopup;
-            public readonly string uxmlText;
-            public readonly string uxmlPath;
-            public readonly bool   uxmlMissing;
-
-            public GenSource(string id, bool isPopup, string text, string path, bool missing)
-            { this.id = id; this.isPopup = isPopup; uxmlText = text; uxmlPath = path; uxmlMissing = missing; }
-        }
-
-        // true + sources — компоненты найдены; false + error — поломка; false + error==null — AppRunner/детей нет.
-        private bool ScanComponentsForNames(out List<GenSource> sources, out string error)
-        {
-            sources = new List<GenSource>();
-            error   = null;
-
-            var tRunner = ResolveType("Exerussus.AppCore.AppRunner");
-            var tPage   = ResolveType("Exerussus.AppCore.Views.AppPage");
-            var tPopup  = ResolveType("Exerussus.AppCore.Views.AppPopup");
-
-            if (tRunner == null) { error = "type 'AppRunner' not found"; return false; }
-            if (tPage == null && tPopup == null) { error = "neither 'AppPage' nor 'AppPopup' type found"; return false; }
-
-            var runners = UnityEngine.Object.FindObjectsByType(tRunner, FindObjectsInactive.Include);
-            if (runners == null || runners.Length == 0) return false;          // AppRunner нет
-            if (runners[0] is not Component runner) { error = "AppRunner is not a Component"; return false; }
-
-            var pages  = tPage  != null ? runner.GetComponentsInChildren(tPage,  true) : Array.Empty<Component>();
-            var popups = tPopup != null ? runner.GetComponentsInChildren(tPopup, true) : Array.Empty<Component>();
-
-            foreach (var c in pages)  AddGenSource(sources, c, false);
-            foreach (var c in popups) AddGenSource(sources, c, true);
-
-            return sources.Count > 0;
-        }
-
-        private static void AddGenSource(List<GenSource> list, Component c, bool isPopup)
-        {
-            if (c == null) return;
-            var id  = (ReadStringField(c, isPopup ? "popupId" : "pageId") ?? "").Trim();
-            var vta = ReadVisualTree(c);
-
-            if (vta == null) { list.Add(new GenSource(id, isPopup, null, null, true)); return; }
-
-            var path = AssetDatabase.GetAssetPath(vta);
-            string text = null;
-            try { if (!string.IsNullOrEmpty(path)) text = File.ReadAllText(path); }
-            catch { /* unreadable */ }
-
-            list.Add(new GenSource(id, isPopup, text, path, string.IsNullOrEmpty(text)));
-        }
-
-        // Рефлексия-хелперы сцены (ResolveType / ReadStringField / ReadVisualTree)
-        // определены в AppPage.Graph.cs — общие для скана имён и графа (кэшированные).
-
         // ============================================================ запись кода
 
         private static bool TryWrite(string fileNameNoExt, string content, out string path, out string error)
@@ -924,20 +717,6 @@ namespace Exerussus.Nexus.Pages.App
         {
             var s = ToTypeIdent(raw);
             return s == "_" || string.IsNullOrEmpty(s) ? "Unnamed" + kind : s;
-        }
-
-        // имя элемента -> const: '-' отбрасывается, '_' СОХРАНЯЕТСЯ (restart-button_easy -> RestartButton_Easy)
-        private static string ToConstIdent(string raw)
-        {
-            var sb = new StringBuilder();
-            bool up = true;
-            foreach (var ch in raw ?? string.Empty)
-            {
-                if (ch == '_') { sb.Append('_'); up = true; }
-                else if (char.IsLetterOrDigit(ch)) { sb.Append(up ? char.ToUpperInvariant(ch) : ch); up = false; }
-                else up = true;
-            }
-            return EnsureValidIdent(sb.ToString());
         }
 
         private static string EnsureValidIdent(string s)

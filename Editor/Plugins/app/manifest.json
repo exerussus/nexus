@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "0a1f7c4e9b2d4f6a8c3e5d7b1a9f0e22",
   "id": "app",
-  "version": "1.0",
+  "version": "1.1",
   "typeName": "Exerussus.Nexus.Pages.App.AppPage",
   "kind": "servicing",
   "display": {
@@ -13,23 +13,75 @@
   },
   "requires": [],
   "packageRequires": [
-    { "name": "com.exerussus.di",       "gitUrl": "https://github.com/exerussus/DI.git",       "version": "1.0.2" },
-    { "name": "com.exerussus.signals",  "gitUrl": "https://github.com/exerussus/signals.git",  "version": "1.0.0" },
-    { "name": "com.exerussus.payloads", "gitUrl": "https://github.com/exerussus/payloads.git",  "version": "1.0.0" },
-    { "name": "com.exerussus.app-core", "gitUrl": "https://github.com/exerussus/app-core.git",  "version": "REPLACE_WITH_TAG" }
+    {
+      "name": "com.exerussus.di",
+      "gitUrl": "https://github.com/exerussus/DI.git",
+      "version": "1.0.2"
+    },
+    {
+      "name": "com.exerussus.signals",
+      "gitUrl": "https://github.com/exerussus/signals.git",
+      "version": "1.0.0"
+    },
+    {
+      "name": "com.exerussus.payloads",
+      "gitUrl": "https://github.com/exerussus/payloads.git",
+      "version": "1.0.0"
+    },
+    {
+      "name": "com.exerussus.app-core",
+      "gitUrl": "https://github.com/exerussus/app-core.git",
+      "version": "REPLACE_WITH_TAG"
+    }
   ],
   "deploy": [
-    { "from": "Exerussus.Nexus.Pages.App.asmdef.txt", "to": "Exerussus.Nexus.Pages.App.asmdef" },
-    { "from": "AppPaths.cs.txt",            "to": "AppPaths.cs" },
-    { "from": "AppPage.cs.txt",             "to": "AppPage.cs" },
-    { "from": "AppPage.Tabs.cs.txt",        "to": "AppPage.Tabs.cs" },
-    { "from": "AppPage.Theme.cs.txt",       "to": "AppPage.Theme.cs" },
-    { "from": "AppPage.Graph.cs.txt",       "to": "AppPage.Graph.cs" },
-    { "from": "AppPage.Generation.cs.txt",  "to": "AppPage.Generation.cs" },
-    { "from": "AppPage.Hooks.cs.txt",       "to": "AppPage.Hooks.cs" },
-    { "from": "AppPage.NavClasses.cs.txt",  "to": "AppPage.NavClasses.cs" },
-    { "from": "AppPage.External.cs.txt",    "to": "AppPage.External.cs" },
-    { "from": "AppControllerGenerator.cs.txt", "to": "AppControllerGenerator.cs" },
-    { "from": "AppPage.uss.txt",            "to": "AppPage.uss" }
+    {
+      "from": "Exerussus.Nexus.Pages.App.asmdef.txt",
+      "to": "Exerussus.Nexus.Pages.App.asmdef"
+    },
+    {
+      "from": "AppPaths.cs.txt",
+      "to": "AppPaths.cs"
+    },
+    {
+      "from": "AppPage.cs.txt",
+      "to": "AppPage.cs"
+    },
+    {
+      "from": "AppPage.Tabs.cs.txt",
+      "to": "AppPage.Tabs.cs"
+    },
+    {
+      "from": "AppPage.Theme.cs.txt",
+      "to": "AppPage.Theme.cs"
+    },
+    {
+      "from": "AppPage.Graph.cs.txt",
+      "to": "AppPage.Graph.cs"
+    },
+    {
+      "from": "AppPage.Generation.cs.txt",
+      "to": "AppPage.Generation.cs"
+    },
+    {
+      "from": "AppPage.Hooks.cs.txt",
+      "to": "AppPage.Hooks.cs"
+    },
+    {
+      "from": "AppPage.NavClasses.cs.txt",
+      "to": "AppPage.NavClasses.cs"
+    },
+    {
+      "from": "AppPage.External.cs.txt",
+      "to": "AppPage.External.cs"
+    },
+    {
+      "from": "AppControllerGenerator.cs.txt",
+      "to": "AppControllerGenerator.cs"
+    },
+    {
+      "from": "AppPage.uss.txt",
+      "to": "AppPage.uss"
+    }
   ]
 }

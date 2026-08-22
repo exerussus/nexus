@@ -16,7 +16,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
     [EditorPage("ecs-world-tracker", "ECS Worlds", PageCategory.Game, order: 20, icon: null)]
     public sealed class EcsWorldTrackerPage : EditorPageBase {
         // ── внешняя развёртка ECS-ядра (обслуживающий footprint вне Nexus) ──
-        const string CoreDirRel = "Exerussus.EcsLite";
+        const string CoreDirRel = "Plugins/Exerussus.EcsLite";
         const string CoreFile = "Exerussus.EcsLite.cs";
         const string CoreSrcAsset = "Exerussus.EcsLite.cs.txt";
         const string LicenseFile = "LICENSE";

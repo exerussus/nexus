@@ -120,7 +120,12 @@ namespace Exerussus.Nexus.Core
         {
             if (!_entries.TryGetValue(id, out var e) || e.Page == null || e.Faulted) return true;
             try { return e.Page.CanClose(); }
-            catch { return true; }   // упавшая на CanClose страница не блокирует выключение
+            catch (Exception ex)
+            {
+                // упавшая на CanClose страница не блокирует выключение
+                NexusDiagnostics.Swallowed($"CanClose страницы '{id}'", ex);
+                return true;
+            }
         }
 
         /// <summary>Свернуть и дать последний шанс сбросить данные ПЕРЕД упаковкой/рекомпилом.
@@ -204,7 +209,7 @@ namespace Exerussus.Nexus.Core
             {
                 e.Faulted = true;
                 e.Error   = $"{what}: {ex.Message}";
-                Debug.LogError($"[Nexus] Страница '{id}' упала в {what}: {ex}");
+                NexusDiagnostics.Error($"Страница '{id}' упала в {what}", ex);
                 _status?.Invoke($"Страница «{id}» упала: {what}", StatusKind.Error);
             }
         }
@@ -213,7 +218,7 @@ namespace Exerussus.Nexus.Core
         {
             e.Faulted = true;
             e.Error   = error;
-            Debug.LogError($"[Nexus] Страница не загрузилась: {error}");
+            NexusDiagnostics.Error("Страница не загрузилась", error);
             return null;
         }
 
@@ -221,7 +226,7 @@ namespace Exerussus.Nexus.Core
         {
             if (e?.Page == null) return;
             try { e.Page.OnDispose(); }
-            catch (Exception ex) { Debug.LogError($"[Nexus] OnDispose упал: {ex.Message}"); }
+            catch (Exception ex) { NexusDiagnostics.Error("OnDispose упал", ex); }
         }
     }
 }

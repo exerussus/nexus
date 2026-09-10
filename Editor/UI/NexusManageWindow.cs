@@ -113,6 +113,14 @@ namespace Exerussus.Nexus.UI
             _pending = new Label("нет изменений") { style = { flexGrow = 1f, color = TextDim } };
             bar.Add(_pending);
 
+            // подробное логирование: показывать проглоченные ошибки, стеки и ход работы
+            var verbose = new Toggle("Подробные ошибки") { value = NexusDiagnosticsStore.Verbose };
+            verbose.tooltip = "Логировать все ошибки (включая штатно подавленные), со стеками и ходом работы. " +
+                              "Личная настройка, переживает рекомпил.";
+            verbose.style.marginRight = 8f;
+            verbose.RegisterValueChangedCallback(e => NexusDiagnosticsStore.Verbose = e.newValue);
+            bar.Add(verbose);
+
             bar.Add(NexusStyles.Button("Revert", Reload));
 
             _apply = NexusStyles.Button("Apply", ApplyChanges);

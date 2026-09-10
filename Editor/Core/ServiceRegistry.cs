@@ -64,8 +64,16 @@ namespace Exerussus.Nexus.Core
             {
                 Type[] types;
                 try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException ex) { types = ex.Types; }
-                catch { continue; }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    NexusDiagnostics.Swallowed($"частично загруженная сборка '{asm.GetName().Name}'", ex);
+                    types = ex.Types;
+                }
+                catch (Exception ex)
+                {
+                    NexusDiagnostics.Swallowed($"сборка '{asm.GetName().Name}' не просканирована", ex);
+                    continue;
+                }
 
                 foreach (var t in types)
                 {

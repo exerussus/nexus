@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Manifests;
 using UnityEditor;
 
@@ -61,7 +62,11 @@ namespace Exerussus.Nexus.Deployment
                 SwapIntoState(m.Id, tmp);
                 return Result.Done($"развёрнут «{m.Id}» (дефолт v{m.Version})");
             }
-            catch (System.Exception ex) { return Fail(tmp, ex.Message); }
+            catch (System.Exception ex)
+            {
+                NexusDiagnostics.Error($"Деплой '{m.Id}' сорвался", ex);
+                return Fail(tmp, ex.Message);
+            }
         }
 
         private static Result DeployFromPreserve(PluginManifest m)
@@ -88,7 +93,11 @@ namespace Exerussus.Nexus.Deployment
                 DeleteDir(preDir);   // сейв распакован в State — старый снапшот больше не нужен
                 return Result.Done($"восстановлен сейв «{m.Id}» (из v{desc.DeployedVersion})");
             }
-            catch (System.Exception ex) { return Fail(tmp, ex.Message); }
+            catch (System.Exception ex)
+            {
+                NexusDiagnostics.Error($"Деплой '{m.Id}' сорвался", ex);
+                return Fail(tmp, ex.Message);
+            }
         }
 
         // --------------------------------------------------------------- undeploy
@@ -123,7 +132,11 @@ namespace Exerussus.Nexus.Deployment
                 DeleteStateAsset(id);
                 return Result.Done($"выключен «{id}» (сейв упакован в Preserve)");
             }
-            catch (System.Exception ex) { return Fail(ptmp, ex.Message); }
+            catch (System.Exception ex)
+            {
+                NexusDiagnostics.Error($"Операция над '{m.Id}' сорвалась", ex);
+                return Fail(ptmp, ex.Message);
+            }
         }
 
         // ---------------------------------------------------------------- restore

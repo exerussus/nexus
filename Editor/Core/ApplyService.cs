@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Deployment;
 using Exerussus.Nexus.Manifests;
 using UnityEditor;
@@ -50,6 +51,7 @@ namespace Exerussus.Nexus.Core
                 var gate = DependencyGate.Check(dp?.Manifest);
                 if (gate.Count > 0)
                 {
+                    NexusDiagnostics.Trace("Gate", $"'{it.Id}' отклонён: {string.Join("; ", gate)}");
                     refusals.Add($"• «{name}»: {string.Join("; ", gate)}");
                     continue;
                 }
@@ -57,6 +59,8 @@ namespace Exerussus.Nexus.Core
                 // нет нужного UPM-пакета → не деплоим сейчас, уводим в двухфазную установку
                 if (DependencyGate.MissingPackages(dp?.Manifest).Count > 0 && dp != null)
                 {
+                    NexusDiagnostics.Trace("Gate",
+                        $"'{it.Id}' ждёт UPM-пакеты: {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest).Select(p => p.Name))}");
                     needsPackages.Add(dp);
                     continue;
                 }

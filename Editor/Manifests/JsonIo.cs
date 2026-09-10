@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using Exerussus.Nexus.Abstractions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using UnityEngine;
@@ -37,7 +38,7 @@ namespace Exerussus.Nexus.Manifests
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[Nexus] Не удалось прочитать '{absolutePath}': {ex.Message}");
+                NexusDiagnostics.Error($"Не удалось прочитать '{absolutePath}'", ex);
                 return null;
             }
         }
@@ -58,7 +59,7 @@ namespace Exerussus.Nexus.Manifests
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[Nexus] Не удалось записать '{absolutePath}': {ex.Message}");
+                NexusDiagnostics.Error($"Не удалось записать '{absolutePath}'", ex);
                 return false;
             }
         }

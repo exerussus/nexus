@@ -45,7 +45,11 @@ namespace Exerussus.Nexus.Abstractions
             for (int i = _tracked.Count - 1; i >= 0; i--)
             {
                 try { _tracked[i]?.Dispose(); }
-                catch { /* отписка не должна ронять освобождение остальных */ }
+                catch (Exception ex)
+                {
+                    // отписка не должна ронять освобождение остальных — но в Verbose видно
+                    NexusDiagnostics.Swallowed("Track.Dispose", ex);
+                }
             }
             _tracked.Clear();
             OnDisposing();

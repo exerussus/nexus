@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Deployment;
 using UnityEditor;
 using UnityEngine;
@@ -66,7 +67,10 @@ namespace Exerussus.Nexus.Core
                     .Where(p => !PackageRegistry.IsResolved(p.Name)).ToList();
                 if (unresolved != null && unresolved.Count > 0)
                 {
-                    stillWaiting.Add(id);   // пакет ещё тянется — ждём следующего reload
+                    // пакет ещё тянется — ждём следующего reload
+                    NexusDiagnostics.Trace("Отложенный деплой",
+                        $"'{id}' ждёт пакеты: {string.Join(", ", unresolved.Select(p => p.Name))}");
+                    stillWaiting.Add(id);
                     continue;
                 }
 

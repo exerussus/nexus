@@ -1,0 +1,218 @@
+// ============================================================
+//  GitInfo.cs — СГЕНЕРИРОВАНО страницей Nexus «Build». Хэш коммита и «грязность» рабочего дерева.
+//
+//  Порядок: сначала git из PATH (точно и умеет проверять грязность);
+//  если git недоступен (частый случай для Unity, запущенного из GUI на
+//  Windows) — чтение .git напрямую: HEAD → refs / packed-refs, с поддержкой
+//  .git-файла (worktree/submodule) и commondir. Грязность без git неизвестна.
+//
+//  Репозиторий ищется ВВЕРХ от корня проекта: вложенные репозитории внутри
+//  Assets (например Assets/Plugins/Exerussus.Nexus/.git) не учитываются.
+// ============================================================
+
+using System;
+using System.Diagnostics;
+using System.IO;
+using UnityEngine;
+
+namespace Exerussus.Builds.Editor
+{
+    internal static class GitInfo
+    {
+        internal struct Snapshot
+        {
+            public bool   HasRepo;     // найден .git выше корня проекта
+            public string Hash;        // укороченный хэш; пусто — хэша нет
+            public string FullHash;
+            public string Branch;
+            public bool   IsDirty;
+            public bool   DirtyKnown;  // false — грязность не проверялась/недоступна
+            public string Source;      // "git" | "files" | "none"
+        }
+
+        private const int GitTimeoutMs = 5000;
+
+        public static string ProjectRoot => Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+
+        public static Snapshot Read(int hashLength, bool checkDirty)
+        {
+            var s = new Snapshot { Hash = "", FullHash = "", Branch = "", Source = "none" };
+
+            var repoRoot = FindRepoRoot(ProjectRoot);
+            if (repoRoot == null) return s;
+            s.HasRepo = true;
+
+            if (TryRun(repoRoot, "rev-parse HEAD", out var full) && IsHash(full))
+            {
+                s.FullHash = full;
+                s.Source   = "git";
+                if (TryRun(repoRoot, "rev-parse --abbrev-ref HEAD", out var branch)) s.Branch = branch;
+                if (checkDirty && TryRun(repoRoot, "status --porcelain --untracked-files=no", out var status))
+                {
+                    s.DirtyKnown = true;
+                    s.IsDirty    = status.Length > 0;
+                }
+            }
+            else if (TryReadFiles(repoRoot, out full, out var branch))
+            {
+                s.FullHash = full;
+                s.Branch   = branch;
+                s.Source   = "files";
+            }
+            else
+            {
+                // репозиторий есть, но коммитов нет (или .git повреждён)
+                return s;
+            }
+
+            s.Hash = Shorten(s.FullHash, hashLength);
+            return s;
+        }
+
+        public static string Shorten(string hash, int length)
+        {
+            if (string.IsNullOrEmpty(hash)) return "";
+            length = Mathf.Clamp(length, 4, 40);
+            return hash.Length <= length ? hash : hash.Substring(0, length);
+        }
+
+        // ------------------------------------------------------------ поиск репозитория
+
+        private static string FindRepoRoot(string start)
+        {
+            var dir = new DirectoryInfo(start);
+            while (dir != null)
+            {
+                var git = Path.Combine(dir.FullName, ".git");
+                if (Directory.Exists(git) || File.Exists(git)) return dir.FullName;
+                dir = dir.Parent;
+            }
+            return null;
+        }
+
+        // ------------------------------------------------------------ git из PATH
+
+        private static bool TryRun(string workDir, string args, out string output)
+        {
+            output = "";
+            try
+            {
+                var psi = new ProcessStartInfo("git", args)
+                {
+                    WorkingDirectory       = workDir,
+                    UseShellExecute        = false,
+                    CreateNoWindow         = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError  = true,
+                };
+                using (var p = Process.Start(psi))
+                {
+                    if (p == null) return false;
+                    var stdout = p.StandardOutput.ReadToEndAsync();
+                    p.StandardError.ReadToEndAsync(); // не даём буферу stderr заблокировать процесс
+                    if (!p.WaitForExit(GitTimeoutMs))
+                    {
+                        try { p.Kill(); } catch { /* процесс уже завершился */ }
+                        return false;
+                    }
+                    if (p.ExitCode != 0) return false;
+                    output = (stdout.Result ?? "").Trim();
+                    return true;
+                }
+            }
+            catch
+            {
+                // git не установлен / не в PATH — уходим на чтение файлов
+                return false;
+            }
+        }
+
+        // ------------------------------------------------------------ чтение .git напрямую
+
+        private static bool TryReadFiles(string repoRoot, out string hash, out string branch)
+        {
+            hash   = "";
+            branch = "";
+            try
+            {
+                var gitDir = Path.Combine(repoRoot, ".git");
+                if (File.Exists(gitDir))
+                {
+                    // .git-файл: «gitdir: <path>» (worktree / submodule)
+                    var line = File.ReadAllText(gitDir).Trim();
+                    if (!line.StartsWith("gitdir:", StringComparison.Ordinal)) return false;
+                    var p = line.Substring("gitdir:".Length).Trim();
+                    gitDir = Path.GetFullPath(Path.IsPathRooted(p) ? p : Path.Combine(repoRoot, p));
+                }
+
+                var commonDir = gitDir;
+                var commonFile = Path.Combine(gitDir, "commondir");
+                if (File.Exists(commonFile))
+                {
+                    var c = File.ReadAllText(commonFile).Trim();
+                    commonDir = Path.GetFullPath(Path.IsPathRooted(c) ? c : Path.Combine(gitDir, c));
+                }
+
+                var headFile = Path.Combine(gitDir, "HEAD");
+                if (!File.Exists(headFile)) return false;
+                var head = File.ReadAllText(headFile).Trim();
+
+                if (head.StartsWith("ref:", StringComparison.Ordinal))
+                {
+                    var refName = head.Substring("ref:".Length).Trim();
+                    branch = refName.StartsWith("refs/heads/", StringComparison.Ordinal)
+                        ? refName.Substring("refs/heads/".Length)
+                        : refName;
+                    hash = ReadLooseRef(gitDir, refName)
+                        ?? ReadLooseRef(commonDir, refName)
+                        ?? ReadPackedRef(commonDir, refName)
+                        ?? "";
+                }
+                else
+                {
+                    hash   = head;   // detached HEAD
+                    branch = "HEAD";
+                }
+
+                return IsHash(hash);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string ReadLooseRef(string dir, string refName)
+        {
+            var path = Path.Combine(dir, refName.Replace('/', Path.DirectorySeparatorChar));
+            return File.Exists(path) ? File.ReadAllText(path).Trim() : null;
+        }
+
+        private static string ReadPackedRef(string dir, string refName)
+        {
+            var packed = Path.Combine(dir, "packed-refs");
+            if (!File.Exists(packed)) return null;
+            foreach (var raw in File.ReadAllLines(packed))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#' || line[0] == '^') continue;
+                var space = line.IndexOf(' ');
+                if (space <= 0) continue;
+                if (string.Equals(line.Substring(space + 1), refName, StringComparison.Ordinal))
+                    return line.Substring(0, space);
+            }
+            return null;
+        }
+
+        private static bool IsHash(string s)
+        {
+            if (string.IsNullOrEmpty(s) || (s.Length != 40 && s.Length != 64)) return false;
+            foreach (var ch in s)
+            {
+                var hex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+                if (!hex) return false;
+            }
+            return true;
+        }
+    }
+}

@@ -1,0 +1,90 @@
+using System;
+using System.IO;
+using System.Threading;
+using Dsl.Ide;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.SalamanderEditor
+{
+    // Хост IDE в редакторе: лог — через NexusDiagnostics, статус — в строку Nexus,
+    // сохранённый файл внутри проекта — точечный ImportAsset (не полный Refresh:
+    // тот перекомпилировал бы чужие правки C# посреди работы), зависший поток
+    // компиляции — Thread.Abort (редактор на Mono это умеет; иначе поток бросается).
+    internal sealed class EditorIdeHost : IIdeHost
+    {
+        private readonly Action<string, StatusKind> _status;
+
+        public EditorIdeHost(Action<string, StatusKind> status) => _status = status;
+
+        public void Log(IdeLogLevel level, string context, string message, Exception ex = null)
+        {
+            string ctx = "salamander-ide/" + context;
+            switch (level)
+            {
+                case IdeLogLevel.Error:
+                    if (ex != null) NexusDiagnostics.Error(ctx, ex);
+                    else NexusDiagnostics.Error(ctx, message);
+                    break;
+                case IdeLogLevel.Warning:
+                    if (ex != null) NexusDiagnostics.Swallowed(ctx + ": " + message, ex);
+                    else NexusDiagnostics.Warn(ctx, message);
+                    break;
+                default:
+                    NexusDiagnostics.Trace(ctx, message + (ex != null ? " — " + ex.Message : ""));
+                    break;
+            }
+        }
+
+        public void OnStatus(string text, IdeStatusKind kind)
+        {
+            var k = kind == IdeStatusKind.Ok ? StatusKind.Ok
+                  : kind == IdeStatusKind.Warning ? StatusKind.Warning
+                  : kind == IdeStatusKind.Error ? StatusKind.Error
+                  : StatusKind.Info;
+            _status?.Invoke(text, k);
+        }
+
+        public void OnFileSaved(string path)
+        {
+            string asset = ToAssetPath(path);
+            if (asset == null) return; // вне Assets/ — импортировать нечего
+            try { AssetDatabase.ImportAsset(asset, ImportAssetOptions.ForceUpdate); }
+            catch (Exception e) { NexusDiagnostics.Swallowed("salamander-ide/import " + asset, e); }
+        }
+
+        public bool SupportsThreads => true;
+
+        public bool TryAbortThread(Thread thread)
+        {
+            if (thread == null || !thread.IsAlive) return true;
+            try
+            {
+#pragma warning disable 618, SYSLIB0006
+                thread.Abort(); // Mono: работает; CoreCLR: PlatformNotSupportedException
+#pragma warning restore 618, SYSLIB0006
+                return true;
+            }
+            catch (PlatformNotSupportedException) { return false; }
+            catch (Exception e)
+            {
+                NexusDiagnostics.Swallowed("salamander-ide/abort", e);
+                return false;
+            }
+        }
+
+        // Путь на диске → "Assets/…" (только внутри папки Assets проекта).
+        internal static string ToAssetPath(string path)
+        {
+            try
+            {
+                string full = Path.GetFullPath(path).Replace('\\', '/');
+                string assets = Path.GetFullPath(Application.dataPath).Replace('\\', '/').TrimEnd('/') + "/";
+                if (!full.StartsWith(assets, StringComparison.OrdinalIgnoreCase)) return null;
+                return "Assets/" + full.Substring(assets.Length);
+            }
+            catch { return null; }
+        }
+    }
+}

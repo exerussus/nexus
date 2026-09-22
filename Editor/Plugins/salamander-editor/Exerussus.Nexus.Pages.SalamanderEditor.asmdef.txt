@@ -4,7 +4,11 @@
     "references": [
         "Exerussus.Nexus.Abstractions",
         "Exerussus.Nexus.Services",
-        "Dsl.Core"
+        "Dsl.Core",
+        "Dsl.Tooling",
+        "Dsl.Unity",
+        "Dsl.Ide",
+        "Dsl.Ide.Unity"
     ],
     "includePlatforms": [ "Editor" ],
     "excludePlatforms": [],

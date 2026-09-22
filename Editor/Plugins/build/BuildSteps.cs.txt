@@ -1,0 +1,181 @@
+// ============================================================
+//  BuildSteps.cs — контракт пре-/пост-процессов сборки.
+//
+//  Как добавить шаг: создать в этой странице класс, унаследовать
+//  BuildStep<TSettings> и пометить [BuildStep(id, name, stage)]. Страница найдёт
+//  его сама (TypeCache), покажет в пайплайне каждого профиля, сохранит порядок,
+//  вкл/выкл и настройки (JSON) в build-config.json.
+//
+//  Правила шага:
+//  • Execute бросает исключение при ошибке — сборка/пайплайн останавливается,
+//    в историю пишется, какой шаг упал.
+//  • Pre-шаги выполняются после активации профиля, до BuildPlayer.
+//    Post-шаги — только после УСПЕШНОГО билда.
+//  • Настройки — [Serializable]-класс с публичными полями (JsonUtility).
+//  • Состояние между вызовами не хранить: экземпляр создаётся заново.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Build.Reporting;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    internal enum BuildStage
+    {
+        Pre  = 0,
+        Post = 1,
+    }
+
+    [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+    internal sealed class BuildStepAttribute : Attribute
+    {
+        public string     Id          { get; }
+        public string     Name        { get; }
+        public BuildStage Stage       { get; }
+        public string     Description { get; set; } = "";
+
+        public BuildStepAttribute(string id, string name, BuildStage stage)
+        {
+            Id    = id;
+            Name  = name;
+            Stage = stage;
+        }
+    }
+
+    internal interface IBuildStep
+    {
+        object        LoadSettings(string json);
+        string        SaveSettings(object settings);
+        VisualElement BuildSettingsUI(object settings, Action changed, IPageUi ui);
+        void          Execute(BuildStepContext context, object settings);
+    }
+
+    /// <summary>База шага с типизированными настройками.</summary>
+    internal abstract class BuildStep<TSettings> : IBuildStep where TSettings : class, new()
+    {
+        public object LoadSettings(string json)
+        {
+            var s = new TSettings();
+            if (!string.IsNullOrEmpty(json))
+            {
+                try { JsonUtility.FromJsonOverwrite(json, s); }
+                catch (Exception ex) { NexusDiagnostics.Swallowed("Build: настройки шага", ex); }
+            }
+            return s;
+        }
+
+        public string SaveSettings(object settings) => JsonUtility.ToJson(settings);
+
+        public VisualElement BuildSettingsUI(object settings, Action changed, IPageUi ui)
+            => BuildSettingsUI((TSettings)settings, changed, ui);
+
+        public void Execute(BuildStepContext context, object settings)
+            => Execute(context, (TSettings)settings);
+
+        /// <summary>UI настроек (null — настроек нет). После правки вызвать changed().</summary>
+        protected virtual VisualElement BuildSettingsUI(TSettings settings, Action changed, IPageUi ui) => null;
+
+        protected abstract void Execute(BuildStepContext context, TSettings settings);
+    }
+
+    /// <summary>Всё, что шаг знает о текущей сборке.</summary>
+    internal sealed class BuildStepContext
+    {
+        public BuildStage  Stage;
+        public string      ProfileName     = "";
+        public BuildTarget Target;
+        public string      ProductName     = "";
+        public string      Version         = "";
+        public string      CommitHash      = "";   // пусто — git не найден
+        public bool        IsDirty;
+        public bool        Development;
+
+        /// <summary>locationPathName билда: файл (.exe/.apk/.app) или папка (WebGL/iOS).</summary>
+        public string OutputPath = "";
+
+        /// <summary>Папка сборки (корень, который упаковывается/публикуется).</summary>
+        public string OutputDirectory = "";
+
+        /// <summary>Билд — один самодостаточный файл (.apk/.aab). Для Windows .exe — false:
+        /// рядом лежат _Data, UnityPlayer.dll и пр., поставляется вся папка.</summary>
+        public bool OutputIsSingleFile;
+
+        /// <summary>Отчёт Unity; есть только у Post-шагов.</summary>
+        public BuildReport Report;
+
+        /// <summary>Файлы, созданные шагами (zip и т.п.) — попадают в историю.</summary>
+        public readonly List<string> Artifacts = new List<string>();
+
+        public readonly List<string> LogLines = new List<string>();
+
+        public void Log(string message)
+        {
+            LogLines.Add(message);
+            Debug.Log($"[Build] {message}");
+        }
+    }
+
+    /// <summary>Найденный шаг: метаданные + экземпляр.</summary>
+    internal sealed class StepDescriptor
+    {
+        public BuildStepAttribute Meta;
+        public IBuildStep         Step;
+    }
+
+    internal static class BuildStepRegistry
+    {
+        /// <summary>Все шаги страницы (без кэша — TypeCache и так быстрый).</summary>
+        public static List<StepDescriptor> All()
+        {
+            var list = new List<StepDescriptor>();
+            foreach (var type in TypeCache.GetTypesWithAttribute<BuildStepAttribute>())
+            {
+                if (type.IsAbstract || !typeof(IBuildStep).IsAssignableFrom(type)) continue;
+                var meta = (BuildStepAttribute)Attribute.GetCustomAttribute(type, typeof(BuildStepAttribute));
+                if (meta == null || string.IsNullOrEmpty(meta.Id)) continue;
+                try
+                {
+                    list.Add(new StepDescriptor { Meta = meta, Step = (IBuildStep)Activator.CreateInstance(type) });
+                }
+                catch (Exception ex)
+                {
+                    NexusDiagnostics.Error($"Build: шаг {type.FullName} не создаётся", ex);
+                }
+            }
+            list.Sort((a, b) => string.CompareOrdinal(a.Meta.Id, b.Meta.Id));
+            return list;
+        }
+
+        public static StepDescriptor Find(List<StepDescriptor> all, string id)
+        {
+            foreach (var d in all)
+                if (d.Meta.Id == id) return d;
+            return null;
+        }
+
+        /// <summary>
+        /// Синхронизировать пайплайн профиля с найденными шагами: новые шаги
+        /// дописываются выключенными в конец. Неизвестные записи НЕ удаляются
+        /// (шаг мог временно пропасть) — их показывает UI. true — были изменения.
+        /// </summary>
+        public static bool Sync(ProfilePipeline pipeline, List<StepDescriptor> all)
+        {
+            var changed = false;
+            foreach (var d in all)
+            {
+                var exists = false;
+                foreach (var e in pipeline.steps)
+                    if (e.id == d.Meta.Id) { exists = true; break; }
+                if (exists) continue;
+                pipeline.steps.Add(new StepEntry { id = d.Meta.Id, enabled = false });
+                changed = true;
+            }
+            return changed;
+        }
+    }
+}

@@ -1,0 +1,265 @@
+// ============================================================
+//  BuildInfoEditor.cs — СГЕНЕРИРОВАНО страницей Nexus «Build» (развёртка BuildInfo).
+//  Ручные правки перезапишет кнопка «Обновить код» на странице.
+//
+//  Редакторная часть BuildInfo. Работает БЕЗ Nexus (в т.ч. в CI через -executeMethod
+//  и при сборке из File → Build): любой билд получает правильный штамп.
+//
+//  • Штамп: перед билдом пишет в ассет версию, хэш, префикс/постфикс, профиль.
+//  • Откат: после билда — IPostprocessBuildWithReport; если билд упал (postprocess
+//    не вызывается) — первый тик редактора после билда; если редактор упал — при
+//    следующей загрузке. Инвариант: вне билда ассет ВСЕГДА в «editor-play-mode».
+//  • Play Mode: версия и хэш отдаются через BuildInfo.EditorProvider из SessionState,
+//    в ассет не пишутся; при выходе из Play Mode очищаются.
+//  • Бутстрап: если ассета в Resources нет — создаёт пустой.
+//
+//  Настройки (префикс/постфикс/длина хэша) — build-config.json рядом с этим файлом;
+//  его пишет страница Build.
+// ============================================================
+
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEditor.Build;
+using UnityEditor.Build.Profile;
+using UnityEditor.Build.Reporting;
+using UnityEditor.Compilation;
+using UnityEngine;
+
+namespace Exerussus.Builds.Editor
+{
+    /// <summary>Часть build-config.json, нужная развёртке (остальные поля — страницы Build).</summary>
+    [Serializable]
+    internal sealed class BuildInfoSettings
+    {
+        public string prefix     = "";
+        public string postfix    = "";
+        public int    hashLength = 7;
+        public bool   markDirty  = true;
+
+        public const string RuntimeAssembly = "Exerussus.BuildInfo";
+        public const string EditorAssembly  = "Exerussus.BuildInfo.Editor";
+        public const string ConfigFileName  = "build-config.json";
+
+        public static string RuntimeDir => AsmdefDir(RuntimeAssembly);
+        public static string EditorDir  => AsmdefDir(EditorAssembly);
+
+        public static BuildInfoSettings Load()
+        {
+            var settings = new BuildInfoSettings();
+            try
+            {
+                var dir = EditorDir;
+                if (dir == null) return settings;
+                var path = Path.Combine(dir, ConfigFileName);
+                if (File.Exists(path)) JsonUtility.FromJsonOverwrite(File.ReadAllText(path), settings);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[BuildInfo] Не удалось прочитать {ConfigFileName}: {ex.Message}");
+            }
+            return settings;
+        }
+
+        private static string AsmdefDir(string assembly)
+        {
+            var path = CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(assembly);
+            if (string.IsNullOrEmpty(path)) return null;
+            return Path.GetDirectoryName(path)?.Replace('\\', '/');
+        }
+    }
+
+    /// <summary>Поиск/создание/сохранение ассета BuildInfo.</summary>
+    internal static class BuildInfoAssets
+    {
+        public static string ExpectedPath
+        {
+            get
+            {
+                var root = BuildInfoSettings.RuntimeDir;
+                return root == null ? null : $"{root}/Resources/{BuildInfo.ResourceName}.asset";
+            }
+        }
+
+        public static BuildInfo Find()
+        {
+            var path = ExpectedPath;
+            return path == null ? null : AssetDatabase.LoadAssetAtPath<BuildInfo>(path);
+        }
+
+        public static BuildInfo Ensure()
+        {
+            var existing = Find();
+            if (existing != null) return existing;
+
+            var path = ExpectedPath;
+            if (path == null) return null;
+
+            var folder = Path.GetDirectoryName(path)?.Replace('\\', '/');
+            EnsureFolder(folder);
+
+            var info = ScriptableObject.CreateInstance<BuildInfo>();
+            info.EditorReset();
+            AssetDatabase.CreateAsset(info, path);
+            AssetDatabase.SaveAssets();
+            Debug.Log($"[BuildInfo] Создан ассет {path}");
+            return info;
+        }
+
+        public static void Save(BuildInfo info)
+        {
+            EditorUtility.SetDirty(info);
+            AssetDatabase.SaveAssetIfDirty(info);
+        }
+
+        private static void EnsureFolder(string folder)
+        {
+            if (string.IsNullOrEmpty(folder) || AssetDatabase.IsValidFolder(folder)) return;
+            var parent = Path.GetDirectoryName(folder)?.Replace('\\', '/');
+            EnsureFolder(parent);
+            AssetDatabase.CreateFolder(parent, Path.GetFileName(folder));
+        }
+    }
+
+    /// <summary>Штамп и откат ассета вокруг билда.</summary>
+    internal static class BuildInfoStamp
+    {
+        public static void Stamp(BuildTarget target)
+        {
+            var info = BuildInfoAssets.Ensure();
+            if (info == null)
+            {
+                Debug.LogWarning("[BuildInfo] Ассет не найден и не может быть создан — штамп пропущен.");
+                return;
+            }
+
+            var settings = BuildInfoSettings.Load();
+            var git      = GitInfo.Read(settings.hashLength, settings.markDirty);
+            var profile  = BuildProfile.GetActiveBuildProfile();
+
+            info.EditorStamp(
+                PlayerSettings.bundleVersion,
+                git.Hash,
+                git.IsDirty,
+                settings.prefix,
+                settings.postfix,
+                profile != null ? profile.name : "",
+                target.ToString(),
+                DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+            BuildInfoAssets.Save(info);
+
+            // Упавший билд не вызывает postprocess — откатим на первом тике после билда.
+            EditorApplication.update -= WaitBuildEnd;
+            EditorApplication.update += WaitBuildEnd;
+
+            Debug.Log($"[BuildInfo] Штамп билда: {info.FullVersion}");
+        }
+
+        public static void Revert()
+        {
+            var info = BuildInfoAssets.Find();
+            if (info == null || !info.IsStamped) return;
+            info.EditorReset();
+            BuildInfoAssets.Save(info);
+        }
+
+        private static void WaitBuildEnd()
+        {
+            if (BuildPipeline.isBuildingPlayer) return;
+            EditorApplication.update -= WaitBuildEnd;
+            Revert();
+        }
+    }
+
+    /// <summary>Хуки пайплайна сборки Unity.</summary>
+    internal sealed class BuildInfoBuildHooks : IPreprocessBuildWithReport, IPostprocessBuildWithReport
+    {
+        // Рано: чтобы остальные препроцессоры уже видели проштампованный ассет.
+        public int callbackOrder => -1000;
+
+        public void OnPreprocessBuild(BuildReport report)  => BuildInfoStamp.Stamp(report.summary.platform);
+        public void OnPostprocessBuild(BuildReport report) => BuildInfoStamp.Revert();
+    }
+
+    /// <summary>Значения BuildInfo в Play Mode редактора: живут в SessionState, не в ассете.</summary>
+    internal static class BuildInfoPlayMode
+    {
+        private const string KeyOn      = "Exerussus.BuildInfo.PlayMode.On";
+        private const string KeyVersion = "Exerussus.BuildInfo.PlayMode.Version";
+        private const string KeyHash    = "Exerussus.BuildInfo.PlayMode.Hash";
+        private const string KeyDirty   = "Exerussus.BuildInfo.PlayMode.Dirty";
+
+        // Кэш на один домен; SessionState переживает перезагрузку домена при входе в Play Mode.
+        private static BuildInfo.EditorValues? _cache;
+
+        public static BuildInfo.EditorValues? Provide()
+        {
+            if (_cache.HasValue) return _cache;
+            if (!SessionState.GetBool(KeyOn, false)) return null;
+            _cache = new BuildInfo.EditorValues
+            {
+                Version    = SessionState.GetString(KeyVersion, ""),
+                CommitHash = SessionState.GetString(KeyHash, ""),
+                IsDirty    = SessionState.GetBool(KeyDirty, false),
+            };
+            return _cache;
+        }
+
+        public static void OnPlayModeChanged(PlayModeStateChange state)
+        {
+            switch (state)
+            {
+                case PlayModeStateChange.ExitingEditMode:
+                {
+                    var settings = BuildInfoSettings.Load();
+                    var git      = GitInfo.Read(settings.hashLength, settings.markDirty);
+                    SessionState.SetString(KeyVersion, PlayerSettings.bundleVersion);
+                    SessionState.SetString(KeyHash, git.Hash);
+                    SessionState.SetBool(KeyDirty, git.IsDirty);
+                    SessionState.SetBool(KeyOn, true);
+                    _cache = null;
+                    BuildInfo.EditorResetCache();
+                    break;
+                }
+                case PlayModeStateChange.EnteredEditMode:
+                    SessionState.EraseBool(KeyOn);
+                    SessionState.EraseString(KeyVersion);
+                    SessionState.EraseString(KeyHash);
+                    SessionState.EraseBool(KeyDirty);
+                    _cache = null;
+                    BuildInfo.EditorResetCache();
+                    break;
+            }
+        }
+    }
+
+    [InitializeOnLoad]
+    internal static class BuildInfoEditorBootstrap
+    {
+        static BuildInfoEditorBootstrap()
+        {
+            BuildInfo.EditorProvider = BuildInfoPlayMode.Provide;
+            EditorApplication.playModeStateChanged -= BuildInfoPlayMode.OnPlayModeChanged;
+            EditorApplication.playModeStateChanged += BuildInfoPlayMode.OnPlayModeChanged;
+            EditorApplication.delayCall += EnsureEditorState;
+        }
+
+        // Ассет существует и не проштампован (восстановление после сбоя билда/редактора).
+        private static void EnsureEditorState()
+        {
+            if (BuildPipeline.isBuildingPlayer || EditorApplication.isPlayingOrWillChangePlaymode) return;
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                EditorApplication.delayCall += EnsureEditorState;
+                return;
+            }
+
+            var info = BuildInfoAssets.Ensure();
+            if (info != null && info.IsStamped)
+            {
+                BuildInfoStamp.Revert();
+                Debug.Log("[BuildInfo] Ассет был проштампован вне билда — откат к «editor-play-mode».");
+            }
+        }
+    }
+}

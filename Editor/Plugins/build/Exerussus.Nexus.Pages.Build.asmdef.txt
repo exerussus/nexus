@@ -1,0 +1,18 @@
+{
+    "name": "Exerussus.Nexus.Pages.Build",
+    "rootNamespace": "Exerussus.Nexus.Pages.Build",
+    "references": [
+        "Exerussus.Nexus.Abstractions"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

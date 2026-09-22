@@ -1,0 +1,161 @@
+// ============================================================
+//  BuildConfig.cs — данные страницы Build.
+//
+//  Два владельца, два места:
+//  • BuildConfig — ОБЩИЕ для команды настройки (пайплайны по профилям, шаблон пути,
+//    префикс/постфикс…). Лежат в развёртке: <root>/Editor/build-config.json
+//    (коммитится вместе с развёрткой BuildInfo, её же читает редакторная часть).
+//  • BuildPrefs — ЛИЧНЫЕ (выбранный профиль, Development, вкладка) → UserSettings
+//    через Context.GetUserConfigPath. История сборок — там же (history.json).
+//
+//  JsonUtility: формат наш и плоский; развёртка читает тот же файл своим DTO.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Compilation;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    [Serializable]
+    internal sealed class BuildConfig
+    {
+        // 2 — папка сборки больше не зависит от версии (кэш билда переиспользуется)
+        public const int CurrentSchema = 2;
+        public const string DefaultOutputTemplate = "Builds/{profile}/{product}";
+        private const string LegacyOutputTemplate = "Builds/{profile}/{version}";
+
+        public int schemaVersion = CurrentSchema;
+
+        // --- BuildInfo (эти поля читает и редакторная часть развёртки) ---
+        public string resourceName = "BuildInfo";
+        public string prefix       = "";
+        public string postfix      = "";
+        public int    hashLength   = 7;
+        public bool   markDirty    = true;
+
+        // --- сборка ---
+        public string outputTemplate           = DefaultOutputTemplate;
+        public bool   restoreProfileAfterBuild = true;
+        public bool   bumpBuildNumbers         = true;
+
+        public List<ProfilePipeline> pipelines = new List<ProfilePipeline>();
+
+        /// <summary>Разовая миграция старого конфига. true — конфиг изменён (нужно сохранить).</summary>
+        public bool Migrate()
+        {
+            if (schemaVersion >= CurrentSchema) return false;
+            // старый дефолт создавал новую папку на каждую версию → кэш сборки терялся
+            if (outputTemplate == LegacyOutputTemplate) outputTemplate = DefaultOutputTemplate;
+            schemaVersion = CurrentSchema;
+            return true;
+        }
+
+        public ProfilePipeline Find(string profileKey)
+        {
+            foreach (var p in pipelines)
+                if (p != null && p.profileKey == profileKey) return p;
+            return null;
+        }
+
+        public ProfilePipeline GetOrCreate(string profileKey)
+        {
+            var p = Find(profileKey);
+            if (p != null) return p;
+            p = new ProfilePipeline { profileKey = profileKey };
+            pipelines.Add(p);
+            return p;
+        }
+    }
+
+    /// <summary>Пайплайн одного профиля: шаги в порядке выполнения.</summary>
+    [Serializable]
+    internal sealed class ProfilePipeline
+    {
+        public string          profileKey = "";
+        public List<StepEntry> steps      = new List<StepEntry>();
+    }
+
+    [Serializable]
+    internal sealed class StepEntry
+    {
+        public string id           = "";
+        public bool   enabled;
+        public string settingsJson = "";
+    }
+
+    /// <summary>Личные настройки страницы (UserSettings).</summary>
+    [Serializable]
+    internal sealed class BuildPrefs
+    {
+        public string selectedProfileKey = "";
+        public bool   development;
+        public bool   cleanBuild;
+        public int    tab;
+        public string pendingRoot = Footprint.DefaultRoot;   // корень развёртки ДО её создания
+    }
+
+    /// <summary>Где лежит развёртка BuildInfo (ищем по asmdef — папку можно перенести).</summary>
+    internal static class Footprint
+    {
+        public const string RuntimeAssembly = "Exerussus.BuildInfo";
+        public const string EditorAssembly  = "Exerussus.BuildInfo.Editor";
+        public const string DefaultRoot     = "Assets/Plugins/BuildInfo";
+        public const string ConfigFileName  = "build-config.json";
+
+        /// <summary>Корень развёрнутого BuildInfo (папка runtime-asmdef) или null.</summary>
+        public static string DeployedRoot()
+        {
+            var path = CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(RuntimeAssembly);
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            return Normalize(Path.GetDirectoryName(path));
+        }
+
+        public static string ConfigPath(string root) => $"{Normalize(root)}/Editor/{ConfigFileName}";
+
+        public static string Normalize(string path)
+            => string.IsNullOrEmpty(path) ? "" : path.Replace('\\', '/').TrimEnd('/');
+    }
+
+    /// <summary>Чтение/запись JSON (запись — только при реальном изменении).</summary>
+    internal static class JsonStore
+    {
+        public static T Load<T>(string path) where T : class, new()
+        {
+            var obj = new T();
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                    JsonUtility.FromJsonOverwrite(File.ReadAllText(path), obj);
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Error($"Build: чтение {path}", ex);
+            }
+            return obj;
+        }
+
+        /// <summary>true — файл создан впервые (нужен импорт в AssetDatabase).</summary>
+        public static bool Save(string path, object obj)
+        {
+            var json    = JsonUtility.ToJson(obj, true) + "\n";
+            var existed = File.Exists(path);
+            if (existed && File.ReadAllText(path) == json) return false;
+
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(path, json);
+            return !existed;
+        }
+
+        /// <summary>Сохранить файл внутри Assets и импортировать при первом создании.</summary>
+        public static void SaveAsset(string assetPath, object obj)
+        {
+            if (Save(assetPath, obj)) AssetDatabase.ImportAsset(assetPath);
+        }
+    }
+}

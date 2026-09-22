@@ -1,0 +1,183 @@
+// ============================================================
+//  BuildInfo.cs — СГЕНЕРИРОВАНО страницей Nexus «Build» (развёртка BuildInfo).
+//  Ручные правки перезапишет кнопка «Обновить код» на странице.
+//
+//  Информация о сборке: версия игры, хэш коммита, префикс/постфикс, профиль.
+//  • В закоммиченном ассете поля ПУСТЫЕ, режим — «editor-play-mode».
+//  • Перед билдом редакторная часть развёртки штампует значения в ассет,
+//    после билда (в т.ч. упавшего) — откатывает обратно к «editor-play-mode».
+//  • В Play Mode редактора версия и хэш подставляются на лету (в ассет НЕ
+//    пишутся) и очищаются при выходе из Play Mode.
+//
+//  Доступ из кода: BuildInfo.Current (ленивая загрузка из Resources).
+// ============================================================
+
+using System;
+using UnityEngine;
+
+namespace Exerussus.Builds
+{
+    public sealed class BuildInfo : ScriptableObject
+    {
+        /// <summary>Имя ассета в Resources (задаётся на странице Build).</summary>
+        public const string ResourceName = "%RESOURCE_NAME%";
+
+        /// <summary>Режим закоммиченного ассета: значения пустые.</summary>
+        public const string EditorMode = "editor-play-mode";
+
+        /// <summary>Режим проштампованного ассета (только на время билда и в самом билде).</summary>
+        public const string BuildMode = "build";
+
+        // Поля пишет только редакторный штамп (в плеере — лишь чтение) → глушим CS0649.
+#pragma warning disable CS0649
+        [SerializeField] private string mode = EditorMode;
+        [SerializeField] private string version = "";
+        [SerializeField] private string commitHash = "";
+        [SerializeField] private bool   isDirty;
+        [SerializeField] private string prefix = "";
+        [SerializeField] private string postfix = "";
+        [SerializeField] private string profile = "";
+        [SerializeField] private string platform = "";
+        [SerializeField] private string buildTimeUtc = "";
+#pragma warning restore CS0649
+
+        private static BuildInfo _current;
+
+        /// <summary>Ассет информации о сборке (null, если его нет в Resources).</summary>
+        public static BuildInfo Current
+        {
+            get
+            {
+                if (_current == null) _current = Resources.Load<BuildInfo>(ResourceName);
+                return _current;
+            }
+        }
+
+        /// <summary>Полная строка версии текущей сборки; без ассета — Application.version.</summary>
+        public static string CurrentFullVersion => Current != null ? Current.FullVersion : Application.version;
+
+        /// <summary>Режим ассета: <see cref="EditorMode"/> или <see cref="BuildMode"/>.</summary>
+        public string Mode => mode;
+
+        /// <summary>true — значения проставлены штампом билда.</summary>
+        public bool IsStamped => mode == BuildMode;
+
+        /// <summary>Версия игры (PlayerSettings.bundleVersion на момент билда).</summary>
+        public string Version
+        {
+            get
+            {
+#if UNITY_EDITOR
+                if (TryEditor(out var e)) return e.Version ?? "";
+#endif
+                return version ?? "";
+            }
+        }
+
+        /// <summary>Укороченный хэш коммита; пусто, если git не найден.</summary>
+        public string CommitHash
+        {
+            get
+            {
+#if UNITY_EDITOR
+                if (TryEditor(out var e)) return e.CommitHash ?? "";
+#endif
+                return commitHash ?? "";
+            }
+        }
+
+        /// <summary>В рабочем дереве были незакоммиченные изменения.</summary>
+        public bool IsDirty
+        {
+            get
+            {
+#if UNITY_EDITOR
+                if (TryEditor(out var e)) return e.IsDirty;
+#endif
+                return isDirty;
+            }
+        }
+
+        public string Prefix       => prefix ?? "";
+        public string Postfix      => postfix ?? "";
+        public string Profile      => profile ?? "";
+        public string Platform     => platform ?? "";
+        public string BuildTimeUtc => buildTimeUtc ?? "";
+
+        /// <summary>Версия с префиксом/постфиксом, без хэша: «beta-1.2.3-rc».</summary>
+        public string DisplayVersion => Prefix + Version + Postfix;
+
+        /// <summary>Полная версия: «beta-1.2.3-rc+a1b2c3d» (и «-dirty», если дерево было грязным).</summary>
+        public string FullVersion
+        {
+            get
+            {
+                var v = DisplayVersion;
+                var h = CommitHash;
+                if (!string.IsNullOrEmpty(h)) v += "+" + h + (IsDirty ? "-dirty" : "");
+                return v;
+            }
+        }
+
+        public override string ToString() => FullVersion;
+
+        // Сброс статики при входе в Play Mode с выключенной перезагрузкой домена.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetStatics() => _current = null;
+
+#if UNITY_EDITOR
+        /// <summary>Значения для Play Mode редактора (в ассет не пишутся).</summary>
+        public struct EditorValues
+        {
+            public string Version;
+            public string CommitHash;
+            public bool   IsDirty;
+        }
+
+        /// <summary>Источник значений Play Mode; выставляется редакторной частью развёртки.</summary>
+        public static Func<EditorValues?> EditorProvider;
+
+        private bool TryEditor(out EditorValues values)
+        {
+            values = default;
+            if (IsStamped || !Application.isPlaying || EditorProvider == null) return false;
+            var v = EditorProvider();
+            if (!v.HasValue) return false;
+            values = v.Value;
+            return true;
+        }
+
+        /// <summary>Штамп перед билдом (вызывает только редакторная часть развёртки).</summary>
+        public void EditorStamp(string version, string commitHash, bool isDirty, string prefix, string postfix,
+                                string profile, string platform, string buildTimeUtc)
+        {
+            mode              = BuildMode;
+            this.version      = version ?? "";
+            this.commitHash   = commitHash ?? "";
+            this.isDirty      = isDirty;
+            this.prefix       = prefix ?? "";
+            this.postfix      = postfix ?? "";
+            this.profile      = profile ?? "";
+            this.platform     = platform ?? "";
+            this.buildTimeUtc = buildTimeUtc ?? "";
+        }
+
+        /// <summary>Откат к пустому «editor-play-mode».</summary>
+        public void EditorReset()
+        {
+            mode         = EditorMode;
+            version      = "";
+            commitHash   = "";
+            isDirty      = false;
+            prefix       = "";
+            postfix      = "";
+            profile      = "";
+            platform     = "";
+            buildTimeUtc = "";
+        }
+
+        /// <summary>Сбросить закэшированную ссылку (после выхода из Play Mode).</summary>
+        public static void EditorResetCache() => _current = null;
+#endif
+    }
+}

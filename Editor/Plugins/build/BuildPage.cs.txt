@@ -1,0 +1,602 @@
+// ============================================================
+//  BuildPage.cs — страница Nexus «Build»: сборка по профилю.
+//
+//  Обслуживающая (servicing) страница: её внешний след — развёртка BuildInfo
+//  (Assets/Plugins/BuildInfo по умолчанию) — потребляется игрой и переживает
+//  выключение страницы. Вкладки:
+//    • Сборка   — версия (Major/Minor/Patch), профиль, запуск (свитч + билд), история;
+//    • Пайплайн — пре-/пост-процессы по профилю (шаги: BuildStep<T> в этой странице);
+//    • BuildInfo — развёртка SO с версией/хэшем + общие настройки.
+//
+//  Данные: общие — build-config.json в развёртке; до развёртки — черновик в
+//  UserSettings; личные — prefs.json/history.json в UserSettings.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Build.Profile;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    [EditorPage("build", "Build", PageCategory.Infrastructure, order: 30, icon: null)]
+    public sealed partial class BuildPage : EditorPageBase
+    {
+        private const string PrefsFile   = "prefs.json";
+        private const string HistoryFile = "history.json";
+        private const string DraftFile   = "draft-config.json";
+
+        private static readonly string[] TabNames = { "Сборка", "Пайплайн", "BuildInfo" };
+
+        // ----------------------------------------------------- данные
+        private BuildPrefs          _prefs;
+        private BuildConfig         _config;
+        private BuildHistory        _history;
+        private List<ProfileOption> _profiles = new List<ProfileOption>();
+        private GitInfo.Snapshot    _git;
+
+        // ----------------------------------------------------- UI
+        private VisualElement                _root;
+        private VisualElement                _tabBar;
+        private ScrollView                   _content;
+        private IVisualElementScheduledItem  _saveItem;
+        private bool                         _configDirty;
+
+        // ============================================================ lifecycle
+
+        protected override void OnInitialize()
+        {
+            BuildRunner.Finished += OnBuildFinished;
+            Track(new Unsubscriber(() => BuildRunner.Finished -= OnBuildFinished));
+        }
+
+        public override VisualElement BuildUI()
+        {
+            _root = new VisualElement();
+            _root.style.flexGrow = 1;
+            _root.style.backgroundColor = Context.Theme.Get(NexusToken.BgHard);
+
+            _tabBar = new VisualElement();
+            _tabBar.style.flexDirection = FlexDirection.Row;
+            _tabBar.style.paddingLeft = _tabBar.style.paddingRight = 8;
+            _tabBar.style.paddingTop = _tabBar.style.paddingBottom = 6;
+            _tabBar.style.backgroundColor = Context.Theme.Get(NexusToken.BgSoft);
+            _tabBar.style.borderBottomWidth = 1;
+            _tabBar.style.borderBottomColor = Context.Theme.Get(NexusToken.Divider);
+            _root.Add(_tabBar);
+
+            _content = new ScrollView(ScrollViewMode.Vertical);
+            _content.style.flexGrow = 1;
+            _content.contentContainer.style.paddingLeft = _content.contentContainer.style.paddingRight = 10;
+            _content.contentContainer.style.paddingTop = 8;
+            _content.contentContainer.style.paddingBottom = 16;
+            _root.Add(_content);
+
+            return _root;
+        }
+
+        public override void OnEnter()
+        {
+            LoadAll();
+            Render();
+        }
+
+        public override void OnRefresh()
+        {
+            LoadAll();
+            Render();
+            Context.SetStatus("Обновлено.", StatusKind.Info);
+        }
+
+        public override void OnExit()    => FlushConfig();
+        public override void OnPrePack() => FlushConfig();
+
+        public override bool CanClose()
+        {
+            if (!BuildRunner.IsBusy) return true;
+            Context.SetStatus("Идёт сборка — страницу нельзя закрыть до её окончания.", StatusKind.Warning);
+            return false;
+        }
+
+        protected override void OnDisposing() => FlushConfig();
+
+        // ============================================================ данные
+
+        private void LoadAll()
+        {
+            _prefs    = JsonStore.Load<BuildPrefs>(Context.GetUserConfigPath(PrefsFile));
+            _config   = JsonStore.Load<BuildConfig>(ConfigPath());
+            if (_config.Migrate()) { _configDirty = true; FlushConfig(); }
+            _history  = JsonStore.Load<BuildHistory>(Context.GetUserConfigPath(HistoryFile));
+            _profiles = BuildProfiles.List();
+            _git      = GitInfo.Read(_config.hashLength, _config.markDirty);
+
+            if (BuildProfiles.Find(_profiles, _prefs.selectedProfileKey) == null)
+                _prefs.selectedProfileKey = PickDefaultProfileKey();
+        }
+
+        /// <summary>Корень развёртки: по asmdef (компилированное состояние), иначе по файлам.</summary>
+        private string DeployedRoot()
+        {
+            var byAsmdef = Footprint.DeployedRoot();
+            if (byAsmdef != null) return byAsmdef;
+            return BuildInfoDeployer.ExistsAt(_prefs?.pendingRoot) ? Footprint.Normalize(_prefs.pendingRoot) : null;
+        }
+
+        /// <summary>Конфиг: в развёртке, если она есть; иначе личный черновик.</summary>
+        private string ConfigPath()
+        {
+            var root = _prefs != null ? DeployedRoot() : Footprint.DeployedRoot();
+            return root != null ? Footprint.ConfigPath(root) : Context.GetUserConfigPath(DraftFile);
+        }
+
+        private string PickDefaultProfileKey()
+        {
+            var active = BuildProfile.GetActiveBuildProfile();
+            if (active != null)
+            {
+                var guid = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(active));
+                if (BuildProfiles.Find(_profiles, guid) != null) return guid;
+            }
+            return ProfileOption.PlatformKey;
+        }
+
+        private ProfileOption SelectedProfile() => BuildProfiles.Find(_profiles, _prefs.selectedProfileKey);
+
+        private void SavePrefs() => JsonStore.Save(Context.GetUserConfigPath(PrefsFile), _prefs);
+
+        /// <summary>Отложенное сохранение общего конфига (ввод текста не пишет файл на каждый символ).</summary>
+        private void RequestConfigSave()
+        {
+            _configDirty = true;
+            if (_root == null) { FlushConfig(); return; }
+            if (_saveItem == null) _saveItem = _root.schedule.Execute(FlushConfig);
+            _saveItem.ExecuteLater(500);
+        }
+
+        private void FlushConfig()
+        {
+            if (!_configDirty || _config == null) return;
+            _configDirty = false;
+            var path = ConfigPath();
+            if (path.StartsWith("Assets/", StringComparison.Ordinal)) JsonStore.SaveAsset(path, _config);
+            else JsonStore.Save(path, _config);
+        }
+
+        // ============================================================ рендер
+
+        private void Render()
+        {
+            if (_root == null || _prefs == null) return;
+            RenderTabs();
+            _content.Clear();
+            switch (Mathf.Clamp(_prefs.tab, 0, TabNames.Length - 1))
+            {
+                case 0:  RenderBuildTab();     break;
+                case 1:  RenderPipelineTab();  break;
+                default: RenderBuildInfoTab(); break;
+            }
+        }
+
+        private void RenderTabs()
+        {
+            _tabBar.Clear();
+            for (var i = 0; i < TabNames.Length; i++)
+            {
+                var index = i;
+                var btn = Context.Ui.Button(i == _prefs.tab ? NexusRole.Primary : NexusRole.Ghost, TabNames[i], () =>
+                {
+                    FlushConfig();
+                    _prefs.tab = index;
+                    SavePrefs();
+                    Render();
+                });
+                btn.style.marginRight = 4;
+                _tabBar.Add(btn);
+            }
+
+            var spacer = new VisualElement();
+            spacer.style.flexGrow = 1;
+            _tabBar.Add(spacer);
+
+            if (BuildRunner.IsPending)
+                _tabBar.Add(Context.Ui.StatusPill(StatusKind.Warning, "ожидание свитча профиля…"));
+        }
+
+        // ============================================================ вкладка «Сборка»
+
+        private void RenderBuildTab()
+        {
+            RenderVersionSection();
+            RenderProfileSection();
+            RenderRunSection();
+            RenderHistorySection();
+        }
+
+        private void RenderVersionSection()
+        {
+            var card = Section("Версия игры", "PlayerSettings.bundleVersion — чистый semver (X.Y.Z); префикс/постфикс задаются во вкладке BuildInfo.");
+
+            var row = Row();
+            var input = Context.Ui.Input(PlayerSettings.bundleVersion, _ => { });
+            input.style.width = 140;
+            input.RegisterCallback<FocusOutEvent>(_ => ApplyVersionInput(input.value));
+            input.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter) ApplyVersionInput(input.value);
+            });
+            row.Add(input);
+            row.Add(Gap(8));
+            row.Add(Btn(NexusRole.Common, "Major +1", () => Bump(BumpKind.Major)));
+            row.Add(Btn(NexusRole.Common, "Minor +1", () => Bump(BumpKind.Minor)));
+            row.Add(Btn(NexusRole.Common, "Patch +1", () => Bump(BumpKind.Patch)));
+            card.Add(row);
+
+            if (!VersionBumper.IsStrictSemver(PlayerSettings.bundleVersion))
+                card.Add(Pill(StatusKind.Warning, "Версия не в формате X.Y.Z — кнопки приведут её к нему."));
+
+            var bumpToggle = new Toggle("Поднимать Android versionCode и iOS buildNumber вместе с версией")
+            {
+                value = _config.bumpBuildNumbers,
+            };
+            bumpToggle.RegisterValueChangedCallback(e => { _config.bumpBuildNumbers = e.newValue; RequestConfigSave(); });
+            card.Add(bumpToggle);
+
+            card.Add(Txt($"Android versionCode: {PlayerSettings.Android.bundleVersionCode}   ·   iOS build: {PlayerSettings.iOS.buildNumber}",
+                NexusToken.TextDim));
+            card.Add(Txt($"В билде BuildInfo: {PreviewFullVersion()}", NexusToken.TextNormal, bold: true));
+
+            if (_git.IsDirty)
+                card.Add(Pill(StatusKind.Warning, "В рабочем дереве незакоммиченные изменения — к хэшу добавится «-dirty»."));
+            else if (!_git.HasRepo)
+                card.Add(Txt("Git-репозиторий не найден — хэш в имя архива и BuildInfo не попадёт.", NexusToken.TextDim));
+        }
+
+        private void ApplyVersionInput(string value)
+        {
+            value = (value ?? "").Trim();
+            if (value == PlayerSettings.bundleVersion) return;
+            if (!VersionBumper.TryParse(value, out _, out _, out _))
+            {
+                Context.SetStatus($"«{value}» — не версия. Ожидается X.Y.Z.", StatusKind.Error);
+                Render();
+                return;
+            }
+            PlayerSettings.bundleVersion = value;
+            AssetDatabase.SaveAssets();
+            Context.SetStatus($"Версия: {value}", StatusKind.Ok);
+            Render();
+        }
+
+        private void Bump(BumpKind kind)
+        {
+            var old  = PlayerSettings.bundleVersion;
+            var next = VersionBumper.Apply(kind, _config.bumpBuildNumbers);
+            Context.SetStatus($"Версия {old} → {next}", StatusKind.Ok);
+            Render();
+        }
+
+        private void RenderProfileSection()
+        {
+            var card = Section("Профиль сборки", "Сборка сама активирует выбранный профиль (со сменой платформы), а после — вернёт прежний, если включено.");
+
+            card.Add(ProfileDropdown());
+
+            var selected = SelectedProfile();
+            card.Add(Txt($"Активен сейчас: {BuildProfiles.ActiveName()}", NexusToken.TextDim));
+
+            if (selected != null)
+            {
+                var scenes = selected.Profile != null ? selected.Profile.GetScenesForBuild() : EditorBuildSettings.scenes;
+                var count = 0;
+                if (scenes != null) foreach (var s in scenes) if (s != null && s.enabled) count++;
+                card.Add(count > 0
+                    ? Txt($"Сцен в сборке: {count}", NexusToken.TextDim)
+                    : Pill(StatusKind.Error, "В профиле нет включённых сцен — сборка не начнётся."));
+            }
+
+            if (_profiles.Count <= 1)
+                card.Add(Txt("Ассетов Build Profile в проекте нет — доступна сборка текущей платформы. Создайте профиль в окне Build Profiles.",
+                    NexusToken.TextDim));
+
+            var row = Row();
+            row.Add(Btn(NexusRole.Common, "Build Profiles…", () => EditorApplication.ExecuteMenuItem("File/Build Profiles")));
+            if (selected?.Profile != null)
+                row.Add(Btn(NexusRole.Ghost, "Показать ассет", () =>
+                {
+                    Selection.activeObject = selected.Profile;
+                    EditorGUIUtility.PingObject(selected.Profile);
+                }));
+            card.Add(row);
+        }
+
+        private DropdownField ProfileDropdown()
+        {
+            var names = new List<string>();
+            var index = 0;
+            for (var i = 0; i < _profiles.Count; i++)
+            {
+                names.Add(_profiles[i].Name);
+                if (_profiles[i].Key == _prefs.selectedProfileKey) index = i;
+            }
+            var dd = new DropdownField("Профиль", names, index);
+            dd.RegisterValueChangedCallback(e =>
+            {
+                var i = names.IndexOf(e.newValue);
+                if (i < 0) return;
+                _prefs.selectedProfileKey = _profiles[i].Key;
+                SavePrefs();
+                Render();
+            });
+            return dd;
+        }
+
+        private void RenderRunSection()
+        {
+            var card = Section("Сборка", null);
+
+            var dev = new Toggle("Development build") { value = _prefs.development };
+            dev.RegisterValueChangedCallback(e => { _prefs.development = e.newValue; SavePrefs(); });
+            card.Add(dev);
+
+            var clean = new Toggle("Clean build (сбросить кэш сборки)") { value = _prefs.cleanBuild };
+            clean.RegisterValueChangedCallback(e => { _prefs.cleanBuild = e.newValue; SavePrefs(); });
+            card.Add(clean);
+
+            var restore = new Toggle("Вернуть исходный профиль после сборки") { value = _config.restoreProfileAfterBuild };
+            restore.RegisterValueChangedCallback(e => { _config.restoreProfileAfterBuild = e.newValue; RequestConfigSave(); });
+            card.Add(restore);
+
+            card.Add(Txt("Папка сборки ({profile} {platform} {product}; относительно проекта). " +
+                         "Папка постоянная — Unity переиспользует кэш прошлой сборки; версия попадает в имя zip.",
+                NexusToken.TextDim));
+            var preview = Txt("", NexusToken.TextFaint);
+            var volatileWarn = Pill(StatusKind.Warning,
+                "В шаблоне {version}/{hash}/{date} — на каждую сборку будет новая папка и кэш не переиспользуется.");
+            void UpdateTemplateHints()
+            {
+                preview.text = "→ " + PreviewOutputDir();
+                volatileWarn.style.display = HasVolatileToken(_config.outputTemplate) ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+            var tpl = Context.Ui.Input(_config.outputTemplate, v =>
+            {
+                _config.outputTemplate = v;
+                RequestConfigSave();
+                UpdateTemplateHints();
+            });
+            card.Add(tpl);
+            card.Add(preview);
+            card.Add(volatileWarn);
+            UpdateTemplateHints();
+
+            card.Add(Txt(PipelineSummary(), NexusToken.TextDim));
+
+            var row = Row();
+            row.style.marginTop = 6;
+            var buildBtn = Btn(NexusRole.Primary, "Собрать", StartBuild);
+            buildBtn.style.minWidth = 140;
+            buildBtn.SetEnabled(!BuildRunner.IsBusy);
+            row.Add(buildBtn);
+            row.Add(Btn(NexusRole.Common, "Открыть папку", () => RevealDir(Path.GetDirectoryName(PreviewOutputDir()))));
+            if (BuildRunner.IsPending)
+                row.Add(Btn(NexusRole.Alarm, "Отменить ожидание", () =>
+                {
+                    BuildRunner.CancelPending();
+                    Context.SetStatus("Отложенная сборка отменена (профиль остался переключённым).", StatusKind.Warning);
+                    Render();
+                }));
+            card.Add(row);
+        }
+
+        private void StartBuild()
+        {
+            FlushConfig();
+            var selected = SelectedProfile();
+            if (selected == null) { Context.SetStatus("Профиль не выбран.", StatusKind.Error); return; }
+
+            var req = new BuildRequest
+            {
+                profileKey     = selected.Key,
+                profilePath    = selected.Path ?? "",
+                configPath     = ConfigPath(),
+                historyPath    = Context.GetUserConfigPath(HistoryFile),
+                development    = _prefs.development,
+                cleanBuild     = _prefs.cleanBuild,
+                restoreProfile = _config.restoreProfileAfterBuild,
+            };
+
+            Context.SetStatus($"Сборка «{selected.Name}»…", StatusKind.Info);
+            var result = BuildRunner.Start(req, out var message);
+            switch (result)
+            {
+                case StartResult.Scheduled: Context.SetStatus(message, StatusKind.Info);    Render(); break;
+                case StartResult.Cancelled: Context.SetStatus("Сборка отменена.", StatusKind.Warning); break;
+                case StartResult.Rejected:  Context.SetStatus(message, StatusKind.Error);   break;
+                // Finished — статус выставит OnBuildFinished
+            }
+        }
+
+        private void OnBuildFinished(BuildHistoryEntry entry)
+        {
+            if (_root == null) return;
+            Context.SetStatus(entry.success
+                    ? $"Собрано: {entry.profile} {entry.version} за {entry.seconds} с. {entry.message}"
+                    : $"Сборка не удалась: {entry.message}",
+                entry.success ? StatusKind.Ok : StatusKind.Error);
+            LoadAll();
+            Render();
+        }
+
+        private void RenderHistorySection()
+        {
+            var card = Section("Последние сборки", null);
+            if (_history.entries.Count == 0)
+            {
+                card.Add(Txt("Пока пусто.", NexusToken.TextDim));
+                return;
+            }
+
+            var shown = Mathf.Min(8, _history.entries.Count);
+            for (var i = 0; i < shown; i++)
+            {
+                var e = _history.entries[i];
+                var row = Row();
+                row.style.marginTop = 4;
+                row.Add(Context.Ui.StatusPill(e.success ? StatusKind.Ok : StatusKind.Error, e.success ? "OK" : "ошибка"));
+                row.Add(Gap(6));
+
+                var hash = string.IsNullOrEmpty(e.hash) ? "" : $"+{e.hash}{(e.dirty ? "-dirty" : "")}";
+                var size = e.sizeBytes > 0 ? " · " + ZipStep.FormatSize(e.sizeBytes) : "";
+                if (e.zipBytes > 0) size += $" (zip {ZipStep.FormatSize(e.zipBytes)})";
+                var text = new VisualElement();
+                text.style.flexGrow = 1;
+                text.style.flexShrink = 1;
+                text.Add(Txt($"{e.timeLocal} · {e.profile} · {e.version}{hash} · {e.seconds} с{size}"));
+                if (!string.IsNullOrEmpty(e.message)) text.Add(Txt(e.message, NexusToken.TextDim));
+                row.Add(text);
+
+                var target = e.artifacts.Count > 0 ? e.artifacts[0] : e.outputPath;
+                if (!string.IsNullOrEmpty(target) && (File.Exists(target) || Directory.Exists(target)))
+                    row.Add(Btn(NexusRole.Ghost, "Показать", () => EditorUtility.RevealInFinder(target)));
+                card.Add(row);
+            }
+
+            var clear = Btn(NexusRole.Ghost, "Очистить историю", () =>
+            {
+                _history = new BuildHistory();
+                JsonStore.Save(Context.GetUserConfigPath(HistoryFile), _history);
+                Render();
+            });
+            clear.style.alignSelf = Align.FlexStart;
+            clear.style.marginTop = 6;
+            card.Add(clear);
+        }
+
+        // ============================================================ превью
+
+        private BuildStepContext PreviewContext()
+        {
+            var selected = SelectedProfile();
+            return new BuildStepContext
+            {
+                ProfileName = selected?.Profile != null ? selected.Profile.name : EditorUserBuildSettings.activeBuildTarget.ToString(),
+                Target      = EditorUserBuildSettings.activeBuildTarget,
+                ProductName = PlayerSettings.productName,
+                Version     = PlayerSettings.bundleVersion,
+                CommitHash  = _git.Hash,
+                IsDirty     = _git.IsDirty,
+            };
+        }
+
+        private string PreviewOutputDir()
+        {
+            try { return BuildRunner.ResolveOutputDir(_config.outputTemplate, PreviewContext()); }
+            catch (Exception ex) { return "ошибка шаблона: " + ex.Message; }
+        }
+
+        private static bool HasVolatileToken(string template)
+            => !string.IsNullOrEmpty(template) &&
+               (template.Contains("{version}") || template.Contains("{hash}") || template.Contains("{date}"));
+
+        private string PreviewFullVersion()
+        {
+            var v = _config.prefix + PlayerSettings.bundleVersion + _config.postfix;
+            if (!string.IsNullOrEmpty(_git.Hash)) v += "+" + _git.Hash + (_git.IsDirty ? "-dirty" : "");
+            return v;
+        }
+
+        private string PipelineSummary()
+        {
+            var selected = SelectedProfile();
+            var pipeline = selected != null ? _config.Find(selected.Key) : null;
+            var all = BuildStepRegistry.All();
+            var pre = new List<string>();
+            var post = new List<string>();
+            if (pipeline != null)
+                foreach (var e in pipeline.steps)
+                {
+                    if (!e.enabled) continue;
+                    var d = BuildStepRegistry.Find(all, e.id);
+                    var name = d != null ? d.Meta.Name : e.id + " (не найден)";
+                    if (d != null && d.Meta.Stage == BuildStage.Pre) pre.Add(name); else post.Add(name);
+                }
+            return $"Пре-процессы: {(pre.Count > 0 ? string.Join(", ", pre) : "—")}   ·   Пост-процессы: {(post.Count > 0 ? string.Join(", ", post) : "—")}";
+        }
+
+        private static void RevealDir(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return;
+            var d = new DirectoryInfo(dir);
+            while (d != null && !d.Exists) d = d.Parent;
+            if (d != null) EditorUtility.RevealInFinder(d.FullName);
+        }
+
+        // ============================================================ UI helpers
+
+        private VisualElement Section(string title, string hint)
+        {
+            var card = Context.Ui.Card();
+            card.style.marginBottom = 8;
+            card.style.paddingLeft = card.style.paddingRight = 10;
+            card.style.paddingTop = card.style.paddingBottom = 8;
+            card.Add(Txt(title, NexusToken.TextNormal, bold: true, size: 13));
+            if (!string.IsNullOrEmpty(hint)) card.Add(Txt(hint, NexusToken.TextDim));
+            _content.Add(card);
+            return card;
+        }
+
+        private Label Txt(string text, NexusToken token = NexusToken.TextNormal, bool bold = false, int size = 0)
+        {
+            var l = new Label(text);
+            l.style.color = Context.Theme.Get(token);
+            l.style.whiteSpace = WhiteSpace.Normal;
+            l.style.marginTop = 2;
+            if (bold) l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            if (size > 0) l.style.fontSize = size;
+            return l;
+        }
+
+        private VisualElement Pill(StatusKind kind, string text)
+        {
+            var p = Context.Ui.StatusPill(kind, text);
+            p.style.alignSelf = Align.FlexStart;
+            p.style.marginTop = 4;
+            return p;
+        }
+
+        private Button Btn(NexusRole role, string text, Action onClick)
+        {
+            var b = Context.Ui.Button(role, text, onClick);
+            b.style.marginRight = 4;
+            return b;
+        }
+
+        private static VisualElement Row()
+        {
+            var r = new VisualElement();
+            r.style.flexDirection = FlexDirection.Row;
+            r.style.alignItems = Align.Center;
+            r.style.flexWrap = Wrap.Wrap;
+            r.style.marginTop = 4;
+            return r;
+        }
+
+        private static VisualElement Gap(float width)
+        {
+            var g = new VisualElement();
+            g.style.width = width;
+            return g;
+        }
+
+        private sealed class Unsubscriber : IDisposable
+        {
+            private Action _action;
+            public Unsubscriber(Action action) => _action = action;
+            public void Dispose() { _action?.Invoke(); _action = null; }
+        }
+    }
+}

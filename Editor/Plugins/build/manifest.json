@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "guid": "8a0af96cf8af41349314a5ef12499cd0",
+  "id": "build",
+  "version": "1.0",
+  "typeName": "Exerussus.Nexus.Pages.Build.BuildPage",
+  "kind": "servicing",
+  "display": {
+    "name": "Build",
+    "category": "Infrastructure",
+    "order": 30,
+    "icon": null
+  },
+  "requires": [],
+  "packageRequires": [],
+  "deploy": [
+    { "from": "Exerussus.Nexus.Pages.Build.asmdef.txt", "to": "Exerussus.Nexus.Pages.Build.asmdef" },
+    { "from": "BuildPage.cs.txt", "to": "BuildPage.cs" },
+    { "from": "BuildPage.Pipeline.cs.txt", "to": "BuildPage.Pipeline.cs" },
+    { "from": "BuildPage.BuildInfo.cs.txt", "to": "BuildPage.BuildInfo.cs" },
+    { "from": "BuildConfig.cs.txt", "to": "BuildConfig.cs" },
+    { "from": "BuildSteps.cs.txt", "to": "BuildSteps.cs" },
+    { "from": "BuildRunner.cs.txt", "to": "BuildRunner.cs" },
+    { "from": "BuildInfoDeployer.cs.txt", "to": "BuildInfoDeployer.cs" },
+    { "from": "VersionBumper.cs.txt", "to": "VersionBumper.cs" },
+    { "from": "GitInfo.cs.txt", "to": "GitInfo.cs" },
+    { "from": "ZipStep.cs.txt", "to": "ZipStep.cs" },
+    { "from": "Template.Exerussus.BuildInfo.asmdef.txt", "to": "Template.Exerussus.BuildInfo.asmdef.txt" },
+    { "from": "Template.Exerussus.BuildInfo.Editor.asmdef.txt", "to": "Template.Exerussus.BuildInfo.Editor.asmdef.txt" },
+    { "from": "Template.BuildInfo.cs.txt", "to": "Template.BuildInfo.cs.txt" },
+    { "from": "Template.BuildInfoEditor.cs.txt", "to": "Template.BuildInfoEditor.cs.txt" },
+    { "from": "Template.GitInfo.cs.txt", "to": "Template.GitInfo.cs.txt" }
+  ]
+}

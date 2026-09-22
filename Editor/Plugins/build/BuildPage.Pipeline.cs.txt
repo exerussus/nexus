@@ -1,0 +1,154 @@
+// ============================================================
+//  BuildPage.Pipeline.cs — вкладка «Пайплайн»: пре-/пост-процессы по профилю.
+//
+//  У каждого профиля свой список шагов: порядок, вкл/выкл, настройки (JSON).
+//  Новые шаги из кода дописываются в конец выключенными. Запись о шаге,
+//  которого больше нет в коде, не удаляется молча — показывается с кнопкой
+//  «Удалить», а включённая такая запись остановит сборку с понятной ошибкой.
+// ============================================================
+
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    public sealed partial class BuildPage
+    {
+        private void RenderPipelineTab()
+        {
+            var head = Section("Пайплайн профиля",
+                "Пре-процессы выполняются после активации профиля, до билда; пост-процессы — только после успешного билда. " +
+                "Новый шаг = класс BuildStep<T> с атрибутом [BuildStep] в коде этой страницы.");
+            head.Add(ProfileDropdown());
+
+            var selected = SelectedProfile();
+            if (selected == null) return;
+
+            var all      = BuildStepRegistry.All();
+            var pipeline = _config.GetOrCreate(selected.Key);
+            if (BuildStepRegistry.Sync(pipeline, all)) RequestConfigSave();
+
+            RenderStage(pipeline, all, BuildStage.Pre,  "Пре-процессы");
+            RenderStage(pipeline, all, BuildStage.Post, "Пост-процессы");
+            RenderMissingSteps(pipeline, all);
+        }
+
+        private void RenderStage(ProfilePipeline pipeline, List<StepDescriptor> all, BuildStage stage, string title)
+        {
+            var card = Section(title, null);
+            var any = false;
+
+            for (var i = 0; i < pipeline.steps.Count; i++)
+            {
+                var entry = pipeline.steps[i];
+                var d = BuildStepRegistry.Find(all, entry.id);
+                if (d == null || d.Meta.Stage != stage) continue;
+                any = true;
+                card.Add(StepRow(pipeline, all, entry, d));
+            }
+
+            if (!any) card.Add(Txt("Шагов этого типа пока нет.", NexusToken.TextDim));
+        }
+
+        private VisualElement StepRow(ProfilePipeline pipeline, List<StepDescriptor> all, StepEntry entry, StepDescriptor d)
+        {
+            var box = new VisualElement();
+            box.style.marginTop = 6;
+            box.style.paddingTop = 6;
+            box.style.borderTopWidth = 1;
+            box.style.borderTopColor = Context.Theme.Get(NexusToken.Divider);
+
+            var row = Row();
+            var toggle = new Toggle { value = entry.enabled };
+            toggle.RegisterValueChangedCallback(e =>
+            {
+                entry.enabled = e.newValue;
+                RequestConfigSave();
+                Render();
+            });
+            row.Add(toggle);
+            row.Add(Txt(d.Meta.Name, entry.enabled ? NexusToken.TextNormal : NexusToken.TextDim, bold: true));
+
+            var spacer = new VisualElement();
+            spacer.style.flexGrow = 1;
+            row.Add(spacer);
+            row.Add(Btn(NexusRole.Ghost, "↑", () => MoveStep(pipeline, all, entry, -1)));
+            row.Add(Btn(NexusRole.Ghost, "↓", () => MoveStep(pipeline, all, entry, +1)));
+            box.Add(row);
+
+            if (!string.IsNullOrEmpty(d.Meta.Description)) box.Add(Txt(d.Meta.Description, NexusToken.TextDim));
+
+            if (entry.enabled)
+            {
+                var settings = d.Step.LoadSettings(entry.settingsJson);
+                VisualElement ui = null;
+                try
+                {
+                    ui = d.Step.BuildSettingsUI(settings, () =>
+                    {
+                        entry.settingsJson = d.Step.SaveSettings(settings);
+                        RequestConfigSave();
+                    }, Context.Ui);
+                }
+                catch (System.Exception ex)
+                {
+                    NexusDiagnostics.Error($"Build: UI шага {entry.id}", ex);
+                    box.Add(Pill(StatusKind.Error, $"UI настроек шага упал: {ex.Message}"));
+                }
+
+                if (ui != null)
+                {
+                    ui.style.marginLeft = 18;
+                    ui.style.marginTop = 4;
+                    box.Add(ui);
+                }
+            }
+
+            return box;
+        }
+
+        /// <summary>Сдвинуть шаг среди шагов той же стадии (порядок хранится в общем списке).</summary>
+        private void MoveStep(ProfilePipeline pipeline, List<StepDescriptor> all, StepEntry entry, int dir)
+        {
+            var stage = BuildStepRegistry.Find(all, entry.id)?.Meta.Stage;
+            var index = pipeline.steps.IndexOf(entry);
+            if (stage == null || index < 0) return;
+
+            for (var j = index + dir; j >= 0 && j < pipeline.steps.Count; j += dir)
+            {
+                var other = BuildStepRegistry.Find(all, pipeline.steps[j].id);
+                if (other == null || other.Meta.Stage != stage) continue;
+                pipeline.steps[index] = pipeline.steps[j];
+                pipeline.steps[j] = entry;
+                RequestConfigSave();
+                Render();
+                return;
+            }
+        }
+
+        private void RenderMissingSteps(ProfilePipeline pipeline, List<StepDescriptor> all)
+        {
+            var missing = new List<StepEntry>();
+            foreach (var e in pipeline.steps)
+                if (BuildStepRegistry.Find(all, e.id) == null) missing.Add(e);
+            if (missing.Count == 0) return;
+
+            var card = Section("Шаги не найдены в коде", "Записи сохранены в конфиге, но класса шага нет. Включённый ненайденный шаг остановит сборку.");
+            foreach (var e in missing)
+            {
+                var row = Row();
+                row.Add(Context.Ui.StatusPill(e.enabled ? StatusKind.Error : StatusKind.Warning, e.id));
+                row.Add(Gap(6));
+                var captured = e;
+                row.Add(Btn(NexusRole.Alarm, "Удалить", () =>
+                {
+                    pipeline.steps.Remove(captured);
+                    RequestConfigSave();
+                    Render();
+                }));
+                card.Add(row);
+            }
+        }
+    }
+}

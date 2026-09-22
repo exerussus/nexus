@@ -1,0 +1,253 @@
+// ============================================================
+//  BuildInfoDeployer.cs — развёртка BuildInfo ВНЕ Nexus (обслуживающая страница).
+//
+//  Пишет из шаблонов страницы (State/Template.*.txt, инертные) в <root>/:
+//    Exerussus.BuildInfo.asmdef, BuildInfo.cs,
+//    Editor/Exerussus.BuildInfo.Editor.asmdef, Editor/BuildInfoEditor.cs, Editor/GitInfo.cs,
+//    Editor/build-config.json (общие настройки страницы).
+//  Ассет Resources/<name>.asset создаёт сама развёртка после компиляции
+//  (бутстрап в BuildInfoEditor.cs) — страница не ссылается на её типы
+//  (иначе не скомпилировалась бы до первой развёртки).
+//
+//  Выключение страницы развёртку НЕ трогает: её потребляет игра. Удаление —
+//  только явной кнопкой, только наших файлов, с подтверждением.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    internal static class BuildInfoDeployer
+    {
+        internal enum FileState
+        {
+            Missing,
+            Actual,
+            Outdated,
+        }
+
+        internal sealed class FileStatus
+        {
+            public string    Label;
+            public string    Path;
+            public FileState State;
+        }
+
+        private const string ResourcePlaceholder = "%RESOURCE_NAME%";
+
+        // Шаблоны лежат ПЛОСКО рядом с кодом страницы (Template.<имя>.txt): движок Nexus
+        // разворачивает/пакует State без подпапок.
+        private const string TemplatePrefix = "Template.";
+
+        // (шаблон Template.<имя> в State, путь относительно корня развёртки)
+        private static readonly (string template, string target)[] CodeFiles =
+        {
+            ("Exerussus.BuildInfo.asmdef.txt",        "Exerussus.BuildInfo.asmdef"),
+            ("BuildInfo.cs.txt",                      "BuildInfo.cs"),
+            ("Exerussus.BuildInfo.Editor.asmdef.txt", "Editor/Exerussus.BuildInfo.Editor.asmdef"),
+            ("BuildInfoEditor.cs.txt",                "Editor/BuildInfoEditor.cs"),
+            ("GitInfo.cs.txt",                        "Editor/GitInfo.cs"),
+        };
+
+        private static readonly Regex ResourceNameRx = new Regex("ResourceName\\s*=\\s*\"([^\"]*)\"");
+        private static readonly Regex ValidNameRx    = new Regex("^[A-Za-z0-9_\\-]+$");
+
+        public static bool IsValidResourceName(string name) => !string.IsNullOrEmpty(name) && ValidNameRx.IsMatch(name);
+
+        public static bool IsValidRoot(string root)
+        {
+            root = Footprint.Normalize(root);
+            return root.StartsWith("Assets/", StringComparison.Ordinal) && root.IndexOfAny(Path.GetInvalidPathChars()) < 0
+                   && !root.Contains("..");
+        }
+
+        public static string AssetPath(string root, BuildConfig cfg) => $"{Footprint.Normalize(root)}/Resources/{cfg.resourceName}.asset";
+
+        /// <summary>Развёртка есть на диске (хотя бы runtime-asmdef).</summary>
+        public static bool ExistsAt(string root)
+            => !string.IsNullOrEmpty(root) && File.Exists($"{Footprint.Normalize(root)}/{CodeFiles[0].target}");
+
+        // ============================================================ статус
+
+        public static List<FileStatus> Status(IPageContext ctx, string root, BuildConfig cfg, out string error)
+        {
+            error = null;
+            var list = new List<FileStatus>();
+            foreach (var (template, target) in CodeFiles)
+            {
+                var path = $"{Footprint.Normalize(root)}/{target}";
+                var st = new FileStatus { Label = target, Path = path, State = FileState.Missing };
+                if (File.Exists(path))
+                {
+                    var rendered = TryRender(ctx, template, cfg, out var err);
+                    if (rendered == null) { error = err; st.State = FileState.Actual; }
+                    else st.State = Same(File.ReadAllText(path), rendered) ? FileState.Actual : FileState.Outdated;
+                }
+                list.Add(st);
+            }
+            return list;
+        }
+
+        // ============================================================ развернуть / обновить
+
+        /// <summary>Записать код развёртки и конфиг. null — успех, иначе текст ошибки.</summary>
+        public static string Deploy(IPageContext ctx, string root, BuildConfig cfg)
+        {
+            root = Footprint.Normalize(root);
+            if (!IsValidRoot(root))                      return $"Корень должен лежать внутри Assets/: «{root}».";
+            if (!IsValidResourceName(cfg.resourceName))  return "Имя ассета: только латиница, цифры, _ и -.";
+
+            // рендерим всё заранее — либо пишем всё, либо ничего
+            var rendered = new List<(string path, string text)>();
+            foreach (var (template, target) in CodeFiles)
+            {
+                var text = TryRender(ctx, template, cfg, out var err);
+                if (text == null) return err;
+                rendered.Add(($"{root}/{target}", text));
+            }
+
+            // смена имени ассета: переименуем существующий, чтобы не осиротел
+            var oldName = ReadDeployedResourceName(root);
+            var renameError = RenameAssetIfNeeded(root, oldName, cfg.resourceName);
+            if (renameError != null) return renameError;
+
+            var written = 0;
+            try
+            {
+                foreach (var (path, text) in rendered)
+                {
+                    if (File.Exists(path) && Same(File.ReadAllText(path), text)) continue;
+                    Directory.CreateDirectory(Path.GetDirectoryName(path) ?? root);
+                    File.WriteAllText(path, text);
+                    written++;
+                }
+                JsonStore.Save(Footprint.ConfigPath(root), cfg);
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Error("Build: развёртка BuildInfo", ex);
+                return $"Ошибка записи: {ex.Message}";
+            }
+
+            AssetDatabase.Refresh();
+            NexusDiagnostics.Trace("Build", $"BuildInfo: записано файлов {written} в {root}");
+            return null;
+        }
+
+        // ============================================================ удалить
+
+        /// <summary>Пути, которые удалит «Удалить развёртку» (только наши).</summary>
+        public static List<string> OwnedPaths(string root, BuildConfig cfg)
+        {
+            root = Footprint.Normalize(root);
+            var list = new List<string>();
+            foreach (var (_, target) in CodeFiles) list.Add($"{root}/{target}");
+            list.Add(Footprint.ConfigPath(root));
+            var name = ReadDeployedResourceName(root) ?? cfg.resourceName;
+            list.Add($"{root}/Resources/{name}.asset");
+            return list;
+        }
+
+        public static string Remove(string root, BuildConfig cfg)
+        {
+            root = Footprint.Normalize(root);
+            if (!IsValidRoot(root)) return $"Некорректный корень: «{root}».";
+
+            var failed = new List<string>();
+            AssetDatabase.StartAssetEditing();
+            try
+            {
+                foreach (var path in OwnedPaths(root, cfg))
+                {
+                    if (!File.Exists(path)) continue;
+                    if (!AssetDatabase.DeleteAsset(path)) failed.Add(path);
+                }
+            }
+            finally
+            {
+                AssetDatabase.StopAssetEditing();
+            }
+
+            // пустые папки — только наши и только если пусты
+            DeleteFolderIfEmpty($"{root}/Resources");
+            DeleteFolderIfEmpty($"{root}/Editor");
+            DeleteFolderIfEmpty(root);
+            AssetDatabase.Refresh();
+
+            return failed.Count == 0 ? null : "Не удалось удалить: " + string.Join(", ", failed);
+        }
+
+        // ============================================================ переместить
+
+        public static string Move(string fromRoot, string toRoot)
+        {
+            fromRoot = Footprint.Normalize(fromRoot);
+            toRoot   = Footprint.Normalize(toRoot);
+            if (fromRoot == toRoot)                 return null;
+            if (!IsValidRoot(toRoot))               return $"Корень должен лежать внутри Assets/: «{toRoot}».";
+            if (AssetDatabase.IsValidFolder(toRoot)) return $"Папка уже существует: {toRoot}";
+            if (toRoot.StartsWith(fromRoot + "/", StringComparison.Ordinal)) return "Нельзя переместить папку внутрь самой себя.";
+
+            EnsureFolder(Path.GetDirectoryName(toRoot)?.Replace('\\', '/'));
+            var err = AssetDatabase.MoveAsset(fromRoot, toRoot);
+            return string.IsNullOrEmpty(err) ? null : err;
+        }
+
+        // ============================================================ helpers
+
+        private static string TryRender(IPageContext ctx, string template, BuildConfig cfg, out string error)
+        {
+            error = null;
+            var path = ctx.GetDeployedAssetPath(TemplatePrefix + template);
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                error = $"Шаблон не найден в деплое страницы: {TemplatePrefix}{template}";
+                return null;
+            }
+            return File.ReadAllText(path).Replace(ResourcePlaceholder, cfg.resourceName);
+        }
+
+        private static string ReadDeployedResourceName(string root)
+        {
+            var path = $"{root}/BuildInfo.cs";
+            if (!File.Exists(path)) return null;
+            var m = ResourceNameRx.Match(File.ReadAllText(path));
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        private static string RenameAssetIfNeeded(string root, string oldName, string newName)
+        {
+            if (string.IsNullOrEmpty(oldName) || oldName == newName) return null;
+            var oldPath = $"{root}/Resources/{oldName}.asset";
+            var newPath = $"{root}/Resources/{newName}.asset";
+            if (!File.Exists(oldPath) || File.Exists(newPath)) return null;
+            var err = AssetDatabase.RenameAsset(oldPath, newName);
+            return string.IsNullOrEmpty(err) ? null : $"Не удалось переименовать ассет: {err}";
+        }
+
+        private static bool Same(string a, string b) => Norm(a) == Norm(b);
+
+        private static string Norm(string s) => (s ?? "").Replace("\r\n", "\n").TrimEnd();
+
+        private static void DeleteFolderIfEmpty(string folder)
+        {
+            if (!AssetDatabase.IsValidFolder(folder)) return;
+            foreach (var entry in Directory.EnumerateFileSystemEntries(folder))
+                if (!entry.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) return;
+            AssetDatabase.DeleteAsset(folder);
+        }
+
+        private static void EnsureFolder(string folder)
+        {
+            if (string.IsNullOrEmpty(folder) || AssetDatabase.IsValidFolder(folder)) return;
+            var parent = Path.GetDirectoryName(folder)?.Replace('\\', '/');
+            EnsureFolder(parent);
+            AssetDatabase.CreateFolder(parent, Path.GetFileName(folder));
+        }
+    }
+}

@@ -1,0 +1,220 @@
+// ============================================================
+//  ZipStep.cs — пост-процесс: zip собранного билда.
+//
+//  Имя: <productName>_<version>_<hash>.zip (без git — <productName>_<version>.zip).
+//  По умолчанию исключает служебные папки Unity, которые нельзя поставлять:
+//    *_BurstDebugInformation_DoNotShip, *_BackUpThisFolder_ButDontShipItWithYourGame.
+//  Маски сравниваются с КАЖДЫМ сегментом относительного пути (папки и файлы),
+//  поддерживаются * и ?.
+//  Архив пишется во временный файл и затем переименовывается — битого zip
+//  с «правильным» именем не остаётся.
+//  Архивируется ВСЯ папка сборки; только самодостаточный билд-файл (.apk/.aab)
+//  архивируется отдельно.
+//  Внимание: zip не хранит unix-права — для macOS/Linux бинарник после
+//  распаковки может потребовать chmod +x.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+using System.Text.RegularExpressions;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    [BuildStep("zip", "Zip-архив сборки", BuildStage.Post,
+        Description = "Упаковывает билд в <product>_<version>_<hash>.zip, исключая служебные папки.")]
+    internal sealed class ZipStep : BuildStep<ZipStep.Settings>
+    {
+        /// <summary>Служебные папки Unity, которые не поставляются (Burst-символы, бэкап IL2CPP).</summary>
+        internal const string DefaultExcludeMasks = "*_BurstDebugInformation_DoNotShip\n*_BackUpThisFolder_ButDontShipItWithYourGame";
+
+        [Serializable]
+        internal sealed class Settings
+        {
+            public string excludeMasks  = DefaultExcludeMasks;
+            public bool   overwrite     = true;
+            public bool   wrapInFolder  = false;   // корневая папка внутри архива
+            public string outputDir     = "";      // пусто — рядом с папкой сборки (Builds/<profile>/)
+        }
+
+        protected override void Execute(BuildStepContext ctx, Settings s)
+        {
+            // Один файл — только самодостаточный артефакт (.apk/.aab). У Windows-билда
+            // OutputPath = .exe, но поставляется ВСЯ папка (_Data, UnityPlayer.dll, …).
+            var singleFile = ctx.OutputIsSingleFile && File.Exists(ctx.OutputPath);
+            var sourceDir  = singleFile ? Path.GetDirectoryName(ctx.OutputPath) : ctx.OutputDirectory;
+            if (string.IsNullOrEmpty(sourceDir) || !Directory.Exists(sourceDir))
+                throw new DirectoryNotFoundException($"Папка сборки не найдена: {sourceDir}");
+
+            var baseName = MakeBaseName(ctx);
+            var targetDir = string.IsNullOrWhiteSpace(s.outputDir)
+                ? Path.GetDirectoryName(Path.GetFullPath(sourceDir))
+                : Path.GetFullPath(Path.Combine(GitInfo.ProjectRoot, s.outputDir.Trim()));
+            if (string.IsNullOrEmpty(targetDir)) throw new IOException("Не удалось определить папку для архива.");
+            Directory.CreateDirectory(targetDir);
+
+            var zipPath = Path.Combine(targetDir, baseName + ".zip");
+            if (File.Exists(zipPath) && !s.overwrite)
+                throw new IOException($"Архив уже существует: {zipPath} (включите «Перезаписывать»).");
+
+            var masks = ParseMasks(s.excludeMasks);
+            var files = new List<(string full, string rel)>();
+            if (singleFile)
+            {
+                files.Add((ctx.OutputPath, Path.GetFileName(ctx.OutputPath)));
+            }
+            else
+            {
+                var root = Path.GetFullPath(sourceDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                foreach (var full in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                {
+                    var rel = full.Substring(root.Length + 1).Replace('\\', '/');
+                    if (!IsExcluded(rel, masks)) files.Add((full, rel));
+                }
+            }
+
+            if (files.Count == 0) throw new IOException("Нечего архивировать: после исключений не осталось файлов.");
+
+            var tmpPath = zipPath + ".tmp";
+            if (File.Exists(tmpPath)) File.Delete(tmpPath);
+
+            long total = 0;
+            try
+            {
+                using (var stream = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write))
+                using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, false, Encoding.UTF8))
+                {
+                    for (var i = 0; i < files.Count; i++)
+                    {
+                        var (full, rel) = files[i];
+                        if (i % 16 == 0)
+                            EditorUtility.DisplayProgressBar("Zip", rel, (float)i / files.Count);
+
+                        var entryName = s.wrapInFolder ? $"{baseName}/{rel}" : rel;
+                        var entry = zip.CreateEntry(entryName, CompressionLevel.Optimal);
+                        entry.LastWriteTime = File.GetLastWriteTime(full);
+                        using (var src = File.OpenRead(full))
+                        using (var dst = entry.Open())
+                            src.CopyTo(dst);
+                        total += new FileInfo(full).Length;
+                    }
+                }
+
+                if (File.Exists(zipPath)) File.Delete(zipPath);
+                File.Move(tmpPath, zipPath);
+            }
+            catch
+            {
+                try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { /* уже нет */ }
+                throw;
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+
+            ctx.Artifacts.Add(zipPath);
+            var zipSize = new FileInfo(zipPath).Length;
+            ctx.Log($"Zip: {files.Count} файл(ов), {FormatSize(total)} → {FormatSize(zipSize)}: {zipPath}");
+        }
+
+        protected override VisualElement BuildSettingsUI(Settings s, Action changed, IPageUi ui)
+        {
+            var root = new VisualElement();
+
+            root.Add(new Label("Исключить (маска на строку, * и ?):"));
+            var masks = ui.Input(s.excludeMasks, v => { s.excludeMasks = v; changed(); });
+            masks.multiline = true;
+            masks.style.minHeight = 44;
+            root.Add(masks);
+
+            var overwrite = new Toggle("Перезаписывать существующий архив") { value = s.overwrite };
+            overwrite.RegisterValueChangedCallback(e => { s.overwrite = e.newValue; changed(); });
+            root.Add(overwrite);
+
+            var wrap = new Toggle("Корневая папка внутри архива") { value = s.wrapInFolder };
+            wrap.RegisterValueChangedCallback(e => { s.wrapInFolder = e.newValue; changed(); });
+            root.Add(wrap);
+
+            root.Add(new Label("Папка для архива (пусто — рядом с папкой сборки; относительно проекта):"));
+            root.Add(ui.Input(s.outputDir, v => { s.outputDir = v; changed(); }));
+            return root;
+        }
+
+        // ------------------------------------------------------------ helpers
+
+        internal static string MakeBaseName(BuildStepContext ctx)
+        {
+            var name = $"{ctx.ProductName}_{ctx.Version}";
+            if (!string.IsNullOrEmpty(ctx.CommitHash)) name += "_" + ctx.CommitHash;
+            return SanitizeFileName(name);
+        }
+
+        internal static string SanitizeFileName(string name)
+        {
+            var sb = new StringBuilder(name.Length);
+            var invalid = Path.GetInvalidFileNameChars();
+            foreach (var ch in name)
+                sb.Append(Array.IndexOf(invalid, ch) >= 0 || ch == ' ' ? '_' : ch);
+            return sb.ToString().Trim('.', '_');
+        }
+
+        internal static List<Regex> ParseMasks(string text)
+        {
+            var list = new List<Regex>();
+            if (string.IsNullOrEmpty(text)) return list;
+            foreach (var raw in text.Split('\n', ';'))
+            {
+                var mask = raw.Trim();
+                if (mask.Length == 0) continue;
+                var pattern = "^" + Regex.Escape(mask).Replace("\\*", ".*").Replace("\\?", ".") + "$";
+                list.Add(new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant));
+            }
+            return list;
+        }
+
+        internal static bool IsExcluded(string relPath, List<Regex> masks)
+        {
+            if (masks.Count == 0) return false;
+            foreach (var segment in relPath.Split('/'))
+                foreach (var m in masks)
+                    if (m.IsMatch(segment)) return true;
+            return false;
+        }
+
+        /// <summary>Размер того, что реально поставляется: папка сборки без исключённых
+        /// папок (или сам файл для .apk/.aab). BuildReport.totalSize считает всё подряд,
+        /// включая *_DoNotShip, поэтому для истории не годится.</summary>
+        internal static long MeasureShipped(BuildStepContext ctx, string masksText)
+        {
+            if (ctx.OutputIsSingleFile && File.Exists(ctx.OutputPath)) return new FileInfo(ctx.OutputPath).Length;
+            var dir = ctx.OutputDirectory;
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return 0;
+
+            var masks = ParseMasks(masksText);
+            var root  = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            long total = 0;
+            foreach (var full in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                var rel = full.Substring(root.Length + 1).Replace('\\', '/');
+                if (!IsExcluded(rel, masks)) total += new FileInfo(full).Length;
+            }
+            return total;
+        }
+
+        internal static string FormatSize(long bytes)
+        {
+            if (bytes < 1024) return $"{bytes} B";
+            double v = bytes;
+            string[] units = { "KB", "MB", "GB" };
+            var i = -1;
+            do { v /= 1024; i++; } while (v >= 1024 && i < units.Length - 1);
+            return $"{v:0.##} {units[i]}";
+        }
+    }
+}

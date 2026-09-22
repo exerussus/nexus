@@ -1,23 +1,38 @@
+using System;
 using System.IO;
+using Exerussus.Nexus.Abstractions;
 using Newtonsoft.Json;
 
 namespace Exerussus.Nexus.Pages.SalamanderEditor
 {
     // Личные настройки страницы: UserSettings/Exerussus.Nexus/salamander-editor/prefs.json.
     // Переживают Restore и Disable; стираются только «Clear settings» из Manage.
+    // Вкладки, каретки и несохранённые буферы IDE хранит сама — в ide/ рядом.
     internal sealed class PagePrefs
     {
-        public string ApiSourcePath; // откуда скопирован salamander-api.json (для авто-обновления)
-        public string LastFilePath;  // последний открытый .sal
+        public int SchemaVersion = 2;
+        public string ModulesRoot;      // папка модулей (null — StreamingAssets проекта)
+        public string ApiManifestPath;  // salamander-api.json (null — найти в папке модулей)
+
+        // v1: откуда был скопирован манифест и последний открытый файл — читаются для миграции
+        public string ApiSourcePath;
+        public string LastFilePath;
 
         public static PagePrefs Load(string path)
         {
             try
             {
                 if (File.Exists(path))
-                    return JsonConvert.DeserializeObject<PagePrefs>(File.ReadAllText(path)) ?? new PagePrefs();
+                {
+                    var p = JsonConvert.DeserializeObject<PagePrefs>(File.ReadAllText(path)) ?? new PagePrefs();
+                    if (string.IsNullOrEmpty(p.ApiManifestPath) && !string.IsNullOrEmpty(p.ApiSourcePath))
+                        p.ApiManifestPath = p.ApiSourcePath; // миграция v1
+                    p.ApiSourcePath = null;
+                    p.SchemaVersion = 2;
+                    return p;
+                }
             }
-            catch { /* битый prefs — начинаем с чистого */ }
+            catch (Exception e) { NexusDiagnostics.Swallowed("salamander-editor/prefs.load", e); }
             return new PagePrefs();
         }
 
@@ -26,9 +41,10 @@ namespace Exerussus.Nexus.Pages.SalamanderEditor
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
-                File.WriteAllText(path, JsonConvert.SerializeObject(this, Formatting.Indented));
+                File.WriteAllText(path, JsonConvert.SerializeObject(this, Formatting.Indented,
+                    new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore }));
             }
-            catch { /* prefs — не повод ронять страницу */ }
+            catch (Exception e) { NexusDiagnostics.Swallowed("salamander-editor/prefs.save", e); }
         }
     }
 }

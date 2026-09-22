@@ -1,0 +1,263 @@
+// ============================================================
+//  BuildPage.BuildInfo.cs — вкладка «BuildInfo»: развёртка SO и её настройки.
+//
+//  Внешний след страницы (переживает её выключение):
+//    <root>/Exerussus.BuildInfo.asmdef, BuildInfo.cs            — runtime (autoReferenced)
+//    <root>/Editor/…Editor.asmdef, BuildInfoEditor.cs, GitInfo.cs — штамп/откат/Play Mode
+//    <root>/Editor/build-config.json                             — общие настройки страницы
+//    <root>/Resources/<name>.asset                               — создаёт сама развёртка
+//  Статус — с полными путями; удаление — только этих файлов и с подтверждением.
+// ============================================================
+
+using System.IO;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    public sealed partial class BuildPage
+    {
+        private string _moveTarget;
+
+        private void RenderBuildInfoTab()
+        {
+            var root     = DeployedRoot();
+            var deployed = root != null;
+            var shownRoot = deployed ? root : Footprint.Normalize(_prefs.pendingRoot);
+
+            RenderFootprintSection(root, deployed, shownRoot);
+            RenderValuesSection(deployed);
+            RenderUsageSection();
+        }
+
+        private void RenderFootprintSection(string root, bool deployed, string shownRoot)
+        {
+            var card = Section("Развёртка BuildInfo",
+                "Runtime-сборка Exerussus.BuildInfo (доступна из игры и других asmdef) + редакторная часть, " +
+                "которая штампует ассет перед любым билдом и откатывает после. Выключение страницы её не удаляет.");
+
+            // --- статус ---
+            var statuses = BuildInfoDeployer.Status(Context, shownRoot, _config, out var tplError);
+            var missing = 0;
+            var outdated = 0;
+            foreach (var s in statuses)
+            {
+                if (s.State == BuildInfoDeployer.FileState.Missing) missing++;
+                if (s.State == BuildInfoDeployer.FileState.Outdated) outdated++;
+            }
+
+            if (!deployed)                card.Add(Pill(StatusKind.Info, "Не развёрнута"));
+            else if (missing > 0)         card.Add(Pill(StatusKind.Error, $"Развёрнута не полностью: нет {missing} файл(ов)"));
+            else if (outdated > 0)        card.Add(Pill(StatusKind.Warning, $"Код устарел: {outdated} файл(ов) — нажмите «Обновить код»"));
+            else                          card.Add(Pill(StatusKind.Ok, "Развёрнута, код актуален"));
+            if (tplError != null)         card.Add(Pill(StatusKind.Error, tplError));
+
+            // --- корень ---
+            if (!deployed)
+            {
+                card.Add(Txt("Папка развёртки (внутри Assets/):", NexusToken.TextDim));
+                card.Add(Context.Ui.Input(_prefs.pendingRoot, v =>
+                {
+                    _prefs.pendingRoot = Footprint.Normalize(v);
+                    SavePrefs();
+                }));
+            }
+            else
+            {
+                card.Add(Txt($"Папка: {root}", NexusToken.TextNormal));
+                var row = Row();
+                _moveTarget ??= root;
+                var input = Context.Ui.Input(_moveTarget, v => _moveTarget = v);
+                input.style.flexGrow = 1;
+                row.Add(input);
+                row.Add(Btn(NexusRole.Common, "Переместить", () => MoveFootprint(root)));
+                card.Add(row);
+            }
+
+            // --- файлы ---
+            foreach (var s in statuses)
+                card.Add(FileRow(s.Label, s.Path, s.State == BuildInfoDeployer.FileState.Missing ? "нет"
+                    : s.State == BuildInfoDeployer.FileState.Outdated ? "устарел" : "ok",
+                    s.State == BuildInfoDeployer.FileState.Missing ? StatusKind.Error
+                    : s.State == BuildInfoDeployer.FileState.Outdated ? StatusKind.Warning : StatusKind.Ok));
+
+            var cfgPath = Footprint.ConfigPath(shownRoot);
+            card.Add(FileRow(Footprint.ConfigFileName, cfgPath, File.Exists(cfgPath) ? "ok" : "нет",
+                File.Exists(cfgPath) ? StatusKind.Ok : (deployed ? StatusKind.Error : StatusKind.Info)));
+
+            var assetPath = BuildInfoDeployer.AssetPath(shownRoot, _config);
+            var assetExists = File.Exists(assetPath);
+            card.Add(FileRow($"Resources/{_config.resourceName}.asset", assetPath,
+                assetExists ? "ok" : (deployed ? "создастся после компиляции" : "нет"),
+                assetExists ? StatusKind.Ok : (deployed ? StatusKind.Warning : StatusKind.Info)));
+
+            // --- действия ---
+            var actions = Row();
+            actions.style.marginTop = 8;
+            actions.Add(Btn(NexusRole.Primary, deployed ? "Обновить код" : "Развернуть", () => DeployFootprint(shownRoot, deployed)));
+            if (deployed) actions.Add(Btn(NexusRole.Alarm, "Удалить развёртку", () => RemoveFootprint(root)));
+            card.Add(actions);
+        }
+
+        private VisualElement FileRow(string label, string path, string state, StatusKind kind)
+        {
+            var row = Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            var pill = Context.Ui.StatusPill(kind, state);
+            pill.style.minWidth = 60;
+            row.Add(pill);
+            row.Add(Gap(6));
+            var name = Txt(label);
+            name.style.width = 240;
+            row.Add(name);
+            var p = Txt(path, NexusToken.TextFaint);
+            p.style.flexShrink = 1;
+            row.Add(p);
+
+            if (File.Exists(path))
+                row.RegisterCallback<PointerDownEvent>(_ =>
+                {
+                    var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+                    if (obj != null) EditorGUIUtility.PingObject(obj);
+                });
+            return row;
+        }
+
+        private void RenderValuesSection(bool deployed)
+        {
+            var card = Section("Значения BuildInfo",
+                "Общие для команды (build-config.json в развёртке). Префикс/постфикс попадают в билд; " +
+                "в редакторе ассет пуст, в Play Mode подставляются только версия и хэш.");
+
+            var preview = Txt("", NexusToken.TextNormal, bold: true);
+            void UpdatePreview() => preview.text = $"В билде: {PreviewFullVersion()}";
+
+            var row = Row();
+            row.Add(Txt("Префикс"));
+            row.Add(Gap(4));
+            var pre = Context.Ui.Input(_config.prefix, v => { _config.prefix = v ?? ""; RequestConfigSave(); UpdatePreview(); });
+            pre.style.width = 140;
+            row.Add(pre);
+            row.Add(Gap(12));
+            row.Add(Txt("Постфикс"));
+            row.Add(Gap(4));
+            var post = Context.Ui.Input(_config.postfix, v => { _config.postfix = v ?? ""; RequestConfigSave(); UpdatePreview(); });
+            post.style.width = 140;
+            row.Add(post);
+            card.Add(row);
+
+            var hashLen = new SliderInt("Длина хэша", 4, 40) { value = _config.hashLength, showInputField = true };
+            hashLen.RegisterValueChangedCallback(e =>
+            {
+                _config.hashLength = e.newValue;
+                _git.Hash = GitInfo.Shorten(_git.FullHash, e.newValue);
+                RequestConfigSave();
+                UpdatePreview();
+            });
+            card.Add(hashLen);
+
+            var dirty = new Toggle("Помечать «-dirty», если есть незакоммиченные изменения (нужен git в PATH)") { value = _config.markDirty };
+            dirty.RegisterValueChangedCallback(e => { _config.markDirty = e.newValue; RequestConfigSave(); });
+            card.Add(dirty);
+
+            var nameRow = Row();
+            nameRow.Add(Txt("Имя ассета в Resources"));
+            nameRow.Add(Gap(4));
+            var nameInput = Context.Ui.Input(_config.resourceName, v =>
+            {
+                if (!BuildInfoDeployer.IsValidResourceName(v)) return;
+                _config.resourceName = v;
+                RequestConfigSave();
+            });
+            nameInput.style.width = 160;
+            nameRow.Add(nameInput);
+            card.Add(nameRow);
+            if (deployed) card.Add(Txt("После смены имени нажмите «Обновить код» — ассет будет переименован.", NexusToken.TextDim));
+
+            UpdatePreview();
+            card.Add(preview);
+            card.Add(Txt(_git.HasRepo
+                ? $"Git: {(_git.Source == "git" ? "git в PATH" : "чтение .git (git не найден в PATH)")}, ветка {(_git.Branch == "" ? "—" : _git.Branch)}"
+                : "Git-репозиторий не найден.", NexusToken.TextDim));
+        }
+
+        private void RenderUsageSection()
+        {
+            var card = Section("Использование", "asmdef, которому нужен BuildInfo, ссылается на Exerussus.BuildInfo (Assembly-CSharp видит его сам).");
+            var code = new TextField { multiline = true, isReadOnly = true };
+            code.value =
+                "using Exerussus.Builds;\n\n" +
+                "var info = BuildInfo.Current;           // null, если ассета нет\n" +
+                "Debug.Log(info.FullVersion);            // beta-1.2.3-rc+a1b2c3d\n" +
+                "Debug.Log(info.Version);                // 1.2.3\n" +
+                "Debug.Log(info.CommitHash);             // a1b2c3d\n" +
+                "Debug.Log(BuildInfo.CurrentFullVersion); // безопасно без ассета";
+            card.Add(code);
+        }
+
+        // ============================================================ действия
+
+        private void DeployFootprint(string root, bool deployed)
+        {
+            FlushConfig();
+            var err = BuildInfoDeployer.Deploy(Context, root, _config);
+            if (err != null)
+            {
+                Context.SetStatus(err, StatusKind.Error);
+                return;
+            }
+
+            // черновик больше не нужен — настройки теперь в развёртке
+            var draft = Context.GetUserConfigPath(DraftFile);
+            if (File.Exists(draft)) File.Delete(draft);
+
+            Context.SetStatus(deployed
+                    ? "Код BuildInfo обновлён."
+                    : $"BuildInfo развёрнут в {root}. Ассет создастся после компиляции.",
+                StatusKind.Ok);
+            LoadAll();
+            Render();
+        }
+
+        private void RemoveFootprint(string root)
+        {
+            var paths = BuildInfoDeployer.OwnedPaths(root, _config);
+            var ok = EditorUtility.DisplayDialog("Удалить развёртку BuildInfo?",
+                "Будут удалены ТОЛЬКО эти файлы (и папки, если опустеют):\n\n  " + string.Join("\n  ", paths) +
+                "\n\nКод игры, который ссылается на Exerussus.BuildInfo, перестанет компилироваться. " +
+                "Настройки страницы сохранятся в личный черновик.",
+                "Удалить", "Отмена");
+            if (!ok) return;
+
+            FlushConfig();
+            JsonStore.Save(Context.GetUserConfigPath(DraftFile), _config);   // сохраняем настройки
+            _prefs.pendingRoot = root;
+            SavePrefs();
+
+            var err = BuildInfoDeployer.Remove(root, _config);
+            Context.SetStatus(err ?? "Развёртка BuildInfo удалена.", err == null ? StatusKind.Ok : StatusKind.Error);
+            LoadAll();
+            Render();
+        }
+
+        private void MoveFootprint(string root)
+        {
+            var target = Footprint.Normalize(_moveTarget);
+            if (target == root) return;
+            FlushConfig();
+            var err = BuildInfoDeployer.Move(root, target);
+            if (err != null)
+            {
+                Context.SetStatus(err, StatusKind.Error);
+                return;
+            }
+            _prefs.pendingRoot = target;
+            SavePrefs();
+            _moveTarget = target;
+            Context.SetStatus($"Развёртка перемещена в {target}.", StatusKind.Ok);
+            LoadAll();
+            Render();
+        }
+    }
+}

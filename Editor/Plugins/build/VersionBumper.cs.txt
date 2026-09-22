@@ -1,0 +1,81 @@
+// ============================================================
+//  VersionBumper.cs — Major / Minor / Patch для PlayerSettings.bundleVersion.
+//
+//  bundleVersion остаётся чистым semver «X.Y.Z»: iOS/Android не принимают
+//  буквенные суффиксы. Префикс/постфикс живут только в BuildInfo.
+//  Нечисловые хвосты частей отбрасываются («1.2.3b» → 1.2.3), недостающие
+//  части = 0. Младшие части при подъёме старшей обнуляются.
+//  Опционально поднимает Android versionCode и iOS buildNumber (+1).
+// ============================================================
+
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    internal enum BumpKind
+    {
+        Major,
+        Minor,
+        Patch,
+    }
+
+    internal static class VersionBumper
+    {
+        public static bool TryParse(string version, out int major, out int minor, out int patch)
+        {
+            major = minor = patch = 0;
+            if (string.IsNullOrWhiteSpace(version)) return false;
+
+            var parts = version.Trim().Split('.');
+            if (!TryLeadingInt(parts[0], out major)) return false;
+            if (parts.Length > 1) TryLeadingInt(parts[1], out minor);
+            if (parts.Length > 2) TryLeadingInt(parts[2], out patch);
+            return true;
+        }
+
+        public static bool IsStrictSemver(string version)
+        {
+            if (!TryParse(version, out var a, out var b, out var c)) return false;
+            return version.Trim() == $"{a}.{b}.{c}";
+        }
+
+        public static string Bump(string version, BumpKind kind)
+        {
+            TryParse(version, out var major, out var minor, out var patch);
+            switch (kind)
+            {
+                case BumpKind.Major: major++; minor = 0; patch = 0; break;
+                case BumpKind.Minor: minor++; patch = 0;            break;
+                default:             patch++;                       break;
+            }
+            return $"{major}.{minor}.{patch}";
+        }
+
+        /// <summary>Поднять версию проекта. Возвращает новую версию.</summary>
+        public static string Apply(BumpKind kind, bool bumpBuildNumbers)
+        {
+            var next = Bump(PlayerSettings.bundleVersion, kind);
+            PlayerSettings.bundleVersion = next;
+
+            if (bumpBuildNumbers)
+            {
+                PlayerSettings.Android.bundleVersionCode = PlayerSettings.Android.bundleVersionCode + 1;
+                PlayerSettings.iOS.buildNumber = int.TryParse(PlayerSettings.iOS.buildNumber, out var n)
+                    ? (n + 1).ToString()
+                    : "1";
+            }
+
+            AssetDatabase.SaveAssets();
+            return next;
+        }
+
+        private static bool TryLeadingInt(string s, out int value)
+        {
+            value = 0;
+            if (string.IsNullOrEmpty(s)) return false;
+            var len = 0;
+            while (len < s.Length && len < 9 && char.IsDigit(s[len])) len++;
+            return len > 0 && int.TryParse(s.Substring(0, len), out value);
+        }
+    }
+}

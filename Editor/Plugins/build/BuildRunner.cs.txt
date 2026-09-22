@@ -1,0 +1,512 @@
+// ============================================================
+//  BuildRunner.cs — запуск сборки по профилю: свитч → пре-шаги → билд → пост-шаги.
+//
+//  Смена профиля может сменить платформу и вызвать перекомпиляцию/перезагрузку
+//  домена. Поэтому запрос сериализуется в SessionState (владелец — эта страница),
+//  а продолжение запускается:
+//    • в том же домене — с EditorApplication.update, когда редактор успокоится;
+//    • после перезагрузки — из [InitializeOnLoadMethod] (дешёвая проверка ключа).
+//  Страница выключена → этого кода нет в проекте → ничего не выполняется.
+//
+//  Итог каждой сборки пишется в личную историю (UserSettings) и публикуется
+//  событием Finished — открытая страница перерисовывается.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Build.Profile;
+using UnityEditor.Build.Reporting;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using Debug = UnityEngine.Debug;
+
+namespace Exerussus.Nexus.Pages.Build
+{
+    /// <summary>Вариант выбора в списке профилей.</summary>
+    internal sealed class ProfileOption
+    {
+        public const string PlatformKey = "platform";
+
+        public string       Key;       // GUID ассета профиля или «platform»
+        public string       Name;
+        public string       Path;      // asset-путь профиля; пусто для «platform»
+        public BuildProfile Profile;   // null для «platform»
+
+        public bool IsPlatform => Key == PlatformKey;
+    }
+
+    internal static class BuildProfiles
+    {
+        public static List<ProfileOption> List()
+        {
+            var list = new List<ProfileOption>
+            {
+                new ProfileOption
+                {
+                    Key  = ProfileOption.PlatformKey,
+                    Name = $"Текущая платформа ({EditorUserBuildSettings.activeBuildTarget})",
+                    Path = "",
+                },
+            };
+
+            var found = new List<ProfileOption>();
+            foreach (var p in BuildProfile.GetAllBuildProfiles())
+            {
+                if (p == null) continue;
+                var path = AssetDatabase.GetAssetPath(p);
+                if (string.IsNullOrEmpty(path)) continue;
+                found.Add(new ProfileOption { Key = AssetDatabase.AssetPathToGUID(path), Name = p.name, Path = path, Profile = p });
+            }
+            found.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            list.AddRange(found);
+            return list;
+        }
+
+        public static ProfileOption Find(List<ProfileOption> list, string key)
+        {
+            foreach (var o in list)
+                if (o.Key == key) return o;
+            return null;
+        }
+
+        public static string ActiveName()
+        {
+            var active = BuildProfile.GetActiveBuildProfile();
+            return active != null ? active.name : $"платформа {EditorUserBuildSettings.activeBuildTarget}";
+        }
+    }
+
+    /// <summary>Запрос сборки (переживает перезагрузку домена через SessionState).</summary>
+    [Serializable]
+    internal sealed class BuildRequest
+    {
+        public string profileKey  = "";
+        public string profilePath = "";   // пусто — сборка «текущей платформы» без профиля
+        public string configPath  = "";
+        public string historyPath = "";
+        public bool   development;
+        public bool   cleanBuild;
+
+        // что было активно до сборки (для возврата)
+        public string prevProfilePath = "";
+        public int    prevTarget;
+        public int    prevGroup;
+        public bool   restoreProfile;
+
+        public double armedAt;
+    }
+
+    [Serializable]
+    internal sealed class BuildHistoryEntry
+    {
+        public string       timeLocal   = "";
+        public string       profile     = "";
+        public string       platform    = "";
+        public string       version     = "";
+        public string       hash        = "";
+        public bool         dirty;
+        public bool         success;
+        public string       message     = "";
+        public double       seconds;
+        public long         sizeBytes;   // поставляемый размер (без *_DoNotShip и пр.)
+        public long         zipBytes;    // размер первого артефакта (zip), если есть
+        public int          errors;
+        public int          warnings;
+        public string       outputPath  = "";
+        public List<string> artifacts   = new List<string>();
+    }
+
+    [Serializable]
+    internal sealed class BuildHistory
+    {
+        public const int Max = 30;
+        public List<BuildHistoryEntry> entries = new List<BuildHistoryEntry>();
+    }
+
+    internal enum StartResult
+    {
+        Finished,     // собрано синхронно (успех/ошибка — см. историю)
+        Scheduled,    // профиль переключается — сборка продолжится автоматически
+        Cancelled,    // пользователь отменил (несохранённые сцены)
+        Rejected,     // нельзя начать (см. message)
+    }
+
+    internal static class BuildRunner
+    {
+        private const string PendingKey  = "Exerussus.Nexus.Pages.Build.Pending";
+        private const double SettleDelay = 1.0;   // сек. тишины перед продолжением
+
+        /// <summary>Сборка завершена (успех или ошибка).</summary>
+        public static event Action<BuildHistoryEntry> Finished;
+
+        private static bool _running;
+
+        public static bool IsPending => !string.IsNullOrEmpty(SessionState.GetString(PendingKey, ""));
+        public static bool IsBusy    => _running || IsPending || BuildPipeline.isBuildingPlayer;
+
+        // ============================================================ старт
+
+        public static StartResult Start(BuildRequest req, out string message)
+        {
+            message = "";
+            if (IsBusy)                                          { message = "Сборка уже идёт.";                        return StartResult.Rejected; }
+            if (EditorApplication.isPlayingOrWillChangePlaymode) { message = "Выйдите из Play Mode.";                    return StartResult.Rejected; }
+            if (EditorApplication.isCompiling)                   { message = "Идёт компиляция — дождитесь окончания.";   return StartResult.Rejected; }
+            if (EditorUtility.scriptCompilationFailed)           { message = "В проекте ошибки компиляции.";             return StartResult.Rejected; }
+
+            BuildProfile target = null;
+            if (!string.IsNullOrEmpty(req.profilePath))
+            {
+                target = BuildProfile.GetBuildProfileAtPath(req.profilePath);
+                if (target == null) { message = $"Профиль не найден: {req.profilePath}"; return StartResult.Rejected; }
+            }
+
+            if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return StartResult.Cancelled;
+
+            var active = BuildProfile.GetActiveBuildProfile();
+            req.prevProfilePath = active != null ? AssetDatabase.GetAssetPath(active) : "";
+            req.prevTarget      = (int)EditorUserBuildSettings.activeBuildTarget;
+            req.prevGroup       = (int)EditorUserBuildSettings.selectedBuildTargetGroup;
+
+            if (active != target)
+            {
+                // Свитч может перезагрузить домен — продолжаем через SessionState.
+                BuildProfile.SetActiveBuildProfile(target);
+                req.armedAt = EditorApplication.timeSinceStartup;
+                SessionState.SetString(PendingKey, JsonUtility.ToJson(req));
+                Arm();
+                message = $"Переключаю профиль на «{(target != null ? target.name : "платформа")}» — сборка начнётся автоматически.";
+                return StartResult.Scheduled;
+            }
+
+            Execute(req);
+            return StartResult.Finished;
+        }
+
+        // ============================================================ продолжение
+
+        [InitializeOnLoadMethod]
+        private static void OnDomainLoaded()
+        {
+            if (IsPending) Arm();
+        }
+
+        private static void Arm()
+        {
+            EditorApplication.update -= Poll;
+            EditorApplication.update += Poll;
+        }
+
+        private static void Poll()
+        {
+            var json = SessionState.GetString(PendingKey, "");
+            if (string.IsNullOrEmpty(json)) { EditorApplication.update -= Poll; return; }
+
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating || BuildPipeline.isBuildingPlayer) return;
+
+            BuildRequest req;
+            try { req = JsonUtility.FromJson<BuildRequest>(json); }
+            catch (Exception ex)
+            {
+                SessionState.EraseString(PendingKey);
+                EditorApplication.update -= Poll;
+                NexusDiagnostics.Error("Build: повреждённый запрос сборки", ex);
+                return;
+            }
+
+            // ждём, пока редактор «успокоится» после свитча (перекомпиляция могла ещё не начаться)
+            if (EditorApplication.timeSinceStartup >= req.armedAt &&
+                EditorApplication.timeSinceStartup - req.armedAt < SettleDelay) return;
+
+            SessionState.EraseString(PendingKey);
+            EditorApplication.update -= Poll;
+
+            if (EditorUtility.scriptCompilationFailed)
+            {
+                Report(req, Fail(req, "После смены профиля в проекте ошибки компиляции — сборка отменена."));
+                return;
+            }
+
+            Execute(req);
+        }
+
+        /// <summary>Отменить отложенную сборку (профиль остаётся переключённым).</summary>
+        public static void CancelPending()
+        {
+            SessionState.EraseString(PendingKey);
+            EditorApplication.update -= Poll;
+        }
+
+        // ============================================================ выполнение
+
+        private static void Execute(BuildRequest req)
+        {
+            _running = true;
+            var sw     = Stopwatch.StartNew();
+            var config = JsonStore.Load<BuildConfig>(req.configPath);
+            config.Migrate();   // в памяти: старый шаблон папки не должен плодить папки по версиям
+            var entry  = new BuildHistoryEntry { timeLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") };
+
+            try
+            {
+                var profile = string.IsNullOrEmpty(req.profilePath) ? null : BuildProfile.GetBuildProfileAtPath(req.profilePath);
+                var target  = EditorUserBuildSettings.activeBuildTarget;
+                var git     = GitInfo.Read(config.hashLength, config.markDirty);
+
+                var ctx = new BuildStepContext
+                {
+                    ProfileName = profile != null ? profile.name : target.ToString(),
+                    Target      = target,
+                    ProductName = PlayerSettings.productName,
+                    Version     = PlayerSettings.bundleVersion,
+                    CommitHash  = git.Hash,
+                    IsDirty     = git.IsDirty,
+                    Development = req.development,
+                };
+                ctx.OutputDirectory = ResolveOutputDir(config.outputTemplate, ctx);
+                ctx.OutputPath      = LocationFor(target, ctx.OutputDirectory, ctx.ProductName);
+                ctx.OutputIsSingleFile = target == BuildTarget.Android;
+
+                entry.profile    = ctx.ProfileName;
+                entry.platform   = target.ToString();
+                entry.version    = ctx.Version;
+                entry.hash       = ctx.CommitHash;
+                entry.dirty      = ctx.IsDirty;
+                entry.outputPath = ctx.OutputPath;
+
+                var scenes = profile != null ? profile.GetScenesForBuild() : EditorBuildSettings.scenes;
+                if (!HasEnabledScenes(scenes)) { Fill(entry, false, "В списке сцен для сборки нет ни одной включённой сцены."); return; }
+
+                var steps    = BuildStepRegistry.All();
+                var pipeline = config.Find(req.profileKey) ?? new ProfilePipeline();
+
+                // --- pre ---
+                ctx.Stage = BuildStage.Pre;
+                var err = RunSteps(pipeline, steps, BuildStage.Pre, ctx);
+                if (err != null) { Fill(entry, false, err); return; }
+
+                // --- build ---
+                Directory.CreateDirectory(ctx.OutputDirectory);
+                var options = BuildOptions.None;
+                if (req.development) options |= BuildOptions.Development;
+                if (req.cleanBuild)  options |= BuildOptions.CleanBuildCache;
+
+                ctx.Log($"Сборка «{ctx.ProfileName}» {ctx.Version} → {ctx.OutputPath}");
+                BuildReport report;
+                if (profile != null)
+                {
+                    report = BuildPipeline.BuildPlayer(new BuildPlayerWithProfileOptions
+                    {
+                        buildProfile     = profile,
+                        locationPathName = ctx.OutputPath,
+                        options          = options,
+                    });
+                }
+                else
+                {
+                    report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                    {
+                        scenes           = EnabledScenePaths(EditorBuildSettings.scenes),
+                        locationPathName = ctx.OutputPath,
+                        target           = target,
+                        targetGroup      = BuildPipeline.GetBuildTargetGroup(target),
+                        options          = options,
+                    });
+                }
+
+                ctx.Report     = report;
+                entry.errors    = report.summary.totalErrors;
+                entry.warnings  = report.summary.totalWarnings;
+
+                if (report.summary.result != BuildResult.Succeeded)
+                {
+                    Fill(entry, false, $"Билд: {report.summary.result}. {FirstError(report)}");
+                    return;
+                }
+
+                // размер поставки — без служебных папок Unity (totalSize из отчёта их включает)
+                try { entry.sizeBytes = ZipStep.MeasureShipped(ctx, ZipStep.DefaultExcludeMasks); }
+                catch (Exception ex) { NexusDiagnostics.Swallowed("Build: размер сборки", ex); }
+
+                // --- post ---
+                ctx.Stage = BuildStage.Post;
+                err = RunSteps(pipeline, steps, BuildStage.Post, ctx);
+                entry.artifacts.AddRange(ctx.Artifacts);
+                if (ctx.Artifacts.Count > 0 && File.Exists(ctx.Artifacts[0]))
+                    entry.zipBytes = new FileInfo(ctx.Artifacts[0]).Length;
+                if (err != null) { Fill(entry, false, "Билд собран, но " + err); return; }
+
+                Fill(entry, true, ctx.Artifacts.Count > 0
+                    ? $"Готово. Артефакты: {string.Join(", ", ctx.Artifacts.ConvertAll(Path.GetFileName))}"
+                    : "Готово.");
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Error("Build: сборка", ex);
+                Fill(entry, false, $"Исключение: {ex.Message}");
+            }
+            finally
+            {
+                entry.seconds = Math.Round(sw.Elapsed.TotalSeconds, 1);
+                _running = false;
+                if (req.restoreProfile) RestoreProfile(req);
+                Report(req, entry);
+            }
+        }
+
+        private static string RunSteps(ProfilePipeline pipeline, List<StepDescriptor> all, BuildStage stage, BuildStepContext ctx)
+        {
+            foreach (var e in pipeline.steps)
+            {
+                if (e == null || !e.enabled) continue;
+                var d = BuildStepRegistry.Find(all, e.id);
+                if (d == null)
+                    return $"шаг «{e.id}» включён, но не найден в коде страницы.";
+                if (d.Meta.Stage != stage) continue;
+
+                try
+                {
+                    ctx.Log($"{(stage == BuildStage.Pre ? "Пре" : "Пост")}-шаг «{d.Meta.Name}»…");
+                    d.Step.Execute(ctx, d.Step.LoadSettings(e.settingsJson));
+                }
+                catch (Exception ex)
+                {
+                    NexusDiagnostics.Error($"Build: шаг {e.id}", ex);
+                    return $"упал шаг «{d.Meta.Name}»: {ex.Message}";
+                }
+            }
+            return null;
+        }
+
+        private static void RestoreProfile(BuildRequest req)
+        {
+            try
+            {
+                var prev = string.IsNullOrEmpty(req.prevProfilePath) ? null : BuildProfile.GetBuildProfileAtPath(req.prevProfilePath);
+                if (BuildProfile.GetActiveBuildProfile() != prev) BuildProfile.SetActiveBuildProfile(prev);
+
+                if (prev == null && (int)EditorUserBuildSettings.activeBuildTarget != req.prevTarget)
+                    EditorUserBuildSettings.SwitchActiveBuildTarget((BuildTargetGroup)req.prevGroup, (BuildTarget)req.prevTarget);
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Error("Build: возврат профиля", ex);
+            }
+        }
+
+        // ============================================================ итог
+
+        private static BuildHistoryEntry Fail(BuildRequest req, string message)
+        {
+            var e = new BuildHistoryEntry { timeLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") };
+            Fill(e, false, message);
+            return e;
+        }
+
+        private static void Fill(BuildHistoryEntry e, bool success, string message)
+        {
+            e.success = success;
+            e.message = message ?? "";
+        }
+
+        private static void Report(BuildRequest req, BuildHistoryEntry entry)
+        {
+            if (entry.success) Debug.Log($"[Build] {entry.profile} {entry.version}: {entry.message} ({entry.seconds} с)");
+            else               Debug.LogError($"[Build] {entry.profile} {entry.version}: {entry.message}");
+
+            try
+            {
+                if (!string.IsNullOrEmpty(req.historyPath))
+                {
+                    var history = JsonStore.Load<BuildHistory>(req.historyPath);
+                    history.entries.Insert(0, entry);
+                    if (history.entries.Count > BuildHistory.Max)
+                        history.entries.RemoveRange(BuildHistory.Max, history.entries.Count - BuildHistory.Max);
+                    JsonStore.Save(req.historyPath, history);
+                }
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Error("Build: запись истории", ex);
+            }
+
+            try { Finished?.Invoke(entry); }
+            catch (Exception ex) { NexusDiagnostics.Error("Build: обработчик Finished", ex); }
+        }
+
+        // ============================================================ пути
+
+        /// <summary>Токены: {profile} {version} {platform} {product} {hash} {date}.</summary>
+        public static string ResolveOutputDir(string template, BuildStepContext ctx)
+        {
+            if (string.IsNullOrWhiteSpace(template)) template = BuildConfig.DefaultOutputTemplate;
+            var s = template.Trim()
+                .Replace("{profile}",  SafeSegment(ctx.ProfileName))
+                .Replace("{version}",  SafeSegment(ctx.Version))
+                .Replace("{platform}", SafeSegment(ctx.Target.ToString()))
+                .Replace("{product}",  SafeSegment(ctx.ProductName))
+                .Replace("{hash}",     SafeSegment(string.IsNullOrEmpty(ctx.CommitHash) ? "nogit" : ctx.CommitHash))
+                .Replace("{date}",     DateTime.Now.ToString("yyyyMMdd-HHmm"));
+            return Path.GetFullPath(Path.IsPathRooted(s) ? s : Path.Combine(GitInfo.ProjectRoot, s));
+        }
+
+        public static string LocationFor(BuildTarget target, string dir, string productName)
+        {
+            var name = ZipStep.SanitizeFileName(string.IsNullOrEmpty(productName) ? "Game" : productName);
+            switch (target)
+            {
+                case BuildTarget.StandaloneWindows:
+                case BuildTarget.StandaloneWindows64:
+                    return Path.Combine(dir, name + ".exe");
+                case BuildTarget.StandaloneOSX:
+                    return Path.Combine(dir, name + ".app");
+                case BuildTarget.StandaloneLinux64:
+                    return Path.Combine(dir, name + ".x86_64");
+                case BuildTarget.Android:
+                    return Path.Combine(dir, name + (EditorUserBuildSettings.buildAppBundle ? ".aab" : ".apk"));
+                default:
+                    return dir;   // WebGL, iOS и пр. — папка
+            }
+        }
+
+        private static string SafeSegment(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "_";
+            var invalid = Path.GetInvalidFileNameChars();
+            var chars = s.ToCharArray();
+            for (var i = 0; i < chars.Length; i++)
+                if (Array.IndexOf(invalid, chars[i]) >= 0) chars[i] = '_';
+            return new string(chars);
+        }
+
+        private static bool HasEnabledScenes(EditorBuildSettingsScene[] scenes)
+        {
+            if (scenes == null) return false;
+            foreach (var s in scenes)
+                if (s != null && s.enabled && !string.IsNullOrEmpty(s.path)) return true;
+            return false;
+        }
+
+        private static string[] EnabledScenePaths(EditorBuildSettingsScene[] scenes)
+        {
+            var list = new List<string>();
+            if (scenes != null)
+                foreach (var s in scenes)
+                    if (s != null && s.enabled && !string.IsNullOrEmpty(s.path)) list.Add(s.path);
+            return list.ToArray();
+        }
+
+        private static string FirstError(BuildReport report)
+        {
+            foreach (var step in report.steps)
+                foreach (var m in step.messages)
+                    if (m.type == LogType.Error || m.type == LogType.Exception)
+                        return m.content.Length > 300 ? m.content.Substring(0, 300) + "…" : m.content;
+            return "";
+        }
+    }
+}

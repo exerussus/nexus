@@ -1,0 +1,89 @@
+// ============================================================
+//  NavClassesTab.cs — вкладка «Nav classes»: стандартные навигационные классы.
+//
+//  Они пишутся в Navigation.uss вместе с классами страниц и попапов и пересобираются
+//  на каждом Apply, поэтому существуют всегда. Сейчас стандартный класс один — «назад».
+// ============================================================
+
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor;
+using Exerussus.AppCore.Views;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class NavClassesTab : IAppTab
+    {
+        private readonly AppKit _kit;
+        private VisualElement _root;
+
+        public string Title => "Nav classes";
+
+        public NavClassesTab(AppKit kit) => _kit = kit;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            return _root;
+        }
+
+        public void Show() => Render();
+        public void Hide() { }
+        public void Refresh() => Render();
+        public bool CanClose() => true;
+        public void Dispose() { }
+
+        private void Render()
+        {
+            _root.Clear();
+
+            var settings = AppCoreAssets.FindNavigationSettings();
+            var (prefix, postfix) = AppNav.Affixes(settings, ViewKind.Page);
+
+            var write = _kit.Btn(NexusRole.Primary, "Переписать Navigation.uss", () =>
+            {
+                AppNav.WriteNavigationUss(AppCoreAssets.EnsureNavigationSettings());
+                AssetDatabase.SaveAssets();
+                _kit.Context.SetStatus($"Navigation.uss переписан: {AppCorePaths.NavigationUssPath}", StatusKind.Ok);
+                Render();
+            });
+            write.style.marginRight = 0f;
+
+            var card = _kit.Card("Стандартные классы",
+                $"Пишутся в {AppCorePaths.NavigationUssPath} вместе с классами страниц и попапов.", write);
+
+            var row = _kit.ListRow();
+            row.Add(_kit.Dot(NexusToken.Accent));
+            var cls = _kit.Mono("." + AppNav.Compose(prefix, postfix, AppNav.BackTargetId));
+            cls.style.width = 240f;
+            row.Add(cls);
+            row.Add(_kit.Hint("Кнопка «назад»: закрывает верхний попап или возвращает на предыдущую страницу. " +
+                              "Escape и аппаратная кнопка следуют настройке «Назад» самой страницы."));
+            card.Add(row);
+
+            _root.Add(card);
+
+            var navCard = _kit.Card("Классы страниц и попапов",
+                "Генерируются из реестра на вкладке Editor. Кнопке достаточно класса — переход работает без контроллера.");
+            if (settings != null)
+            {
+                foreach (var kind in new[] { ViewKind.Page, ViewKind.Popup })
+                {
+                    var (p, q) = AppNav.Affixes(settings, kind);
+                    foreach (var id in settings.GetIds(kind))
+                    {
+                        var r = _kit.ListRow();
+                        var c = _kit.Mono("." + AppNav.Compose(p, q, id));
+                        c.style.width = 240f;
+                        r.Add(c);
+                        r.Add(_kit.Hint(kind == ViewKind.Page ? $"перейти на страницу «{id}»" : $"открыть попап «{id}»"));
+                        navCard.Add(r);
+                    }
+                }
+            }
+            _root.Add(navCard);
+        }
+    }
+}

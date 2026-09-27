@@ -1,0 +1,153 @@
+// ============================================================
+//  ExternalTab.cs — вкладка «External»: внешний след страницы App.
+//
+//  Страница обслуживающая: всё, что она создаёт, живёт в Assets/App и потребляется игрой,
+//  поэтому выключение страницы его не трогает. Здесь — статус с полными путями и очистка,
+//  ограниченная ровно перегенерируемыми выходами.
+//
+//    generated — перезаписываются на Apply/Generate: Navigation.uss, NavTargets.cs. Только их удаляет Clean.
+//    config    — ассеты Settings: хранят данные, не трогаем.
+//    authored  — скаффолд и рукопись: только статус.
+// ============================================================
+
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class ExternalTab : IAppTab
+    {
+        private enum Kind { Generated, Config, Authored }
+
+        private sealed class Entry
+        {
+            public string Label;
+            public string Path;
+            public Kind Kind;
+            public bool Folder;
+        }
+
+        private readonly AppKit _kit;
+        private VisualElement _root;
+
+        public string Title => "External";
+
+        public ExternalTab(AppKit kit) => _kit = kit;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            return _root;
+        }
+
+        public void Show() => Render();
+        public void Hide() { }
+        public void Refresh() => Render();
+        public bool CanClose() => true;
+        public void Dispose() { }
+
+        private static List<Entry> Entries() => new()
+        {
+            new() { Label = "Navigation.uss", Path = AppCorePaths.NavigationUssPath, Kind = Kind.Generated },
+            new() { Label = "NavTargets.cs", Path = AppCorePaths.NavTargetsPath, Kind = Kind.Generated },
+
+            new() { Label = "NavigationSettings", Path = AppCorePaths.NavigationSettingsPath, Kind = Kind.Config },
+            new() { Label = "BuildInfo", Path = AppCorePaths.BuildInfoPath, Kind = Kind.Config },
+            new() { Label = "TextSettings", Path = AppCorePaths.TextSettingsPath, Kind = Kind.Config },
+            new() { Label = "build-config.json", Path = AppCorePaths.BuildConfigPath, Kind = Kind.Config },
+
+            new() { Label = "AppStyle.uss", Path = AppCorePaths.AppStyleUssPath, Kind = Kind.Authored },
+            new() { Label = "Tags.uss", Path = AppCorePaths.TagsUssPath, Kind = Kind.Authored },
+            new() { Label = "AppTheme.tss", Path = AppCorePaths.AppThemePath, Kind = Kind.Authored },
+            new() { Label = "App Settings", Path = AppCorePaths.PanelSettingsPath, Kind = Kind.Authored },
+            new() { Label = "App Text Settings", Path = AppCorePaths.PanelTextSettingsPath, Kind = Kind.Authored },
+            new() { Label = "Шаблоны вёрстки", Path = AppCorePaths.ContainersDir, Kind = Kind.Authored, Folder = true },
+            new() { Label = "Страницы", Path = AppCorePaths.PagesDir, Kind = Kind.Authored, Folder = true },
+            new() { Label = "Попапы", Path = AppCorePaths.PopupsDir, Kind = Kind.Authored, Folder = true },
+            new() { Label = "Фрагменты", Path = AppCorePaths.FragmentsDir, Kind = Kind.Authored, Folder = true },
+        };
+
+        private static bool Exists(Entry e) => e.Folder ? AssetDatabase.IsValidFolder(e.Path) || Directory.Exists(e.Path) : File.Exists(e.Path);
+
+        private void Render()
+        {
+            _root.Clear();
+
+            var entries = Entries();
+            var generated = entries.FindAll(e => e.Kind == Kind.Generated && Exists(e));
+
+            var clean = _kit.Btn(NexusRole.Alarm, "Удалить сгенерированное", Clean, small: true);
+            clean.SetEnabled(generated.Count > 0);
+            clean.style.marginRight = 0f;
+
+            _root.Add(_kit.Hint(
+                "Страница обслуживающая: её файлы живут в Assets/App и потребляются игрой, поэтому выключение " +
+                "страницы их не удаляет. Очистка ниже трогает только перегенерируемые выходы."));
+            _root.Add(_kit.Gap(10f));
+
+            Section("Сгенерированное", "Пересоздаётся на Apply и в Generation.", entries, Kind.Generated, clean);
+            Section("Данные", "Создаются страницей и хранят правки — не удаляются.", entries, Kind.Config, null);
+            Section("Рукопись и скаффолд", "Только статус.", entries, Kind.Authored, null);
+        }
+
+        private void Section(string title, string hint, List<Entry> entries, Kind kind, VisualElement right)
+        {
+            var card = _kit.Card(title, hint, right);
+
+            foreach (var e in entries)
+            {
+                if (e.Kind != kind) continue;
+
+                var exists = Exists(e);
+                var path = e.Path;
+                var row = _kit.ListRow(exists ? () =>
+                {
+                    var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+                    if (obj != null) EditorGUIUtility.PingObject(obj);
+                } : null);
+                row.style.flexWrap = Wrap.NoWrap;
+
+                row.Add(_kit.Dot(exists ? NexusToken.Ok : NexusToken.TextFaint));
+                var label = _kit.Text(e.Label);
+                label.style.width = 170f;
+                row.Add(label);
+                var p = _kit.Mono(e.Path, NexusToken.TextDim);
+                p.style.flexGrow = 1;
+                p.style.flexShrink = 1;
+                row.Add(p);
+                row.Add(_kit.Mono(exists ? "есть" : "нет", exists ? NexusToken.TextDim : NexusToken.TextFaint));
+                card.Add(row);
+            }
+
+            _root.Add(card);
+        }
+
+        private void Clean()
+        {
+            var targets = new List<string>();
+            foreach (var e in Entries())
+                if (e.Kind == Kind.Generated && File.Exists(e.Path)) targets.Add(e.Path);
+
+            if (targets.Count == 0) { Render(); return; }
+
+            if (!EditorUtility.DisplayDialog("App — удалить сгенерированное",
+                    "Будут удалены:\n\n  " + string.Join("\n  ", targets) +
+                    "\n\nДанные и рукопись не трогаются. Файлы пересоздаются через Apply / Generation.",
+                    "Удалить", "Отмена"))
+                return;
+
+            var failed = new List<string>();
+            foreach (var path in targets)
+                if (!AssetDatabase.DeleteAsset(path)) failed.Add(path);
+
+            AssetDatabase.Refresh();
+            Render();
+            _kit.Context.SetStatus(failed.Count == 0 ? $"Удалено: {targets.Count}." : $"Не удалось удалить: {string.Join(", ", failed)}",
+                failed.Count == 0 ? StatusKind.Ok : StatusKind.Warning);
+        }
+    }
+}

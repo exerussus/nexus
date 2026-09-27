@@ -116,6 +116,109 @@ namespace Exerussus.Nexus.Theme
             return line;
         }
 
+        public VisualElement Tabs(string[] labels, int selected, Action<int> onSelected)
+        {
+            var bar = new VisualElement();
+            bar.style.flexDirection = FlexDirection.Row;
+            bar.style.flexShrink = 0;
+            bar.style.borderBottomWidth = 1f;
+            bar.style.borderBottomColor = NexusTheme.Get(NexusToken.Divider);
+
+            var accent = NexusTheme.Get(NexusToken.Accent);
+            var normal = NexusTheme.Get(NexusToken.TextNormal);
+            var dim = NexusTheme.Get(NexusToken.TextDim);
+            var clear = new Color(0f, 0f, 0f, 0f);
+            var items = new Label[labels?.Length ?? 0];
+
+            void Select(int index)
+            {
+                for (var i = 0; i < items.Length; i++)
+                {
+                    var on = i == index;
+                    items[i].style.color = on ? normal : dim;
+                    items[i].style.borderBottomColor = on ? accent : clear;
+                    items[i].style.unityFontStyleAndWeight = on ? FontStyle.Bold : FontStyle.Normal;
+                }
+            }
+
+            for (var i = 0; i < items.Length; i++)
+            {
+                var index = i;
+                var item = new Label(labels[i]);
+                item.style.paddingLeft = 2f; item.style.paddingRight = 2f;
+                item.style.paddingTop = 7f;  item.style.paddingBottom = 8f;
+                item.style.marginRight = 18f;
+                item.style.marginBottom = -1f;
+                item.style.borderBottomWidth = 2f;
+                item.style.fontSize = 12f;
+                item.RegisterCallback<PointerEnterEvent>(_ => { if (item.style.borderBottomColor.value != accent) item.style.color = normal; });
+                item.RegisterCallback<PointerLeaveEvent>(_ => { if (item.style.borderBottomColor.value != accent) item.style.color = dim; });
+                item.RegisterCallback<PointerDownEvent>(e =>
+                {
+                    if (e.button != 0) return;
+                    Select(index);
+                    onSelected?.Invoke(index);
+                });
+                items[i] = item;
+                bar.Add(item);
+            }
+
+            Select(selected);
+            return bar;
+        }
+
+        public VisualElement Segmented(string[] labels, int selected, Action<int> onSelected)
+        {
+            var bar = new VisualElement();
+            bar.style.flexDirection = FlexDirection.Row;
+            bar.style.alignSelf = Align.FlexStart;
+            bar.style.flexShrink = 0;
+            bar.style.paddingLeft = 3f; bar.style.paddingRight = 3f;
+            bar.style.paddingTop = 3f;  bar.style.paddingBottom = 3f;
+            bar.style.backgroundColor = NexusTheme.Get(NexusToken.BgSoft);
+            SetBorder(bar, NexusTheme.Get(NexusToken.Divider), 1f, 7f);
+
+            var raised = NexusTheme.Get(NexusToken.BgRaised);
+            var divider = NexusTheme.Get(NexusToken.Divider);
+            var normal = NexusTheme.Get(NexusToken.TextNormal);
+            var dim = NexusTheme.Get(NexusToken.TextDim);
+            var clear = new Color(0f, 0f, 0f, 0f);
+            var items = new Label[labels?.Length ?? 0];
+
+            void Select(int index)
+            {
+                for (var i = 0; i < items.Length; i++)
+                {
+                    var on = i == index;
+                    items[i].style.backgroundColor = on ? raised : clear;
+                    items[i].style.color = on ? normal : dim;
+                    items[i].style.unityFontStyleAndWeight = on ? FontStyle.Bold : FontStyle.Normal;
+                    SetBorder(items[i], on ? divider : clear, 1f, 5f);
+                }
+            }
+
+            for (var i = 0; i < items.Length; i++)
+            {
+                var index = i;
+                var item = new Label(labels[i]);
+                item.style.paddingLeft = 12f; item.style.paddingRight = 12f;
+                item.style.paddingTop = 4f;   item.style.paddingBottom = 4f;
+                item.style.fontSize = 11f;
+                item.style.unityTextAlign = TextAnchor.MiddleCenter;
+                item.RegisterCallback<PointerDownEvent>(e =>
+                {
+                    if (e.button != 0) return;
+                    Select(index);
+                    onSelected?.Invoke(index);
+                });
+                items[i] = item;
+                bar.Add(item);
+            }
+
+            Select(selected);
+            return bar;
+        }
+
         private static void SetBorder(VisualElement e, Color c, float w, float r)
         {
             e.style.borderTopWidth = w;    e.style.borderRightWidth = w;

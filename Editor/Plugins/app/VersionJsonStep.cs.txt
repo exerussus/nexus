@@ -1,0 +1,94 @@
+// ============================================================
+//  VersionJsonStep.cs — пост-шаг: version.json рядом с билдом.
+//
+//  Зачем: когда «ничего не обновилось» на хостинге, открываешь https://…/version.json и
+//  без запуска игры видишь, что реально лежит на сервере. Сверяешь со строкой версии в
+//  углу экрана — и сразу понятно, отдаёт ли хостинг старое или браузер держит кэш.
+//  В пайплайне ставьте ПЕРЕД Zip, чтобы файл попал в архив.
+// ============================================================
+
+using System;
+using System.IO;
+using System.Text;
+using Exerussus.AppCore.Build;
+using Exerussus.AppCore.Editor;
+using Exerussus.Nexus.Abstractions;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    [BuildStep("version-json", "version.json рядом с билдом", BuildStage.Post,
+        Description = "Пишет version.json (версия, хэш, профиль, платформа, время) в корень папки сборки. Ставьте перед Zip.")]
+    internal sealed class VersionJsonStep : BuildStep<VersionJsonStep.Settings>
+    {
+        [Serializable]
+        internal sealed class Settings
+        {
+            public string fileName = "version.json";
+        }
+
+        [Serializable]
+        private sealed class Payload
+        {
+            public string version;
+            public string fullVersion;
+            public string hash;
+            public bool dirty;
+            public string profile;
+            public string platform;
+            public bool development;
+            public string builtAtUtc;
+        }
+
+        protected override void Execute(BuildStepContext ctx, Settings s)
+        {
+            var dir = ctx.OutputIsSingleFile ? Path.GetDirectoryName(ctx.OutputPath) : ctx.OutputDirectory;
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                throw new DirectoryNotFoundException($"Папка сборки не найдена: {dir}");
+
+            var settings = Exerussus.AppCore.Editor.Build.BuildStampSettings.Load();
+            var display = settings.prefix + ctx.Version + settings.postfix;
+            var full = display + (string.IsNullOrEmpty(ctx.CommitHash) ? "" : "+" + ctx.CommitHash + (ctx.IsDirty ? "-dirty" : ""));
+
+            var payload = new Payload
+            {
+                version = display,
+                fullVersion = full,
+                hash = ctx.CommitHash,
+                dirty = ctx.IsDirty,
+                profile = ctx.ProfileName,
+                platform = ctx.Target.ToString(),
+                development = ctx.Development,
+                builtAtUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            };
+
+            var name = string.IsNullOrWhiteSpace(s.fileName) ? "version.json" : s.fileName.Trim();
+            var path = Path.Combine(dir, name);
+            File.WriteAllText(path, JsonUtility.ToJson(payload, true), new UTF8Encoding(false));
+
+            ctx.Artifacts.Add(path);
+            ctx.Log($"version.json: {full} → {path}");
+        }
+
+        protected override VisualElement BuildSettingsUI(Settings settings, Action changed, IPageUi ui)
+        {
+            var root = new VisualElement();
+            root.style.flexDirection = FlexDirection.Row;
+            root.style.alignItems = Align.Center;
+
+            var label = new Label("Имя файла");
+            label.style.width = 90;
+            root.Add(label);
+
+            var input = ui.Input(settings.fileName, v =>
+            {
+                settings.fileName = v;
+                changed();
+            });
+            input.style.flexGrow = 1;
+            root.Add(input);
+            return root;
+        }
+    }
+}

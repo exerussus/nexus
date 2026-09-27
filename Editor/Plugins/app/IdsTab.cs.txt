@@ -1,0 +1,542 @@
+// ============================================================
+//  IdsTab.cs — вкладка «Editor»: реестр id страниц, попапов и фрагментов.
+//
+//  Источник истины — единственный NavigationSettings (Assets/App/Settings). На Apply:
+//    1. диф id → вопрос, что делать со старыми классами в uxml (переименовать/удалить/оставить);
+//    2. id, аффиксы и записи «класс → цель» пишутся в NavigationSettings;
+//    3. Navigation.uss и NavTargets.cs перегенерируются;
+//    4. при переименовании id папка вью и его uxml переименовываются вслед.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor;
+using Exerussus.AppCore.Navigation;
+using Exerussus.AppCore.Views;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class IdsTab : IAppTab
+    {
+        private sealed class Row
+        {
+            public string Id = "";
+            public string OriginalId;   // null — новая строка
+            public VisualElement Container;
+            public Label ClassLabel;
+            public Label HashLabel;
+            public bool Conflict;
+        }
+
+        private sealed class Registry
+        {
+            public ViewKind Kind;
+            public string Title;
+            public string Noun;
+            public bool HasClasses;
+
+            public string Prefix, Postfix;
+            public string OriginalPrefix, OriginalPostfix;
+
+            public readonly List<Row> Rows = new();
+            public readonly List<string> OriginalIds = new();
+
+            public VisualElement List;
+            public Label Example;
+            public TextField PrefixField, PostfixField;
+        }
+
+        private enum MigrationAction { Skip, Rename, Delete }
+
+        private sealed class Migration
+        {
+            public string Noun;
+            public string OldClass;
+            public string NewClass;   // null — удаление
+            public int Hits;
+            public MigrationAction Action;
+        }
+
+        private readonly AppKit _kit;
+        private readonly Registry[] _regs;
+        private VisualElement _root;
+        private Button _apply;
+        private Label _summary;
+        private bool _dirty;
+
+        public string Title => "Editor";
+
+        public IdsTab(AppKit kit)
+        {
+            _kit = kit;
+            _regs = new[]
+            {
+                new Registry { Kind = ViewKind.Page, Title = "Страницы", Noun = "страница", HasClasses = true },
+                new Registry { Kind = ViewKind.Popup, Title = "Попапы", Noun = "попап", HasClasses = true },
+                new Registry { Kind = ViewKind.Fragment, Title = "Фрагменты", Noun = "фрагмент", HasClasses = false },
+            };
+        }
+
+        private IPageContext Context => _kit.Context;
+
+        // ============================================================ UI
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+
+            var bar = _kit.Row();
+            bar.style.marginBottom = 10f;
+            _summary = _kit.Hint("");
+            _summary.style.flexGrow = 1;
+            bar.Add(_summary);
+            _apply = _kit.Btn(NexusRole.Primary, "Apply", OnApply);
+            _apply.style.marginRight = 0f;
+            bar.Add(_apply);
+            _root.Add(bar);
+
+            foreach (var reg in _regs) _root.Add(BuildRegistry(reg));
+
+            _root.Add(_kit.Faint(
+                "Каждый id страницы и попапа даёт один USS-класс: префикс + id.ToLower() + постфикс — в Navigation.uss. " +
+                "В рантайме id становится PageId/PopupId/FragmentId. На Apply переименованные и удалённые id спросят, " +
+                "что делать со старым классом во всех uxml."));
+
+            return _root;
+        }
+
+        private VisualElement BuildRegistry(Registry reg)
+        {
+            var add = _kit.Btn(NexusRole.Ghost, "Добавить", () =>
+            {
+                reg.Rows.Add(new Row());
+                RebuildRows(reg);
+                MarkDirty();
+            }, small: true);
+            add.style.marginRight = 0f;
+
+            var hint = reg.HasClasses
+                ? $"{reg.Kind}Id и навигационный класс кнопки."
+                : "FragmentId. Навигационных классов у фрагментов нет — ими управляет вью-хозяин.";
+
+            var card = _kit.Card(reg.Title, hint, add);
+
+            if (reg.HasClasses)
+            {
+                var affixes = _kit.Row();
+                affixes.style.flexWrap = Wrap.NoWrap;
+
+                reg.PrefixField = _kit.Input(reg.Prefix, v => { reg.Prefix = v ?? ""; RefreshPreviews(reg); MarkDirty(); });
+                reg.PostfixField = _kit.Input(reg.Postfix, v => { reg.Postfix = v ?? ""; RefreshPreviews(reg); MarkDirty(); });
+
+                var p = _kit.Labeled("Префикс", reg.PrefixField, 64f);
+                p.style.width = Length.Percent(50);
+                p.style.marginRight = 12f;
+                affixes.Add(p);
+                affixes.Add(_kit.Labeled("Постфикс", reg.PostfixField, 64f));
+                card.Add(affixes);
+
+                reg.Example = _kit.Faint("");
+                reg.Example.style.marginBottom = 6f;
+                card.Add(reg.Example);
+            }
+
+            reg.List = new VisualElement();
+            card.Add(reg.List);
+            return card;
+        }
+
+        private void RebuildRows(Registry reg)
+        {
+            reg.List.Clear();
+
+            if (reg.Rows.Count == 0)
+            {
+                reg.List.Add(_kit.Faint("Пусто."));
+                Validate();
+                return;
+            }
+
+            foreach (var row in reg.Rows)
+            {
+                var line = _kit.ListRow();
+                line.style.flexWrap = Wrap.NoWrap;
+                row.Container = line;
+
+                var field = _kit.Input(row.Id, v =>
+                {
+                    row.Id = (v ?? "").Trim();
+                    RefreshPreview(reg, row);
+                    MarkDirty();
+                });
+                field.style.width = 200f;
+                field.style.flexShrink = 0;
+                line.Add(field);
+                line.Add(_kit.Gap(10f));
+
+                row.ClassLabel = _kit.Mono("");
+                row.ClassLabel.style.flexGrow = 1;
+                row.ClassLabel.style.flexShrink = 1;
+                line.Add(row.ClassLabel);
+
+                row.HashLabel = _kit.Mono("", NexusToken.TextFaint);
+                row.HashLabel.style.marginRight = 8f;
+                line.Add(row.HashLabel);
+
+                var captured = row;
+                var remove = _kit.Btn(NexusRole.Ghost, "✕", () =>
+                {
+                    reg.Rows.Remove(captured);
+                    RebuildRows(reg);
+                    MarkDirty();
+                }, small: true);
+                remove.tooltip = $"Убрать {reg.Noun} (на Apply спросит про класс в uxml)";
+                remove.style.marginRight = 0f;
+                line.Add(remove);
+
+                reg.List.Add(line);
+                RefreshPreview(reg, row);
+            }
+
+            Validate();
+        }
+
+        private void RefreshPreview(Registry reg, Row row)
+        {
+            var id = (row.Id ?? "").Trim();
+
+            if (row.ClassLabel != null)
+                row.ClassLabel.text = id.Length == 0 ? "—"
+                    : reg.HasClasses ? "." + AppNav.Compose(reg.Prefix, reg.Postfix, id)
+                    : AppCorePaths.ViewUxmlPath(reg.Kind, id);
+
+            if (row.HashLabel != null)
+                row.HashLabel.text = id.Length == 0 ? "" : $"0x{AppNav.HashOf(reg.Kind, id):X16}";
+
+            Validate();
+        }
+
+        private void RefreshPreviews(Registry reg)
+        {
+            if (reg.Example != null)
+                reg.Example.text = $"Пример: main_menu → .{AppNav.Compose(reg.Prefix, reg.Postfix, "main_menu")}";
+            foreach (var row in reg.Rows) RefreshPreview(reg, row);
+        }
+
+        // ============================================================ проверка
+
+        private int Validate()
+        {
+            // Класс уникален глобально (один uss), id — внутри реестра.
+            var classes = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var reg in _regs)
+            {
+                if (!reg.HasClasses) continue;
+                foreach (var row in reg.Rows)
+                {
+                    var id = (row.Id ?? "").Trim();
+                    if (id.Length == 0) continue;
+                    var cls = AppNav.Compose(reg.Prefix, reg.Postfix, id);
+                    classes.TryGetValue(cls, out var n);
+                    classes[cls] = n + 1;
+                }
+            }
+
+            var errors = 0;
+            foreach (var reg in _regs)
+            {
+                var ids = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var row in reg.Rows)
+                {
+                    var id = (row.Id ?? "").Trim();
+                    if (id.Length == 0) continue;
+                    ids.TryGetValue(id, out var n);
+                    ids[id] = n + 1;
+                }
+
+                foreach (var row in reg.Rows)
+                {
+                    var id = (row.Id ?? "").Trim();
+                    var conflict = id.Length == 0 || ids[id] > 1;
+
+                    if (!conflict && reg.HasClasses)
+                    {
+                        var cls = AppNav.Compose(reg.Prefix, reg.Postfix, id);
+                        conflict = classes[cls] > 1 || !AppNav.ValidClassRx.IsMatch(cls);
+                    }
+
+                    row.Conflict = conflict;
+                    if (conflict) errors++;
+                    if (row.Container != null)
+                        row.Container.style.backgroundColor = conflict ? _kit.Tok(NexusToken.ErrorSoft) : new Color(0, 0, 0, 0);
+                }
+            }
+
+            _apply?.SetEnabled(errors == 0);
+            if (_summary != null)
+            {
+                _summary.text = errors > 0
+                    ? $"Проблем: {errors} — пустой или повторяющийся id, совпадающий или недопустимый класс."
+                    : $"{_regs[0].Rows.Count} стр. · {_regs[1].Rows.Count} поп. · {_regs[2].Rows.Count} фрагм." + (_dirty ? " · есть неприменённые правки" : "");
+                _summary.style.color = _kit.Tok(errors > 0 ? NexusToken.Error : NexusToken.TextDim);
+            }
+
+            return errors;
+        }
+
+        // ============================================================ загрузка
+
+        private void Load()
+        {
+            var settings = AppCoreAssets.EnsureNavigationSettings();
+
+            foreach (var reg in _regs)
+            {
+                var (prefix, postfix) = AppNav.Affixes(settings, reg.Kind);
+                reg.Prefix = reg.OriginalPrefix = prefix;
+                reg.Postfix = reg.OriginalPostfix = postfix;
+                reg.PrefixField?.SetValueWithoutNotify(prefix);
+                reg.PostfixField?.SetValueWithoutNotify(postfix);
+
+                reg.Rows.Clear();
+                reg.OriginalIds.Clear();
+                foreach (var raw in settings.GetIds(reg.Kind))
+                {
+                    var id = (raw ?? "").Trim();
+                    reg.Rows.Add(new Row { Id = id, OriginalId = id.Length == 0 ? null : id });
+                    if (id.Length > 0 && !reg.OriginalIds.Contains(id)) reg.OriginalIds.Add(id);
+                }
+
+                RefreshPreviews(reg);
+                RebuildRows(reg);
+            }
+
+            ClearDirty();
+        }
+
+        // ============================================================ Apply
+
+        private void OnApply()
+        {
+            if (Validate() > 0)
+            {
+                Context.SetStatus("Сначала исправьте подсвеченные строки.", StatusKind.Error);
+                return;
+            }
+
+            var settings = AppCoreAssets.EnsureNavigationSettings();
+
+            // ---- 1. миграции классов в uxml ----
+            var migrations = new List<Migration>();
+            foreach (var reg in _regs) if (reg.HasClasses) migrations.AddRange(BuildMigrations(reg));
+
+            List<(string path, string text)> uxml = null;
+            if (migrations.Count > 0)
+            {
+                uxml = AppNav.LoadAllUxml();
+                foreach (var mig in migrations)
+                {
+                    foreach (var f in uxml) mig.Hits += AppNav.CountToken(f.text, mig.OldClass);
+                    if (mig.Hits == 0) { mig.Action = MigrationAction.Skip; continue; }
+                    AskMigration(mig);
+                }
+            }
+
+            // ---- 2. NavigationSettings ----
+            Undo.RecordObject(settings, "Edit App Navigation");
+            foreach (var reg in _regs)
+            {
+                settings.EditorSetIds(reg.Kind, Distinct(reg));
+                if (reg.HasClasses) settings.EditorSetAffixes(reg.Kind, reg.Prefix, reg.Postfix);
+            }
+            settings.EditorSetEntries(AppNav.BuildEntries(settings));
+            EditorUtility.SetDirty(settings);
+            AssetDatabase.SaveAssetIfDirty(settings);
+
+            // ---- 3. сгенерированное ----
+            AppNav.WriteNavigationUss(settings);
+            AppNav.WriteNavTargets(settings, out var targetsReport);
+
+            // ---- 4. uxml-миграция одним проходом ----
+            var filesChanged = 0;
+            if (uxml != null)
+            {
+                var map = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var mig in migrations)
+                    if (mig.Action != MigrationAction.Skip)
+                        map[mig.OldClass] = mig.Action == MigrationAction.Rename ? mig.NewClass : null;
+
+                if (map.Count > 0)
+                {
+                    foreach (var f in uxml)
+                    {
+                        var text = AppNav.RewriteTokens(f.text, map, out var changed);
+                        if (!changed) continue;
+                        File.WriteAllText(f.path, text);
+                        AssetDatabase.ImportAsset(f.path);
+                        filesChanged++;
+                    }
+                }
+            }
+
+            // ---- 5. переименование папок/uxml вью вслед за id ----
+            var renamed = 0;
+            var notes = new List<string>();
+            foreach (var reg in _regs)
+                foreach (var row in reg.Rows)
+                {
+                    var id = (row.Id ?? "").Trim();
+                    if (string.IsNullOrEmpty(row.OriginalId) || id.Length == 0 || row.OriginalId == id) continue;
+                    if (RenameViewAssets(reg.Kind, row.OriginalId, id, notes)) renamed++;
+                }
+
+            AssetDatabase.SaveAssets();
+            Load();
+
+            Context.SetStatus(
+                $"Применено. {targetsReport}. Изменено uxml: {filesChanged}, переименовано вью: {renamed}." +
+                (notes.Count > 0 ? " (" + string.Join("; ", notes) + ")" : ""),
+                notes.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
+        }
+
+        private static List<string> Distinct(Registry reg)
+        {
+            var ids = new List<string>();
+            foreach (var row in reg.Rows)
+            {
+                var id = (row.Id ?? "").Trim();
+                if (id.Length > 0 && !ids.Contains(id)) ids.Add(id);
+            }
+            return ids;
+        }
+
+        private static List<Migration> BuildMigrations(Registry reg)
+        {
+            var list = new List<Migration>();
+
+            foreach (var row in reg.Rows)
+            {
+                if (string.IsNullOrEmpty(row.OriginalId)) continue;
+                var id = (row.Id ?? "").Trim();
+                if (id.Length == 0) continue;
+
+                var oldClass = AppNav.Compose(reg.OriginalPrefix, reg.OriginalPostfix, row.OriginalId);
+                var newClass = AppNav.Compose(reg.Prefix, reg.Postfix, id);
+                if (!string.Equals(oldClass, newClass, StringComparison.Ordinal))
+                    list.Add(new Migration { Noun = reg.Noun, OldClass = oldClass, NewClass = newClass });
+            }
+
+            var surviving = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var row in reg.Rows) if (!string.IsNullOrEmpty(row.OriginalId)) surviving.Add(row.OriginalId);
+
+            foreach (var id in reg.OriginalIds)
+                if (!surviving.Contains(id))
+                    list.Add(new Migration { Noun = reg.Noun, OldClass = AppNav.Compose(reg.OriginalPrefix, reg.OriginalPostfix, id) });
+
+            return list;
+        }
+
+        private static void AskMigration(Migration mig)
+        {
+            if (mig.NewClass != null)
+            {
+                var r = EditorUtility.DisplayDialogComplex(
+                    "App — класс изменился",
+                    $"Класс {mig.Noun}:\n\n  .{mig.OldClass}\n      ↓\n  .{mig.NewClass}\n\nСтарый класс стоит на {mig.Hits} элемент(ах) uxml. Что с ним сделать?",
+                    "Переименовать", "Оставить", "Удалить");
+                mig.Action = r == 0 ? MigrationAction.Rename : r == 2 ? MigrationAction.Delete : MigrationAction.Skip;
+            }
+            else
+            {
+                var del = EditorUtility.DisplayDialog(
+                    "App — id удалён",
+                    $"Класс больше не существует:\n\n  .{mig.OldClass}\n\nОн стоит на {mig.Hits} элемент(ах) uxml. Удалить его оттуда?",
+                    "Удалить", "Оставить");
+                mig.Action = del ? MigrationAction.Delete : MigrationAction.Skip;
+            }
+        }
+
+        /// <summary>Переименовывает uxml и папку вью вслед за id. Только если цель свободна.</summary>
+        private static bool RenameViewAssets(ViewKind kind, string oldId, string newId, List<string> notes)
+        {
+            var oldDir = AppCorePaths.ViewDir(kind, oldId);
+            var newDir = AppCorePaths.ViewDir(kind, newId);
+            var oldUxml = AppCorePaths.ViewUxmlPath(kind, oldId);
+            var newFile = AppNaming.FileName(newId);
+            var moved = false;
+
+            if (File.Exists(oldUxml) && Path.GetFileNameWithoutExtension(oldUxml) != newFile)
+            {
+                var target = $"{oldDir}/{newFile}.uxml";
+                if (File.Exists(target)) notes.Add($"{oldId}→{newId}: uxml {target} уже есть");
+                else
+                {
+                    var err = AssetDatabase.RenameAsset(oldUxml, newFile);
+                    if (string.IsNullOrEmpty(err)) moved = true;
+                    else notes.Add($"{oldId}→{newId}: {err}");
+                }
+            }
+
+            if (oldDir != newDir && AssetDatabase.IsValidFolder(oldDir))
+            {
+                if (AssetDatabase.IsValidFolder(newDir)) notes.Add($"{oldId}→{newId}: папка {newDir} уже есть");
+                else
+                {
+                    var err = AssetDatabase.RenameAsset(oldDir, Path.GetFileName(newDir));
+                    if (string.IsNullOrEmpty(err)) moved = true;
+                    else notes.Add($"{oldId}→{newId}: {err}");
+                }
+            }
+
+            // Класс контроллера по канону тоже меняет имя — это правка кода, её делает человек.
+            if (moved && File.Exists($"{newDir}/{AppNaming.ControllerName(oldId, kind)}.cs"))
+                notes.Add($"переименуйте {AppNaming.ControllerName(oldId, kind)} → {AppNaming.ControllerName(newId, kind)}");
+
+            return moved;
+        }
+
+        // ============================================================ состояние
+
+        private void MarkDirty()
+        {
+            _dirty = true;
+            if (_apply != null) _apply.text = "Apply *";
+            Validate();
+        }
+
+        private void ClearDirty()
+        {
+            _dirty = false;
+            if (_apply != null) _apply.text = "Apply";
+            Validate();
+        }
+
+        public void Show()
+        {
+            if (!_dirty) Load();
+        }
+
+        public void Hide() { }
+
+        public void Refresh()
+        {
+            Load();
+            Context.SetStatus("Реестр перечитан из NavigationSettings.", StatusKind.Info);
+        }
+
+        public bool CanClose()
+        {
+            if (!_dirty) return true;
+            Context.SetStatus("Есть неприменённые правки реестра — нажмите Apply.", StatusKind.Warning);
+            return false;
+        }
+
+        public void Dispose() { }
+    }
+}

@@ -1,0 +1,15 @@
+namespace Signals
+{
+    /// <summary>
+    /// Editor-only enum used by <see cref="SignalTimelineModel"/>.
+    /// Stored as int in <see cref="TimelineEvent.Kind"/> for JsonUtility friendliness.
+    /// </summary>
+    public enum SignalEventKind
+    {
+        Created      = 0,
+        Subscribed   = 1,
+        Invoked      = 2,
+        Unsubscribed = 3,
+        Disposed     = 4,
+    }
+}

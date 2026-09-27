@@ -1,0 +1,340 @@
+// ============================================================
+//  BuildTab.Info.cs — подвкладка «BuildInfo».
+//
+//  BuildInfo — ассет AppCore (Assets/App/Settings/BuildInfo.asset): штамп перед билдом,
+//  откат после, значения Play Mode на лету — всё это делает AppCore сам, без страницы.
+//  Здесь: текущие значения, префикс/постфикс/хэш (build-config.json), строка версии поверх
+//  приложения и миграция старой развёртки страницы Build (Exerussus.Builds).
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Build;
+using Exerussus.AppCore.Editor;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Compilation;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Object = UnityEngine.Object;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed partial class BuildTab
+    {
+        private const string LegacyRuntimeAssembly = "Exerussus.BuildInfo";
+
+        private void RenderInfoTab()
+        {
+            var info = AppCoreAssets.EnsureBuildInfo();
+
+            var columns = _kit.Columns(out var left, out var right, 452f);
+            _content.Add(columns);
+
+            left.Add(ValuesCard(info));
+            left.Add(StampCard());
+            left.Add(OverlayCard(info));
+            right.Add(PreviewCard(info));
+
+            var legacy = LegacyRoot();
+            if (legacy != null) right.Add(MigrationCard(legacy));
+        }
+
+        // ============================================================ значения
+
+        private VisualElement ValuesCard(BuildInfo info)
+        {
+            var card = _kit.Card("Текущие значения",
+                "В закоммиченном ассете поля пустые. Штамп ставится на время билда, в Play Mode значения подставляются на лету.");
+
+            card.Add(Kv("Ассет", _kit.Mono(AppCorePaths.BuildInfoPath)));
+            card.Add(Kv("Режим", _kit.Mono(info.Mode)));
+            card.Add(Kv("Версия", _kit.Mono(VersionBumper.Current())));
+
+            var commit = _kit.Row();
+            commit.style.flexWrap = Wrap.NoWrap;
+            commit.Add(_kit.Mono(string.IsNullOrEmpty(_git.Hash) ? "—" : _git.Hash));
+            if (_git.IsDirty)
+            {
+                commit.Add(_kit.Gap(10f));
+                commit.Add(_kit.Dot(NexusToken.Warning));
+                commit.Add(_kit.Faint("есть незакоммиченные правки"));
+            }
+            card.Add(Kv("Коммит", commit));
+
+            var selected = SelectedProfile();
+            card.Add(Kv("Профиль", _kit.Mono(selected != null ? selected.Name : "—")));
+            card.Add(Kv("Платформа", _kit.Mono(EditorUserBuildSettings.activeBuildTarget.ToString())));
+            card.Add(Kv("Собрано", _kit.Faint("— заполняется только в билде")));
+            return card;
+        }
+
+        private VisualElement Kv(string key, VisualElement value) => _kit.Labeled(key, value, 110f);
+
+        // ============================================================ штамп
+
+        private VisualElement StampCard()
+        {
+            var card = _kit.Card("Версия в билде", "Общие для команды настройки штампа. Лежат в build-config.json и коммитятся.");
+
+            var prefix = _kit.Input(_config.prefix, v => { _config.prefix = v ?? ""; RequestConfigSave(); });
+            var postfix = _kit.Input(_config.postfix, v => { _config.postfix = v ?? ""; RequestConfigSave(); });
+            card.Add(Kv("Префикс", prefix));
+            card.Add(Kv("Постфикс", postfix));
+
+            var hash = new SliderInt(4, 12) { value = Mathf.Clamp(_config.hashLength, 4, 12), showInputField = true };
+            hash.RegisterValueChangedCallback(e => { _config.hashLength = e.newValue; RequestConfigSave(); });
+            _kit.PaintFieldInput(hash);
+            card.Add(Kv("Длина хэша", hash));
+
+            card.Add(_kit.Check("Отмечать грязное дерево (-dirty / *)", _config.markDirty, v => { _config.markDirty = v; RequestConfigSave(); }));
+            card.Add(_kit.Faint($"Полная версия: {PreviewFullVersion()}"));
+            return card;
+        }
+
+        // ============================================================ строка версии
+
+        private VisualElement OverlayCard(BuildInfo info)
+        {
+            var so = new SerializedObject(info);
+            var mode = so.FindProperty("overlayMode");
+            var corner = so.FindProperty("overlayCorner");
+            var opacity = so.FindProperty("overlayOpacity");
+            var fontSize = so.FindProperty("overlayFontSize");
+            var format = so.FindProperty("overlayFormat");
+            var log = so.FindProperty("logOnStart");
+
+            void Save(bool rerender)
+            {
+                so.ApplyModifiedProperties();
+                AssetDatabase.SaveAssetIfDirty(info);
+                if (rerender) Render();
+            }
+
+            var card = _kit.Card("Строка версии", "Мелкая полупрозрачная строка поверх приложения. Не ловит клики, живёт внутри полосы кадра.");
+
+            card.Add(Kv("Показ", Context.Ui.Segmented(new[] { "Выкл", "Dev-сборки", "Всегда" }, mode.enumValueIndex, i =>
+            {
+                mode.enumValueIndex = i;
+                Save(true);
+            })));
+
+            // ---- угол: 2×2 миниатюры ----
+            var corners = _kit.Row();
+            corners.style.flexWrap = Wrap.NoWrap;
+            for (var i = 0; i < 4; i++)
+            {
+                var index = i;
+                corners.Add(CornerButton(index, corner.enumValueIndex == index, () =>
+                {
+                    corner.enumValueIndex = index;
+                    Save(true);
+                }));
+            }
+            card.Add(Kv("Угол", corners));
+
+            var opacitySlider = new Slider(0.1f, 1f) { value = opacity.floatValue, showInputField = true };
+            opacitySlider.RegisterValueChangedCallback(e => { opacity.floatValue = e.newValue; Save(false); });
+            _kit.PaintFieldInput(opacitySlider);
+            card.Add(Kv("Прозрачность", opacitySlider));
+
+            var sizeSlider = new SliderInt(8, 32) { value = fontSize.intValue, showInputField = true };
+            sizeSlider.RegisterValueChangedCallback(e => { fontSize.intValue = e.newValue; Save(false); });
+            _kit.PaintFieldInput(sizeSlider);
+            card.Add(Kv("Размер", sizeSlider));
+
+            var formatField = _kit.Input(format.stringValue, v => { format.stringValue = v; Save(false); });
+            var formatBox = new VisualElement();
+            formatBox.Add(formatField);
+            var tokens = _kit.Mono("{version} {hash} {dirty} {profile} {platform} {date}", NexusToken.TextFaint);
+            tokens.style.marginTop = 4f;
+            formatBox.Add(tokens);
+            card.Add(Kv("Формат", formatBox));
+
+            card.Add(_kit.Divider(10f));
+            card.Add(_kit.Check("Писать строку в лог на старте", log.boolValue, v => { log.boolValue = v; Save(false); }));
+
+            return card;
+        }
+
+        private VisualElement CornerButton(int corner, bool selected, Action onClick)
+        {
+            var box = new VisualElement();
+            box.style.width = 30f;
+            box.style.height = 20f;
+            box.style.marginRight = 6f;
+            box.style.backgroundColor = _kit.Tok(selected ? NexusToken.AccentSoft : NexusToken.BgHard);
+            AppKit.SetBorder(box, _kit.Tok(selected ? NexusToken.Accent : NexusToken.Divider), 1f, 4f);
+            box.tooltip = corner switch { 0 => "Слева сверху", 1 => "Справа сверху", 2 => "Слева снизу", _ => "Справа снизу" };
+
+            var dot = new VisualElement();
+            dot.style.position = Position.Absolute;
+            dot.style.width = 5f;
+            dot.style.height = 5f;
+            dot.style.backgroundColor = _kit.Tok(selected ? NexusToken.Accent : NexusToken.TextFaint);
+            AppKit.SetRadius(dot, 1f);
+            if (corner is 0 or 2) dot.style.left = 4f; else dot.style.right = 4f;
+            if (corner is 0 or 1) dot.style.top = 4f; else dot.style.bottom = 4f;
+            box.Add(dot);
+
+            box.RegisterCallback<PointerDownEvent>(e => { if (e.button == 0) onClick(); });
+            return box;
+        }
+
+        // ============================================================ предпросмотр
+
+        private VisualElement PreviewCard(BuildInfo info)
+        {
+            var card = _kit.Card("Предпросмотр");
+
+            var frame = new VisualElement();
+            frame.style.height = 235f;
+            frame.style.backgroundColor = _kit.Tok(NexusToken.BgHard);
+            AppKit.SetBorder(frame, _kit.Tok(NexusToken.Divider), 1f, 6f);
+            frame.style.overflow = Overflow.Hidden;
+
+            // Чёрные поля обрезки по бокам и полоса кадра — как в широком окне.
+            var band = new VisualElement();
+            band.style.position = Position.Absolute;
+            band.style.left = 34f; band.style.right = 34f;
+            band.style.top = 0f; band.style.bottom = 0f;
+            band.style.backgroundColor = _kit.Tok(NexusToken.BgRaised);
+            band.style.justifyContent = Justify.Center;
+            band.style.alignItems = Align.Center;
+            band.Add(_kit.Faint("[ЭКРАН ИГРЫ]"));
+            frame.Add(band);
+
+            var mode = info.OverlayMode;
+            if (mode != VersionOverlayMode.Off)
+            {
+                var text = new Label(PreviewOverlayText(info));
+                text.style.position = Position.Absolute;
+                text.style.fontSize = Mathf.Max(8, info.OverlayFontSize - 2);
+                text.style.color = new StyleColor(WithAlpha(_kit.Tok(NexusToken.TextNormal), info.OverlayOpacity));
+                text.style.paddingLeft = 6f; text.style.paddingRight = 6f;
+                text.style.paddingTop = 3f; text.style.paddingBottom = 3f;
+
+                var c = info.OverlayCorner;
+                if (c is VersionOverlayCorner.TopLeft or VersionOverlayCorner.BottomLeft) text.style.left = 0f; else text.style.right = 0f;
+                if (c is VersionOverlayCorner.TopLeft or VersionOverlayCorner.TopRight) text.style.top = 0f; else text.style.bottom = 0f;
+                band.Add(text);
+            }
+
+            card.Add(frame);
+            card.Add(_kit.Faint(mode == VersionOverlayMode.Off
+                ? "Строка выключена."
+                : mode == VersionOverlayMode.DevelopmentBuilds
+                    ? "Видна в Development-сборках и в редакторе."
+                    : "Видна всегда."));
+            return card;
+        }
+
+        private static Color WithAlpha(Color c, float a) => new(c.r, c.g, c.b, a);
+
+        private string PreviewOverlayText(BuildInfo info)
+        {
+            // Временный экземпляр со значениями «как будет в билде» — формат считает сам BuildInfo.
+            var temp = ScriptableObject.CreateInstance<BuildInfo>();
+            try
+            {
+                var selected = SelectedProfile();
+                temp.EditorStamp(VersionBumper.Current(), _git.Hash, _git.IsDirty, _config.prefix, _config.postfix,
+                    selected != null ? selected.Name : "editor", EditorUserBuildSettings.activeBuildTarget.ToString(),
+                    DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+                return temp.Format(info.OverlayFormat);
+            }
+            finally
+            {
+                Object.DestroyImmediate(temp);
+            }
+        }
+
+        // ============================================================ миграция старой развёртки
+
+        private static string LegacyRoot()
+        {
+            var asmdef = CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(LegacyRuntimeAssembly);
+            if (string.IsNullOrEmpty(asmdef) || !File.Exists(asmdef)) return null;
+            return Path.GetDirectoryName(asmdef)?.Replace('\\', '/');
+        }
+
+        private VisualElement MigrationCard(string root)
+        {
+            var card = _kit.Card("Миграция", "Старая развёртка страницы Build больше не нужна: BuildInfo теперь часть AppCore.");
+
+            var files = LegacyFiles(root);
+            card.Add(_kit.Status(StatusKind.Warning, "Найдена развёртка Exerussus.Builds", $"{root} · {files.Count} файл(ов)"));
+
+            var row = _kit.Row();
+            row.Add(_kit.Spacer());
+            var migrate = _kit.Btn(NexusRole.Alarm, "Удалить и перенести настройки", () => MigrateLegacy(root));
+            migrate.style.marginRight = 0f;
+            row.Add(migrate);
+            card.Add(row);
+            return card;
+        }
+
+        private static List<string> LegacyFiles(string root)
+        {
+            var list = new List<string>();
+            foreach (var rel in new[]
+                     {
+                         "Exerussus.BuildInfo.asmdef", "BuildInfo.cs",
+                         "Editor/Exerussus.BuildInfo.Editor.asmdef", "Editor/BuildInfoEditor.cs",
+                         "Editor/GitInfo.cs", "Editor/build-config.json",
+                     })
+            {
+                var path = $"{root}/{rel}";
+                if (File.Exists(path)) list.Add(path);
+            }
+
+            var resources = $"{root}/Resources";
+            if (Directory.Exists(resources))
+                foreach (var asset in Directory.GetFiles(resources, "*.asset"))
+                    list.Add(asset.Replace('\\', '/'));
+
+            return list;
+        }
+
+        private void MigrateLegacy(string root)
+        {
+            var files = LegacyFiles(root);
+            if (!EditorUtility.DisplayDialog("App — миграция BuildInfo",
+                    "Настройки из старого build-config.json переедут в " + AppCorePaths.BuildConfigPath +
+                    " (если там ещё пусто), затем будут удалены:\n\n  " + string.Join("\n  ", files) +
+                    "\n\nКод, ссылающийся на Exerussus.Builds.BuildInfo, нужно перевести на Exerussus.AppCore.Build.BuildInfo.",
+                    "Мигрировать", "Отмена"))
+                return;
+
+            // ---- 1. настройки ----
+            var oldConfig = $"{root}/Editor/build-config.json";
+            if (File.Exists(oldConfig) && !File.Exists(AppCorePaths.BuildConfigPath))
+            {
+                var migrated = JsonStore.Load<BuildConfig>(oldConfig);
+                migrated.Migrate();
+                AppCoreEditorBridge.EnsureSettingsFolder();
+                JsonStore.SaveAsset(AppCorePaths.BuildConfigPath, migrated);
+            }
+
+            // ---- 2. файлы развёртки ----
+            var failed = new List<string>();
+            foreach (var path in files)
+                if (!AssetDatabase.DeleteAsset(path)) failed.Add(path);
+
+            foreach (var dir in new[] { $"{root}/Resources", $"{root}/Editor", root })
+                if (AssetDatabase.IsValidFolder(dir) && Directory.GetFileSystemEntries(dir).Length == 0)
+                    AssetDatabase.DeleteAsset(dir);
+
+            AssetDatabase.Refresh();
+            LoadAll();
+            Render();
+
+            Context.SetStatus(failed.Count == 0
+                    ? "Старая развёртка BuildInfo удалена, настройки перенесены."
+                    : "Не удалось удалить: " + string.Join(", ", failed),
+                failed.Count == 0 ? StatusKind.Ok : StatusKind.Warning);
+        }
+    }
+}

@@ -1,0 +1,405 @@
+// ============================================================
+//  TextTab.cs — вкладка «Text»: кириллица и символы проекта.
+//
+//  В билде нет системных шрифтов: всё, чего нет в атласах цепочки, просто не нарисуется
+//  (в редакторе дыру не видно — символ молча берётся из шрифта ОС). Здесь настраиваются
+//  наборы символов, сканирование исходников и цепочка шрифтов; «Применить» прописывает
+//  настройки текста в PanelSettings и запекает атласы. Логика — в AppCore (AppTextTools),
+//  там же проверка перед билдом.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.TextCore.Text;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class TextTab : IAppTab
+    {
+        private readonly AppKit _kit;
+        private VisualElement _root;
+        private AppTextSettings _settings;
+        private AppTextTools.Report _report;
+        private IVisualElementScheduledItem _save;
+
+        public string Title => "Text";
+
+        public TextTab(AppKit kit) => _kit = kit;
+
+        private IPageContext Context => _kit.Context;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            return _root;
+        }
+
+        public void Show()
+        {
+            _settings = AppCoreAssets.EnsureTextSettings();
+            _report = _settings.primaryFont != null ? AppTextTools.Analyze(_settings) : null;
+            Render();
+        }
+
+        public void Hide() => Flush();
+        public void Refresh() => Show();
+        public bool CanClose() => true;
+        public void Dispose() => Flush();
+
+        // ============================================================ сохранение
+
+        private void Changed(bool rerender = false)
+        {
+            if (_settings == null) return;
+            EditorUtility.SetDirty(_settings);
+
+            // Ввод текста не пишет ассет на каждый символ.
+            _save ??= _root.schedule.Execute(Flush);
+            _save.ExecuteLater(500);
+
+            if (rerender) Render();
+        }
+
+        private void Flush()
+        {
+            if (_settings != null) AssetDatabase.SaveAssetIfDirty(_settings);
+        }
+
+        private void Edit(Action change, bool rerender = false)
+        {
+            Undo.RecordObject(_settings, "Edit App Text Settings");
+            change();
+            Changed(rerender);
+        }
+
+        // ============================================================ рендер
+
+        private void Render()
+        {
+            _root.Clear();
+            if (_settings == null) return;
+
+            var columns = _kit.Columns(out var left, out var right, 392f);
+            _root.Add(columns);
+
+            left.Add(SetsCard());
+            left.Add(ScanCard());
+            right.Add(FontsCard());
+            right.Add(CheckCard());
+        }
+
+        private VisualElement SetsCard()
+        {
+            var card = _kit.Card("Наборы символов",
+                "Что обязано лежать в атласе. В билде нет системных шрифтов: всё, чего нет в цепочке, не нарисуется.");
+
+            var grid = _kit.Row();
+            grid.Add(SetToggle("Latin", "U+0020–007E", _settings.basicLatin, v => _settings.basicLatin = v));
+            grid.Add(SetToggle("Latin-1", "U+00A0–00FF", _settings.latinSupplement, v => _settings.latinSupplement = v));
+            grid.Add(SetToggle("Кириллица", "U+0400–04FF", _settings.cyrillic, v => _settings.cyrillic = v));
+            grid.Add(SetToggle("Пунктуация", "U+2010–203A", _settings.generalPunctuation, v => _settings.generalPunctuation = v));
+            grid.Add(SetToggle("Стрелки", "U+2190–2199", _settings.arrows, v => _settings.arrows = v));
+            card.Add(grid);
+
+            card.Add(_kit.Divider(10f));
+
+            card.Add(_kit.Text("Дополнительные символы", NexusToken.TextDim, 11));
+            var extra = _kit.Input(_settings.extraCharacters, v => Edit(() => _settings.extraCharacters = v ?? ""));
+            extra.multiline = true;
+            extra.style.minHeight = 44f;
+            extra.style.fontSize = 14;
+            extra.style.marginTop = 4f;
+            card.Add(extra);
+            card.Add(_kit.Faint("Вписываются подряд, без разделителей. Дубликаты схлопываются."));
+
+            var add = _kit.Btn(NexusRole.Ghost, "Добавить диапазон", () => Edit(() => _settings.customRanges.Add(new AppTextSettings.UnicodeRange()), rerender: true), small: true);
+            add.style.marginRight = 0f;
+
+            var head = _kit.Row();
+            head.style.marginTop = 12f;
+            head.style.marginBottom = 4f;
+            head.Add(_kit.Text("Свои диапазоны", NexusToken.TextDim, 11));
+            head.Add(_kit.Spacer());
+            head.Add(add);
+            card.Add(head);
+
+            if (_settings.customRanges.Count == 0) card.Add(_kit.Faint("Нет."));
+
+            foreach (var range in _settings.customRanges)
+            {
+                var r = range;
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginTop = 3f;
+
+                var name = _kit.Input(r.name, v => Edit(() => r.name = v));
+                name.style.flexGrow = 1;
+                row.Add(name);
+                row.Add(_kit.Gap(6f));
+
+                var from = _kit.Input(r.from, v => Edit(() => r.from = v));
+                from.style.width = 72f;
+                row.Add(from);
+                row.Add(_kit.Faint(" – "));
+
+                var to = _kit.Input(r.to, v => Edit(() => r.to = v));
+                to.style.width = 72f;
+                row.Add(to);
+                row.Add(_kit.Gap(6f));
+
+                var remove = _kit.Btn(NexusRole.Ghost, "✕", () => Edit(() => _settings.customRanges.Remove(r), rerender: true), small: true);
+                remove.style.marginRight = 0f;
+                row.Add(remove);
+
+                card.Add(row);
+            }
+
+            return card;
+        }
+
+        private VisualElement SetToggle(string label, string range, bool value, Action<bool> set)
+        {
+            var cell = _kit.Row();
+            cell.style.flexWrap = Wrap.NoWrap;
+            cell.style.width = Length.Percent(50);
+
+            var toggle = _kit.Check(label, value, v => Edit(() => set(v)));
+            toggle.style.flexGrow = 1;
+            cell.Add(toggle);
+
+            var code = _kit.Mono(range, NexusToken.TextFaint);
+            code.style.marginRight = 16f;
+            cell.Add(code);
+            return cell;
+        }
+
+        private VisualElement ScanCard()
+        {
+            var enabled = _kit.Check("Включено", _settings.scanSources, v => Edit(() => _settings.scanSources = v));
+            enabled.style.marginRight = 0f;
+
+            var card = _kit.Card("Сканирование исходников",
+                "Добирает все не-ASCII символы из файлов, включая escape-последовательности вида \\uXXXX.", enabled);
+
+            // ---- папки ----
+            var folders = _kit.Row();
+            foreach (var folder in _settings.scanFolders)
+            {
+                var f = folder;
+                var chip = _kit.Row();
+                chip.style.flexWrap = Wrap.NoWrap;
+                chip.style.backgroundColor = _kit.Tok(NexusToken.BgHard);
+                AppKit.SetBorder(chip, _kit.Tok(NexusToken.Divider), 1f, 5f);
+                chip.style.paddingLeft = 8f;
+                chip.style.marginRight = 6f; chip.style.marginBottom = 4f;
+                chip.Add(_kit.Mono(f));
+                var x = _kit.Btn(NexusRole.Ghost, "✕", () => Edit(() => _settings.scanFolders.Remove(f), rerender: true), small: true);
+                x.style.marginRight = 0f;
+                x.style.marginLeft = 4f;
+                AppKit.SetBorderColor(x, new Color(0, 0, 0, 0));
+                chip.Add(x);
+                folders.Add(chip);
+            }
+
+            var addFolder = _kit.Btn(NexusRole.Ghost, "Папка", AddFolder, small: true);
+            addFolder.style.marginBottom = 4f;
+            folders.Add(addFolder);
+            card.Add(_kit.Labeled("Папки", folders, 86f));
+
+            // ---- расширения ----
+            var ext = _kit.Input(string.Join(" ", _settings.scanExtensions), v => Edit(() =>
+            {
+                _settings.scanExtensions.Clear();
+                foreach (var part in (v ?? "").Split(new[] { ' ', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                    _settings.scanExtensions.Add(part.StartsWith(".") ? part : "." + part);
+            }));
+            card.Add(_kit.Labeled("Расширения", ext, 86f));
+
+            if (_report != null && _report.FilesScanned > 0)
+                card.Add(_kit.Faint($"Последний скан: {_report.FilesScanned} файлов · {_report.OutsideSets} символов вне включённых наборов"));
+
+            return card;
+        }
+
+        private void AddFolder()
+        {
+            var abs = EditorUtility.OpenFolderPanel("Папка для сканирования", Application.dataPath, "");
+            if (string.IsNullOrEmpty(abs)) return;
+
+            var project = Path.GetFullPath(Path.Combine(Application.dataPath, "..")).Replace('\\', '/');
+            abs = abs.Replace('\\', '/');
+            if (!abs.StartsWith(project + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                Context.SetStatus("Папка должна быть внутри проекта.", StatusKind.Warning);
+                return;
+            }
+
+            var rel = abs.Substring(project.Length + 1);
+            if (_settings.scanFolders.Contains(rel)) return;
+            Edit(() => _settings.scanFolders.Add(rel), rerender: true);
+        }
+
+        private VisualElement FontsCard()
+        {
+            var card = _kit.Card("Цепочка шрифтов", "Сверху вниз: символ берётся из первого шрифта, где он есть.");
+
+            card.Add(FontRow(1, _settings.primaryFont, f => Edit(() => _settings.primaryFont = f, rerender: true), "Основной", null));
+
+            for (var i = 0; i < _settings.fallbacks.Count; i++)
+            {
+                var fb = _settings.fallbacks[i];
+                card.Add(_kit.Divider(2f));
+                card.Add(FontRow(i + 2, fb.font, f => Edit(() => fb.font = f, rerender: true), "Запасной", fb));
+            }
+
+            var add = _kit.Btn(NexusRole.Ghost, "Добавить запасной шрифт",
+                () => Edit(() => _settings.fallbacks.Add(new AppTextSettings.FallbackFont()), rerender: true), small: true);
+            add.style.alignSelf = Align.FlexStart;
+            add.style.marginTop = 8f;
+            card.Add(add);
+            return card;
+        }
+
+        private VisualElement FontRow(int index, FontAsset font, Action<FontAsset> set, string role, AppTextSettings.FallbackFont fallback)
+        {
+            var box = new VisualElement();
+            box.style.paddingTop = 6f;
+            box.style.paddingBottom = 6f;
+
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+
+            var n = _kit.Mono(index.ToString(), NexusToken.TextFaint);
+            n.style.width = 16f;
+            row.Add(n);
+
+            var field = new ObjectField { objectType = typeof(FontAsset), value = font, allowSceneObjects = false };
+            field.style.flexGrow = 1;
+            field.style.flexShrink = 1;
+            field.RegisterValueChangedCallback(e => set(e.newValue as FontAsset));
+            _kit.PaintLabels(field);
+            row.Add(field);
+
+            if (fallback != null)
+            {
+                var choices = new List<string> { "Весь набор", "Только эти" };
+                var dd = _kit.Dropdown(null, choices, (int)fallback.coverage,
+                    i => Edit(() => fallback.coverage = (FontCoverage)i, rerender: true));
+                dd.style.width = 112f;
+                dd.style.marginLeft = 6f;
+                row.Add(dd);
+
+                var remove = _kit.Btn(NexusRole.Ghost, "✕", () => Edit(() => _settings.fallbacks.Remove(fallback), rerender: true), small: true);
+                remove.style.marginLeft = 6f;
+                remove.style.marginRight = 0f;
+                row.Add(remove);
+            }
+
+            box.Add(row);
+
+            var meta = font == null ? $"{role} · не задан"
+                : $"{role} · {(font.atlasPopulationMode is AtlasPopulationMode.Dynamic or AtlasPopulationMode.DynamicOS ? "Dynamic" : "не Dynamic — не допекается")}";
+            var metaLabel = _kit.Faint(meta);
+            metaLabel.style.marginLeft = 16f;
+            metaLabel.style.marginTop = 2f;
+            box.Add(metaLabel);
+
+            if (fallback != null && fallback.coverage == FontCoverage.OnlyListed)
+            {
+                var chars = _kit.Input(fallback.characters, v => Edit(() => fallback.characters = v ?? ""));
+                chars.style.marginLeft = 16f;
+                chars.style.marginTop = 4f;
+                chars.style.fontSize = 14;
+                box.Add(chars);
+            }
+
+            return box;
+        }
+
+        private VisualElement CheckCard()
+        {
+            var card = _kit.Card("Проверка", "Считается по всей цепочке. Символ, которого нет в основном, но есть в запасном, — норма.");
+
+            if (_settings.primaryFont == null)
+            {
+                card.Add(_kit.Status(StatusKind.Warning, "Не задан основной шрифт."));
+            }
+            else if (_report != null)
+            {
+                if (!string.IsNullOrEmpty(_report.Error))
+                {
+                    card.Add(_kit.Status(StatusKind.Error, _report.Error));
+                }
+                else
+                {
+                    var covered = _report.Required - _report.Uncovered.Count;
+                    card.Add(_kit.Status(StatusKind.Ok, $"{covered} символов покрыты цепочкой"));
+
+                    if (_report.CoveredByFallback.Count > 0)
+                        card.Add(_kit.Faint($"Из них {_report.CoveredByFallback.Count} — запасными шрифтами."));
+
+                    if (_report.Uncovered.Count > 0)
+                    {
+                        var detail = new System.Text.StringBuilder();
+                        var shown = Math.Min(8, _report.Uncovered.Count);
+                        for (var i = 0; i < shown; i++)
+                        {
+                            var code = _report.Uncovered[i];
+                            if (i > 0) detail.Append('\n');
+                            detail.Append($"U+{code:X4} {AppTextTools.Printable(code)}");
+                            if (_report.Locations.TryGetValue(code, out var at)) detail.Append(" · ").Append(at);
+                        }
+                        if (_report.Uncovered.Count > shown) detail.Append($"\n… и ещё {_report.Uncovered.Count - shown}");
+
+                        card.Add(_kit.Status(StatusKind.Error,
+                            $"{_report.Uncovered.Count} символ(ов) не покрыто ни одним шрифтом", detail.ToString()));
+                    }
+
+                    if (_report.Fonts.Count == 0)
+                        card.Add(_kit.Faint("Отчёт по текущим атласам. «Применить» допечёт недостающее."));
+                }
+            }
+
+            var before = _kit.Check("Проверять перед билдом", _settings.checkBeforeBuild, v => Edit(() => _settings.checkBeforeBuild = v));
+            before.style.marginTop = 8f;
+            card.Add(before);
+            var hint = _kit.Faint("Перед сборкой — пересканировать и допечь; непокрытый символ останавливает сборку.");
+            hint.style.marginLeft = 20f;
+            card.Add(hint);
+
+            var buttons = _kit.Row();
+            buttons.style.marginTop = 10f;
+            buttons.Add(_kit.Spacer());
+            buttons.Add(_kit.Btn(NexusRole.Common, "Только отчёт", () =>
+            {
+                Flush();
+                _report = AppTextTools.Analyze(_settings);
+                Context.SetStatus(AppTextTools.Describe(_report).Replace("\n", "  "), _report.Ok ? StatusKind.Ok : StatusKind.Warning);
+                Render();
+            }));
+            var apply = _kit.Btn(NexusRole.Primary, "Применить", () =>
+            {
+                Flush();
+                _report = AppTextTools.Apply(_settings);
+                Debug.Log("[App] Текст:\n" + AppTextTools.Describe(_report));
+                Context.SetStatus(_report.Ok ? "Текст применён." : "Текст применён, но есть непокрытые символы — см. отчёт.",
+                    _report.Ok ? StatusKind.Ok : StatusKind.Warning);
+                Render();
+            });
+            apply.style.marginRight = 0f;
+            apply.SetEnabled(_settings.primaryFont != null);
+            buttons.Add(apply);
+            card.Add(buttons);
+
+            return card;
+        }
+    }
+}

@@ -2,8 +2,7 @@
     "name": "Exerussus.Nexus.Pages.Workspace",
     "rootNamespace": "Exerussus.Nexus.Pages.Workspace",
     "references": [
-        "Exerussus.Nexus.Abstractions",
-        "Newtonsoft.Json"
+        "Exerussus.Nexus.Abstractions"
     ],
     "includePlatforms": [
         "Editor"

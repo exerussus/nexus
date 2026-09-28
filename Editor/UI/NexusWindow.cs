@@ -37,7 +37,10 @@ namespace Exerussus.Nexus.UI
         private Label         _status;
 
         private Dictionary<string, DiscoveredPlugin> _byId = new Dictionary<string, DiscoveredPlugin>();
-        private string _selectedId = HealthId;
+
+        // выбор живёт в сторе: окно пересоздаётся (максимизация Game/Scene, смена
+        // раскладки, рекомпил), поэтому поле — лишь кэш последнего восстановленного значения
+        private string _selectedId = NexusSelectionStore.ActiveId ?? HealthId;
 
         [MenuItem("Exerussus/Nexus/Open")]
         public static void Open()
@@ -184,10 +187,14 @@ namespace Exerussus.Nexus.UI
                 _sidebar.Add(hint);
             }
 
-            if (_selectedId != HealthId && !_byId.ContainsKey(_selectedId))
-                _selectedId = HealthId;
+            // окно могло быть пересоздано — берём сохранённый выбор
+            var saved    = NexusSelectionStore.ActiveId ?? _selectedId;
+            var available = saved == HealthId || _byId.ContainsKey(saved);
+            _selectedId  = available ? saved : HealthId;   // страница скрыта/исчезла — временно Health
 
-            Select(_selectedId);
+            // восстановление не переписывает сохранённый выбор: страница может вернуться
+            // (после Apply/рекомпила/показа), и тогда откроется именно она
+            Select(_selectedId, persist: false);
         }
 
         private static bool IsGame(string category)
@@ -244,9 +251,15 @@ namespace Exerussus.Nexus.UI
             return item;
         }
 
-        private void Select(string id)
+        /// <summary>Выбор пользователем — запоминаем.</summary>
+        private void Select(string id) => Select(id, persist: true);
+
+        /// <summary>persist=false — для ВОССТАНОВЛЕНИЯ и вынужденного отката: временно
+        /// недоступная страница не должна затирать сохранённый выбор.</summary>
+        private void Select(string id, bool persist)
         {
             _selectedId = id;
+            if (persist) NexusSelectionStore.ActiveId = id;   // переживёт пересоздание окна и рекомпил
             RenderContent(id);
             RefreshHighlight();
         }

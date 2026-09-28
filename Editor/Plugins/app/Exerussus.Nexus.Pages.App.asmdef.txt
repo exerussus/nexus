@@ -3,7 +3,8 @@
     "rootNamespace": "Exerussus.Nexus.Pages.App",
     "references": [
         "Exerussus.Nexus.Abstractions",
-        "Exerussus.AppCore"
+        "Exerussus.AppCore",
+        "Exerussus.AppCore.Editor"
     ],
     "includePlatforms": [
         "Editor"

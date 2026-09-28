@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
+using Exerussus.AppCore.Signals;
 using UnityEditor;
 
 namespace Signals
 {
     /// <summary>
-    /// Editor-only ingester. Listens to <see cref="Signal.EditorHook"/>
+    /// Editor-only ingester. Listens to <see cref="AppSignals.EditorHook"/> (шина AppCore)
     /// and turns the stream of events into <see cref="Model"/>.
     /// <para>
     /// Everyone else (the page, the exporter) reads <see cref="Model"/>
@@ -48,6 +48,7 @@ namespace Signals
             // события из «противоположного» режима.
             Model = new SignalTimelineModel { RecordingStartTime = Now() };
             _nextId  = 1;
+            _idMap.Clear();
             _nextSeq = 1;
             ClearInvokeStack();
             Changed?.Invoke();
@@ -57,10 +58,8 @@ namespace Signals
         private static int _nextId  = 1;
         private static int _nextSeq = 1;
 
-        // Maps an alive Signal -> stable numeric id. WeakRef so we don't
-        // keep signals alive past their Dispose.
-        private static readonly ConditionalWeakTable<ISignal, IdBox> _idMap = new();
-        private sealed class IdBox { public int Id; }
+        // Id сигнала (строка) -> стабильный номер дорожки на время записи.
+        private static readonly Dictionary<string, int> _idMap = new(StringComparer.Ordinal);
 
         // -- Call-graph invoke stack -----------------------------------------
         //
@@ -87,7 +86,7 @@ namespace Signals
         private static readonly List<InvokeFrame>  _invokeStack = new(8); // index 0 == bottom
         private static readonly Stack<InvokeFrame>  _framePool   = new();
 
-        private static void OnInvokeBegin(ISignal s, Type pt)
+        private static void OnInvokeBegin(string s)
         {
             // Maintain the stack unconditionally (even when tracking is off) so
             // push/pop stay balanced. Only burn a sequence number when tracking
@@ -97,7 +96,7 @@ namespace Signals
             _invokeStack.Add(f);
         }
 
-        private static void OnInvokeEnd(ISignal s, Type pt)
+        private static void OnInvokeEnd(string s)
         {
             int n = _invokeStack.Count;
             if (n == 0) return; // defensive; should never happen (balanced)
@@ -114,16 +113,15 @@ namespace Signals
 
         static SignalRegistry()
         {
-            Signal.EditorHook.Created      = OnCreated;
-            Signal.EditorHook.Subscribed   = OnSubscribed;
-            Signal.EditorHook.Invoked      = OnInvoked;
-            Signal.EditorHook.Unsubscribed = OnUnsubscribed;
-            Signal.EditorHook.Disposed     = OnDisposed;
+            AppSignals.EditorHook.Created      = OnCreated;
+            AppSignals.EditorHook.Subscribed   = OnSubscribed;
+            AppSignals.EditorHook.Invoked      = OnInvoked;
+            AppSignals.EditorHook.Unsubscribed = OnUnsubscribed;
 
             // Call-graph causality: these bracket every Invoke's dispatch
             // so we can maintain a synchronous invoke stack (see OnInvoked).
-            Signal.EditorHook.InvokeBegin  = OnInvokeBegin;
-            Signal.EditorHook.InvokeEnd    = OnInvokeEnd;
+            AppSignals.EditorHook.InvokeBegin  = OnInvokeBegin;
+            AppSignals.EditorHook.InvokeEnd    = OnInvokeEnd;
 
             // RecordingStartTime — origin of the displayed time axis.
             // Now() гарантирует одинаковую шкалу с Time-источником, который
@@ -145,6 +143,7 @@ namespace Signals
             {
                 Model = new SignalTimelineModel { RecordingStartTime = 0.0 };
                 _nextId  = 1;
+                _idMap.Clear();
                 _nextSeq = 1;
                 ClearInvokeStack();
                 Changed?.Invoke();
@@ -168,6 +167,7 @@ namespace Signals
         {
             Model = new SignalTimelineModel { RecordingStartTime = Now() };
             _nextId  = 1;
+            _idMap.Clear();
             _nextSeq = 1;
             ClearInvokeStack();
             Changed?.Invoke();
@@ -186,14 +186,14 @@ namespace Signals
 
         // -- Hook handlers ----------------------------------------------------
 
-        private static void OnCreated(ISignal s, string file, int line, string member)
+        private static void OnCreated(string s, string file, int line, string member)
         {
             if (!IsEnabled) return;
             double t     = Now();
             var    track = GetOrCreateTrack(s, t, file, line, member);
             track.IsAlive       = true;
             track.DisposedAt    = -1;
-            track.Name          = s.Name;
+            track.Name          = s;
             track.CreatedAt     = t;
             track.CreatedFile   = file;
             track.CreatedLine   = line;
@@ -210,7 +210,7 @@ namespace Signals
             });
         }
 
-        private static void OnSubscribed(ISignal s, Type pt, int count,
+        private static void OnSubscribed(string s, int count,
                                          string file, int line, string member)
         {
             if (!IsEnabled) return;
@@ -222,7 +222,7 @@ namespace Signals
                 Sequence                = _nextSeq++,
                 Time                    = t,
                 Kind                    = (int)SignalEventKind.Subscribed,
-                PayloadType             = pt?.Name ?? "",
+                PayloadType             = "",
                 FilePath                = file,
                 LineNumber              = line,
                 MemberName              = member,
@@ -230,7 +230,7 @@ namespace Signals
             });
         }
 
-        private static void OnInvoked(ISignal s, Type pt, string summary, int count, List<string> errors,
+        private static void OnInvoked(string s, string summary, int count, List<string> errors,
                                       string file, int line, string member)
         {
             if (!IsEnabled) return;
@@ -250,7 +250,7 @@ namespace Signals
                 Sequence                = seq,
                 Time                    = t,
                 Kind                    = (int)SignalEventKind.Invoked,
-                PayloadType             = pt?.Name ?? "",
+                PayloadType             = summary != null ? "string" : "",
                 PayloadSummary          = summary ?? "",
                 FilePath                = file,
                 LineNumber              = line,
@@ -261,7 +261,7 @@ namespace Signals
             });
         }
 
-        private static void OnUnsubscribed(ISignal s, Type pt, int count,
+        private static void OnUnsubscribed(string s, int count,
                                            string file, int line, string member)
         {
             if (!IsEnabled) return;
@@ -273,7 +273,7 @@ namespace Signals
                 Sequence                = _nextSeq++,
                 Time                    = t,
                 Kind                    = (int)SignalEventKind.Unsubscribed,
-                PayloadType             = pt?.Name ?? "",
+                PayloadType             = "",
                 FilePath                = file,
                 LineNumber              = line,
                 MemberName              = member,
@@ -281,36 +281,17 @@ namespace Signals
             });
         }
 
-        private static void OnDisposed(ISignal s, string file, int line, string member)
-        {
-            if (!IsEnabled) return;
-            double t     = Now();
-            var    track = GetOrCreateTrack(s, t, file, line, member);
-            track.IsAlive    = false;
-            track.DisposedAt = t;
-
-            AppendEvent(track, new TimelineEvent
-            {
-                Sequence   = _nextSeq++,
-                Time       = t,
-                Kind       = (int)SignalEventKind.Disposed,
-                FilePath   = file,
-                LineNumber = line,
-                MemberName = member,
-            });
-        }
-
         // -- internals --------------------------------------------------------
 
-        private static int GetOrCreateId(ISignal s)
+        private static int GetOrCreateId(string s)
         {
-            if (_idMap.TryGetValue(s, out var box)) return box.Id;
-            box = new IdBox { Id = _nextId++ };
-            _idMap.Add(s, box);
-            return box.Id;
+            if (_idMap.TryGetValue(s, out var id)) return id;
+            id = _nextId++;
+            _idMap.Add(s, id);
+            return id;
         }
 
-        private static SignalTrackData GetOrCreateTrack(ISignal s, double t,
+        private static SignalTrackData GetOrCreateTrack(string s, double t,
                                                         string file, int line, string member)
         {
             int id = GetOrCreateId(s);
@@ -322,7 +303,7 @@ namespace Signals
             var nt = new SignalTrackData
             {
                 Id            = id,
-                Name          = s.Name,
+                Name          = s,
                 CreatedAt     = t,
                 IsAlive       = true,
                 CreatedFile   = file,

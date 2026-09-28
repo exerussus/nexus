@@ -1,0 +1,586 @@
+// ============================================================
+//  BuildTab.cs — вкладка «Сборка» страницы App (бывшая отдельная страница Build).
+//
+//  Подвкладки:
+//    • Билд      — версия, профиль, запуск (свитч + билд), история;
+//    • Пайплайн  — пре-/пост-процессы по профилю (шаги BuildStep<T> в коде страницы);
+//    • BuildInfo — текущие значения, строка версии поверх приложения, миграция старой развёртки.
+//
+//  Данные: общие — Assets/App/Settings/build-config.json; личные — prefs.json/history.json
+//  в UserSettings страницы. BuildInfo — ассет AppCore (Assets/App/Settings/BuildInfo.asset).
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor.Build;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Build.Profile;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed partial class BuildTab : IAppTab
+    {
+        private const string PrefsFile = "build-prefs.json";
+        private const string HistoryFile = "build-history.json";
+
+        private static readonly string[] SubTabs = { "Билд", "Пайплайн", "BuildInfo" };
+
+        private readonly AppKit _kit;
+
+        private BuildPrefs _prefs;
+        private BuildConfig _config;
+        private BuildHistory _history;
+        private List<ProfileOption> _profiles = new();
+        private GitInfo.Snapshot _git;
+
+        private VisualElement _root;
+        private VisualElement _subBar;
+        private VisualElement _content;
+        private IVisualElementScheduledItem _saveItem;
+        private bool _configDirty;
+        private bool _subscribed;
+
+        public string Title => "Сборка";
+
+        public BuildTab(AppKit kit) => _kit = kit;
+
+        private IPageContext Context => _kit.Context;
+
+        // ============================================================ жизненный цикл
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+
+            _subBar = new VisualElement();
+            _subBar.style.flexDirection = FlexDirection.Row;
+            _subBar.style.alignItems = Align.Center;
+            _subBar.style.marginBottom = 12f;
+            _root.Add(_subBar);
+
+            _content = new VisualElement();
+            _root.Add(_content);
+            return _root;
+        }
+
+        public void Show()
+        {
+            if (!_subscribed)
+            {
+                BuildRunner.Finished += OnBuildFinished;
+                _subscribed = true;
+            }
+
+            LoadAll();
+            Render();
+        }
+
+        public void Hide() => FlushConfig();
+
+        public void Refresh()
+        {
+            LoadAll();
+            Render();
+            Context.SetStatus("Обновлено.", StatusKind.Info);
+        }
+
+        public bool CanClose()
+        {
+            if (!BuildRunner.IsBusy) return true;
+            Context.SetStatus("Идёт сборка — страницу нельзя закрыть до её окончания.", StatusKind.Warning);
+            return false;
+        }
+
+        public void Dispose()
+        {
+            FlushConfig();
+            if (_subscribed) BuildRunner.Finished -= OnBuildFinished;
+            _subscribed = false;
+        }
+
+        // ============================================================ данные
+
+        private void LoadAll()
+        {
+            _prefs = JsonStore.Load<BuildPrefs>(Context.GetUserConfigPath(PrefsFile));
+            _config = JsonStore.Load<BuildConfig>(AppCorePaths.BuildConfigPath);
+            if (_config.Migrate()) { _configDirty = true; FlushConfig(); }
+            _history = JsonStore.Load<BuildHistory>(Context.GetUserConfigPath(HistoryFile));
+            _profiles = BuildProfiles.List();
+            _git = GitInfo.Read(_config.hashLength, _config.markDirty);
+
+            if (BuildProfiles.Find(_profiles, _prefs.selectedProfileKey) == null)
+                _prefs.selectedProfileKey = PickDefaultProfileKey();
+        }
+
+        private string PickDefaultProfileKey()
+        {
+            var active = BuildProfile.GetActiveBuildProfile();
+            if (active != null)
+            {
+                var guid = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(active));
+                if (BuildProfiles.Find(_profiles, guid) != null) return guid;
+            }
+            return ProfileOption.PlatformKey;
+        }
+
+        private ProfileOption SelectedProfile() => BuildProfiles.Find(_profiles, _prefs.selectedProfileKey);
+
+        private void SavePrefs() => JsonStore.Save(Context.GetUserConfigPath(PrefsFile), _prefs);
+
+        /// <summary>Отложенное сохранение общего конфига (ввод текста не пишет файл на каждый символ).</summary>
+        private void RequestConfigSave()
+        {
+            _configDirty = true;
+            if (_root == null) { FlushConfig(); return; }
+            _saveItem ??= _root.schedule.Execute(FlushConfig);
+            _saveItem.ExecuteLater(500);
+        }
+
+        private void FlushConfig()
+        {
+            if (!_configDirty || _config == null) return;
+            _configDirty = false;
+            AppCoreEditorBridge.EnsureSettingsFolder();
+            JsonStore.SaveAsset(AppCorePaths.BuildConfigPath, _config);
+        }
+
+        // ============================================================ рендер
+
+        private void Render()
+        {
+            if (_root == null || _prefs == null) return;
+
+            _subBar.Clear();
+            var seg = Context.Ui.Segmented(SubTabs, Mathf.Clamp(_prefs.tab, 0, SubTabs.Length - 1), i =>
+            {
+                FlushConfig();
+                _prefs.tab = i;
+                SavePrefs();
+                Render();
+            });
+            _subBar.Add(seg);
+            _subBar.Add(_kit.Spacer());
+            if (BuildRunner.IsPending) _subBar.Add(_kit.Badge(StatusKind.Warning, "ожидание свитча профиля…"));
+
+            _content.Clear();
+            switch (Mathf.Clamp(_prefs.tab, 0, SubTabs.Length - 1))
+            {
+                case 0: RenderBuildTab(); break;
+                case 1: RenderPipelineTab(); break;
+                default: RenderInfoTab(); break;
+            }
+        }
+
+        // ============================================================ «Билд»
+
+        private void RenderBuildTab()
+        {
+            var columns = _kit.Columns(out var left, out var right, 440f);
+            _content.Add(columns);
+
+            left.Add(ProfileCard());
+            left.Add(VersionCard());
+            left.Add(PipelineSummaryCard());
+            right.Add(HistoryCard());
+        }
+
+        private VisualElement ProfileCard()
+        {
+            var card = _kit.Card("Профиль сборки",
+                "Сборка сама активирует выбранный профиль (со сменой платформы), а после — вернёт прежний, если включено.");
+
+            card.Add(_kit.Labeled("Профиль", ProfileDropdown()));
+
+            var selected = SelectedProfile();
+            if (selected != null)
+            {
+                var resolved = BuildProfiles.Resolve(selected);
+                var scenes = BuildProfiles.ScenesFor(resolved);
+                var count = 0;
+                if (scenes != null) foreach (var s in scenes) if (s != null && s.enabled) count++;
+                if (count == 0)
+                    card.Add(_kit.Status(StatusKind.Error, resolved != null
+                        ? "В профиле нет включённых сцен — сборка не начнётся."
+                        : "Глобальный Scene List пуст, а профиль не активен — выберите профиль со своим списком сцен."));
+                else card.Add(_kit.Faint($"Активен сейчас: {BuildProfiles.ActiveName()} · сцен в сборке: {count}"));
+            }
+
+            if (_profiles.Count <= 1)
+                card.Add(_kit.Faint("Ассетов Build Profile нет — доступна сборка текущей платформы. Создайте профиль в окне Build Profiles."));
+
+            // ---- папка ----
+            var preview = _kit.Mono("", NexusToken.TextFaint);
+            var volatileWarn = _kit.Status(StatusKind.Warning,
+                "В шаблоне {version}/{hash}/{date} — на каждую сборку новая папка, кэш не переиспользуется.");
+            void UpdateHints()
+            {
+                preview.text = "→ " + PreviewOutputDir();
+                volatileWarn.style.display = HasVolatileToken(_config.outputTemplate) ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+
+            var tpl = _kit.Input(_config.outputTemplate, v =>
+            {
+                _config.outputTemplate = v;
+                RequestConfigSave();
+                UpdateHints();
+            });
+
+            var folder = new VisualElement();
+            folder.Add(tpl);
+            preview.style.marginTop = 4f;
+            folder.Add(preview);
+            card.Add(_kit.Labeled("Папка", folder));
+            card.Add(volatileWarn);
+            card.Add(_kit.Faint("Токены: {profile} {platform} {product} {version} {hash} {date}. Папка постоянная — Unity переиспользует кэш прошлой сборки."));
+            UpdateHints();
+
+            card.Add(_kit.Divider(10f));
+
+            var toggles = _kit.Row();
+            toggles.Add(_kit.Check("Development", _prefs.development, v => { _prefs.development = v; SavePrefs(); }));
+            toggles.Add(_kit.Check("Clean build", _prefs.cleanBuild, v => { _prefs.cleanBuild = v; SavePrefs(); }));
+            toggles.Add(_kit.Check("Вернуть профиль после сборки", _config.restoreProfileAfterBuild, v => { _config.restoreProfileAfterBuild = v; RequestConfigSave(); }));
+            card.Add(toggles);
+
+            var buttons = _kit.Row();
+            buttons.style.marginTop = 10f;
+            buttons.Add(_kit.Btn(NexusRole.Ghost, "Build Profiles…", () => EditorApplication.ExecuteMenuItem("File/Build Profiles"), small: true));
+            buttons.Add(_kit.Btn(NexusRole.Ghost, "Открыть папку", () => RevealDir(Path.GetDirectoryName(PreviewOutputDir())), small: true));
+            buttons.Add(_kit.Spacer());
+
+            if (BuildRunner.IsPending)
+                buttons.Add(_kit.Btn(NexusRole.Alarm, "Отменить ожидание", () =>
+                {
+                    BuildRunner.CancelPending();
+                    Context.SetStatus("Отложенная сборка отменена (профиль остался переключённым).", StatusKind.Warning);
+                    Render();
+                }));
+
+            var build = _kit.Btn(NexusRole.Primary, "Собрать", StartBuild);
+            build.style.minWidth = 120f;
+            build.style.marginRight = 0f;
+            build.SetEnabled(!BuildRunner.IsBusy);
+            buttons.Add(build);
+            card.Add(buttons);
+
+            return card;
+        }
+
+        private DropdownField ProfileDropdown()
+        {
+            var names = new List<string>();
+            var index = 0;
+            for (var i = 0; i < _profiles.Count; i++)
+            {
+                names.Add(_profiles[i].Name);
+                if (_profiles[i].Key == _prefs.selectedProfileKey) index = i;
+            }
+
+            return _kit.Dropdown(null, names, index, i =>
+            {
+                _prefs.selectedProfileKey = _profiles[i].Key;
+                SavePrefs();
+                Render();
+            });
+        }
+
+        private VisualElement VersionCard()
+        {
+            var card = _kit.Card("Версия игры",
+                "PlayerSettings.bundleVersion — чистый semver (X.Y.Z); пишется в Project Settings и во все профили с переопределением Player Settings.");
+
+            var carriers = VersionBumper.Carriers();
+            var current = VersionBumper.Current(carriers);
+
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            var input = _kit.Input(current, _ => { });
+            input.style.width = 110f;
+            input.RegisterCallback<FocusOutEvent>(_ => ApplyVersionInput(input.value));
+            input.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter) ApplyVersionInput(input.value);
+            });
+            row.Add(input);
+            row.Add(_kit.Gap(8f));
+            row.Add(_kit.Btn(NexusRole.Ghost, "+ patch", () => Bump(BumpKind.Patch), small: true));
+            row.Add(_kit.Btn(NexusRole.Ghost, "+ minor", () => Bump(BumpKind.Minor), small: true));
+            row.Add(_kit.Btn(NexusRole.Ghost, "+ major", () => Bump(BumpKind.Major), small: true));
+            row.Add(_kit.Spacer());
+
+            var inSync = VersionBumper.InSync(carriers);
+            var sync = _kit.Row();
+            sync.style.flexWrap = Wrap.NoWrap;
+            sync.Add(_kit.Dot(inSync ? NexusToken.Ok : NexusToken.Warning));
+            sync.Add(_kit.Faint(inSync ? "Носители согласованы" : "Носители расходятся"));
+            row.Add(sync);
+            card.Add(row);
+
+            if (!VersionBumper.IsStrictSemver(current))
+                card.Add(_kit.Status(StatusKind.Warning, "Версия не в формате X.Y.Z — кнопки приведут её к нему."));
+
+            if (!inSync)
+            {
+                card.Add(_kit.Status(StatusKind.Warning, $"Версии профилей расходятся. Перед сборкой будет выровнено до {current}."));
+                var align = _kit.Btn(NexusRole.Warning, $"Выровнять до {current}", SyncVersions, small: true);
+                align.style.alignSelf = Align.FlexStart;
+                card.Add(align);
+            }
+
+            card.Add(_kit.Check("Поднимать Android versionCode и iOS buildNumber вместе с версией", _config.bumpBuildNumbers,
+                v => { _config.bumpBuildNumbers = v; RequestConfigSave(); }));
+            card.Add(_kit.Faint($"Android versionCode: {VersionBumper.MaxAndroidCode(carriers)} · iOS build: {VersionBumper.MaxIosBuild(carriers)}"));
+
+            var full = _kit.Row();
+            full.style.marginTop = 6f;
+            full.Add(_kit.Text("В билде: ", NexusToken.TextDim, 11));
+            full.Add(_kit.Mono(PreviewFullVersion()));
+            card.Add(full);
+
+            if (_git.IsDirty) card.Add(_kit.Status(StatusKind.Warning, "В рабочем дереве незакоммиченные изменения — к хэшу добавится «-dirty»."));
+            else if (!_git.HasRepo) card.Add(_kit.Faint("Git-репозиторий не найден — хэш в BuildInfo и имя архива не попадёт."));
+
+            return card;
+        }
+
+        private VisualElement PipelineSummaryCard()
+        {
+            var open = _kit.Btn(NexusRole.Ghost, "Открыть", () => { _prefs.tab = 1; SavePrefs(); Render(); }, small: true);
+            open.style.marginRight = 0f;
+            var card = _kit.Card("Пайплайн профиля", "Шаги до и после сборки. Порядок и настройки — в подвкладке Пайплайн.", open);
+
+            var selected = SelectedProfile();
+            var pipeline = selected != null ? _config.Find(selected.Key) : null;
+            var all = BuildStepRegistry.All();
+            var pre = new List<string>();
+            var post = new List<string>();
+
+            if (pipeline != null)
+                foreach (var e in pipeline.steps)
+                {
+                    if (!e.enabled) continue;
+                    var d = BuildStepRegistry.Find(all, e.id);
+                    var name = d != null ? d.Meta.Name : e.id + " (не найден)";
+                    if (d != null && d.Meta.Stage == BuildStage.Pre) pre.Add(name);
+                    else post.Add(name);
+                }
+
+            card.Add(_kit.Labeled("До", Chips(pre), 52f));
+            card.Add(_kit.Labeled("После", Chips(post), 52f));
+            card.Add(_kit.Faint("Штамп BuildInfo и проверка текста работают при любой сборке сами — отдельными шагами они не нужны."));
+            return card;
+        }
+
+        private VisualElement Chips(List<string> names)
+        {
+            var row = _kit.Row();
+            if (names.Count == 0)
+            {
+                row.Add(_kit.Faint("—"));
+                return row;
+            }
+
+            foreach (var n in names)
+            {
+                var chip = _kit.Text(n, NexusToken.TextNormal, 11);
+                chip.style.backgroundColor = _kit.Tok(NexusToken.BgHard);
+                AppKit.SetBorder(chip, _kit.Tok(NexusToken.Divider), 1f, 5f);
+                chip.style.paddingLeft = 8f; chip.style.paddingRight = 8f;
+                chip.style.paddingTop = 3f;  chip.style.paddingBottom = 3f;
+                chip.style.marginRight = 6f; chip.style.marginBottom = 4f;
+                row.Add(chip);
+            }
+            return row;
+        }
+
+        private VisualElement HistoryCard()
+        {
+            var clear = _kit.Btn(NexusRole.Ghost, "Очистить", () =>
+            {
+                _history = new BuildHistory();
+                JsonStore.Save(Context.GetUserConfigPath(HistoryFile), _history);
+                Render();
+            }, small: true);
+            clear.style.marginRight = 0f;
+
+            var card = _kit.Card("История", null, clear);
+
+            if (_history.entries.Count == 0)
+            {
+                card.Add(_kit.Faint("Пока пусто."));
+                return card;
+            }
+
+            var shown = Mathf.Min(10, _history.entries.Count);
+            for (var i = 0; i < shown; i++)
+            {
+                var e = _history.entries[i];
+                var target = e.artifacts.Count > 0 ? e.artifacts[0] : e.outputPath;
+                var canReveal = !string.IsNullOrEmpty(target) && (File.Exists(target) || Directory.Exists(target));
+
+                var row = _kit.ListRow(canReveal ? () => EditorUtility.RevealInFinder(target) : null);
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.alignItems = Align.FlexStart;
+                if (canReveal) row.tooltip = "Показать: " + target;
+
+                var dot = _kit.Dot(e.success ? NexusToken.Ok : NexusToken.Error);
+                dot.style.marginTop = 5f;
+                row.Add(dot);
+
+                var text = new VisualElement();
+                text.style.flexGrow = 1;
+                text.style.flexShrink = 1;
+
+                var hash = string.IsNullOrEmpty(e.hash) ? "" : $" · {e.hash}{(e.dirty ? "*" : "")}";
+                text.Add(_kit.Mono(e.version + hash));
+                var size = e.sizeBytes > 0 ? " · " + ZipStep.FormatSize(e.sizeBytes) : "";
+                text.Add(_kit.Faint($"{e.profile} · {e.timeLocal} · {e.seconds} с{size}"));
+                if (!e.success && !string.IsNullOrEmpty(e.message))
+                {
+                    var err = _kit.Text(e.message, NexusToken.Error, 11);
+                    text.Add(err);
+                }
+
+                row.Add(text);
+                card.Add(row);
+            }
+
+            card.Add(_kit.Faint("* — собрано из грязного дерева"));
+            return card;
+        }
+
+        // ============================================================ действия
+
+        private void ApplyVersionInput(string value)
+        {
+            value = (value ?? "").Trim();
+            var carriers = VersionBumper.Carriers();
+            if (value == VersionBumper.Current(carriers) && VersionBumper.InSync(carriers)) return;
+            if (!VersionBumper.TryParse(value, out _, out _, out _))
+            {
+                Context.SetStatus($"«{value}» — не версия. Ожидается X.Y.Z.", StatusKind.Error);
+                Render();
+                return;
+            }
+
+            var result = VersionBumper.Set(value);
+            ReportVersion(result, $"Версия: {result.Version}");
+            Render();
+        }
+
+        private void SyncVersions()
+        {
+            var result = VersionBumper.SyncIfNeeded();
+            if (result == null) Context.SetStatus("Версии уже согласованы.", StatusKind.Info);
+            else ReportVersion(result, $"Версия выровнена: {result.Version} (носителей: {result.Written})");
+            Render();
+        }
+
+        private void ReportVersion(VersionWriteResult result, string ok)
+        {
+            if (result.Warnings.Count == 0) Context.SetStatus(ok, StatusKind.Ok);
+            else Context.SetStatus(ok + " — но: " + string.Join("; ", result.Warnings), StatusKind.Warning);
+        }
+
+        private void Bump(BumpKind kind)
+        {
+            var old = VersionBumper.Current();
+            var result = VersionBumper.Apply(kind, _config.bumpBuildNumbers);
+            ReportVersion(result, $"Версия {old} → {result.Version}");
+            Render();
+        }
+
+        private void StartBuild()
+        {
+            FlushConfig();
+            var selected = SelectedProfile();
+            if (selected == null) { Context.SetStatus("Профиль не выбран.", StatusKind.Error); return; }
+
+            var req = new BuildRequest
+            {
+                profileKey = selected.Key,
+                profilePath = selected.Path ?? "",
+                configPath = AppCorePaths.BuildConfigPath,
+                historyPath = Context.GetUserConfigPath(HistoryFile),
+                development = _prefs.development,
+                cleanBuild = _prefs.cleanBuild,
+                restoreProfile = _config.restoreProfileAfterBuild,
+            };
+
+            Context.SetStatus($"Сборка «{selected.Name}»…", StatusKind.Info);
+            var result = BuildRunner.Start(req, out var message);
+            switch (result)
+            {
+                case StartResult.Scheduled: Context.SetStatus(message, StatusKind.Info); Render(); break;
+                case StartResult.Cancelled: Context.SetStatus("Сборка отменена.", StatusKind.Warning); break;
+                case StartResult.Rejected: Context.SetStatus(message, StatusKind.Error); break;
+                // Finished — статус выставит OnBuildFinished
+            }
+        }
+
+        private void OnBuildFinished(BuildHistoryEntry entry)
+        {
+            if (_root == null) return;
+            Context.SetStatus(entry.success
+                    ? $"Собрано: {entry.profile} {entry.version} за {entry.seconds} с. {entry.message}"
+                    : $"Сборка не удалась: {entry.message}",
+                entry.success ? StatusKind.Ok : StatusKind.Error);
+            LoadAll();
+            Render();
+        }
+
+        // ============================================================ превью
+
+        private BuildStepContext PreviewContext()
+        {
+            var resolved = BuildProfiles.Resolve(SelectedProfile());
+            return new BuildStepContext
+            {
+                ProfileName = resolved != null ? resolved.name : EditorUserBuildSettings.activeBuildTarget.ToString(),
+                Target = EditorUserBuildSettings.activeBuildTarget,
+                ProductName = PlayerSettings.productName,
+                Version = VersionBumper.Current(),
+                CommitHash = _git.Hash,
+                IsDirty = _git.IsDirty,
+            };
+        }
+
+        private string PreviewOutputDir()
+        {
+            try { return BuildRunner.ResolveOutputDir(_config.outputTemplate, PreviewContext()); }
+            catch (Exception ex) { return "ошибка шаблона: " + ex.Message; }
+        }
+
+        private static bool HasVolatileToken(string template)
+            => !string.IsNullOrEmpty(template) &&
+               (template.Contains("{version}") || template.Contains("{hash}") || template.Contains("{date}"));
+
+        private string PreviewFullVersion()
+        {
+            var v = _config.prefix + VersionBumper.Current() + _config.postfix;
+            if (!string.IsNullOrEmpty(_git.Hash)) v += "+" + _git.Hash + (_git.IsDirty ? "-dirty" : "");
+            return v;
+        }
+
+        private static void RevealDir(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return;
+            var d = new DirectoryInfo(dir);
+            while (d != null && !d.Exists) d = d.Parent;
+            if (d != null) EditorUtility.RevealInFinder(d.FullName);
+        }
+    }
+
+    /// <summary>Мелкие мостики к раскладке AppCore.</summary>
+    internal static class AppCoreEditorBridge
+    {
+        public static void EnsureSettingsFolder()
+            => Exerussus.AppCore.Editor.AppCoreAssets.EnsureFolder(AppCorePaths.SettingsDir);
+    }
+}

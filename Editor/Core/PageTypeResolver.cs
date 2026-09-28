@@ -1,4 +1,5 @@
 using System;
+using Exerussus.Nexus.Abstractions;
 
 namespace Exerussus.Nexus.Core
 {
@@ -22,6 +23,10 @@ namespace Exerussus.Nexus.Core
                 var t = asm.GetType(typeName, throwOnError: false);
                 if (t != null) return t;
             }
+
+            // не нашли ни в одной загруженной сборке — обычно значит «код ещё не скомпилирован»
+            NexusDiagnostics.Trace("Резолв типа",
+                $"тип '{typeName}' не найден ни в одной загруженной сборке");
             return null;
         }
     }

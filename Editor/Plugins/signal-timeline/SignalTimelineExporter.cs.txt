@@ -1,0 +1,49 @@
+#if UNITY_EDITOR
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+namespace Signals
+{
+    /// <summary>
+    /// JSON exporter for <see cref="SignalTimelineModel"/>.
+    /// The whole model is <c>[Serializable]</c> with primitive/list fields,
+    /// so <see cref="JsonUtility"/> handles it directly.
+    /// </summary>
+    public static class SignalTimelineExporter
+    {
+        /// <summary>Serialize the model to JSON string. Mutates only ExportedAtIso.</summary>
+        public static string ToJson(SignalTimelineModel model, bool prettyPrint = true)
+        {
+            if (model == null) throw new ArgumentNullException(nameof(model));
+            model.ExportedAtIso = DateTime.UtcNow.ToString("o");
+            return JsonUtility.ToJson(model, prettyPrint);
+        }
+
+        /// <summary>Opens a save dialog, writes JSON; returns false if user cancels.</summary>
+        public static bool ExportWithDialog(SignalTimelineModel model, out string path)
+        {
+            path = EditorUtility.SaveFilePanel(
+                title:           "Export Signal Timeline",
+                directory:       Application.dataPath,
+                defaultName:     $"signal-timeline-{DateTime.Now:yyyyMMdd-HHmmss}.json",
+                extension:       "json");
+
+            if (string.IsNullOrEmpty(path)) return false;
+
+            File.WriteAllText(path, ToJson(model));
+            return true;
+        }
+
+        /// <summary>Write JSON to a known path. Throws on IO error.</summary>
+        public static void ExportTo(SignalTimelineModel model, string absolutePath)
+        {
+            if (string.IsNullOrEmpty(absolutePath))
+                throw new ArgumentException("Path is empty", nameof(absolutePath));
+            File.WriteAllText(absolutePath, ToJson(model));
+        }
+    }
+}
+
+#endif

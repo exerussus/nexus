@@ -3,7 +3,7 @@
     "rootNamespace": "Exerussus.Nexus.Pages.SignalTimeline",
     "references": [
         "Exerussus.Nexus.Abstractions",
-        "exerussus.signals"
+        "Exerussus.AppCore"
     ],
     "includePlatforms": [
         "Editor"

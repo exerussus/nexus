@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.IO;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Manifests;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -57,7 +58,9 @@ namespace Exerussus.Nexus.Deployment
             foreach (var file in Directory.EnumerateFiles(root, "package.json", SearchOption.AllDirectories))
             {
                 PackageJsonName pj = null;
-                try { pj = JsonIo.Load<PackageJsonName>(file); } catch { /* битый package.json — пропускаем */ }
+                // битый package.json — пропускаем (в Verbose видно, какой именно)
+                try { pj = JsonIo.Load<PackageJsonName>(file); }
+                catch (System.Exception ex) { NexusDiagnostics.Swallowed($"нечитаемый package.json '{file}'", ex); }
                 if (pj != null && string.Equals(pj.Name, packageName, System.StringComparison.Ordinal))
                     return file;
             }

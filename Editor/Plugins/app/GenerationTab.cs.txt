@@ -1,0 +1,307 @@
+// ============================================================
+//  GenerationTab.cs — вкладка «Generation».
+//
+//    • NavTargets.cs — PageId / PopupId / FragmentId на каждый id реестра;
+//    • вью по канону — для каждого id: uxml по пути и контроллер (с половиной .Elements.cs);
+//    • скаффолд Assets/App — стили, тема, PanelSettings, шаблоны вёрстки, ассеты Settings.
+//      Создаётся только отсутствующее — авторские файлы не перетираются никогда.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor;
+using Exerussus.AppCore.Views;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class GenerationTab : IAppTab
+    {
+        private readonly AppKit _kit;
+        private VisualElement _root;
+
+        public string Title => "Generation";
+
+        public GenerationTab(AppKit kit) => _kit = kit;
+
+        private IPageContext Context => _kit.Context;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            return _root;
+        }
+
+        public void Show() => Render();
+        public void Hide() { }
+        public void Refresh() => Render();
+        public bool CanClose() => true;
+        public void Dispose() { }
+
+        private void Render()
+        {
+            _root.Clear();
+            RenderTargets();
+            RenderViews();
+            RenderScaffold();
+        }
+
+        // ============================================================ NavTargets
+
+        private void RenderTargets()
+        {
+            var gen = _kit.Btn(NexusRole.Primary, "Сгенерировать", () =>
+            {
+                var changed = AppNav.WriteNavTargets(AppCoreAssets.EnsureNavigationSettings(), out var report);
+                Context.SetStatus(report, changed ? StatusKind.Ok : StatusKind.Info);
+                Render();
+            });
+            gen.style.marginRight = 0f;
+
+            var card = _kit.Card("NavTargets", $"Константы id для кода: {AppCorePaths.NavTargetsPath}. Перезаписывается целиком; Apply на вкладке Editor делает это сам.", gen);
+
+            var exists = File.Exists(AppCorePaths.NavTargetsPath);
+            card.Add(exists
+                ? _kit.Status(StatusKind.Ok, "Файл на месте", AppCorePaths.NavTargetsPath)
+                : _kit.Status(StatusKind.Warning, "Файла нет — сгенерируйте", AppCorePaths.NavTargetsPath));
+
+            _root.Add(card);
+        }
+
+        // ============================================================ вью по канону
+
+        private void RenderViews()
+        {
+            var settings = AppCoreAssets.FindNavigationSettings();
+            var missing = new List<(ViewKind kind, string id)>();
+
+            var createAll = _kit.Btn(NexusRole.Common, "Создать недостающие uxml", () =>
+            {
+                var created = 0;
+                foreach (var (kind, id) in missing)
+                    if (ViewScaffold.EnsureUxml(kind, id, out _)) created++;
+                AssetDatabase.Refresh();
+                Context.SetStatus($"Создано uxml: {created}.", StatusKind.Ok);
+                Render();
+            }, small: true);
+            createAll.style.marginRight = 0f;
+
+            var card = _kit.Card("Вью по канону",
+                "Для каждого id: вёрстка Assets/App/<Вид>/<Тип>/<id>.uxml и контроллер <Тип><Вид>Controller рядом. " +
+                "Навешивать контроллер на объект — в инспекторе вью, там же всё проставляется само.", createAll);
+
+            if (settings == null)
+            {
+                card.Add(_kit.Status(StatusKind.Warning, "Нет NavigationSettings."));
+                _root.Add(card);
+                return;
+            }
+
+            var total = 0;
+            foreach (ViewKind kind in Enum.GetValues(typeof(ViewKind)))
+            {
+                foreach (var id in settings.GetIds(kind))
+                {
+                    if (string.IsNullOrWhiteSpace(id)) continue;
+                    total++;
+                    card.Add(ViewRow(kind, id, missing));
+                }
+            }
+
+            if (total == 0) card.Add(_kit.Faint("В реестре нет ни одного id."));
+            createAll.SetEnabled(missing.Count > 0);
+            _root.Add(card);
+        }
+
+        private VisualElement ViewRow(ViewKind kind, string id, List<(ViewKind, string)> missing)
+        {
+            var uxmlPath = AppCorePaths.ViewUxmlPath(kind, id);
+            var controllerPath = AppCorePaths.ControllerPath(kind, id);
+            var hasUxml = File.Exists(uxmlPath);
+            var hasController = File.Exists(controllerPath);
+            if (!hasUxml) missing.Add((kind, id));
+
+            var row = _kit.ListRow(() =>
+            {
+                var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(hasUxml ? uxmlPath : AppCorePaths.KindDir(kind));
+                if (asset != null) EditorGUIUtility.PingObject(asset);
+            });
+            row.style.flexWrap = Wrap.NoWrap;
+
+            row.Add(_kit.Dot(hasUxml && hasController ? NexusToken.Ok : hasUxml ? NexusToken.Warning : NexusToken.Error));
+
+            var kindLabel = _kit.Mono(kind.ToString().ToLowerInvariant(), NexusToken.TextFaint);
+            kindLabel.style.width = 64f;
+            row.Add(kindLabel);
+
+            var idLabel = _kit.Text(id);
+            idLabel.style.width = 160f;
+            row.Add(idLabel);
+
+            var path = _kit.Mono(uxmlPath, NexusToken.TextDim);
+            path.style.flexGrow = 1;
+            path.style.flexShrink = 1;
+            row.Add(path);
+
+            if (!hasUxml)
+            {
+                row.Add(_kit.Btn(NexusRole.Ghost, "uxml", () =>
+                {
+                    ViewScaffold.EnsureUxml(kind, id, out var p);
+                    Context.SetStatus($"Создано: {p}", StatusKind.Ok);
+                    Render();
+                }, small: true));
+            }
+
+            if (!hasController)
+            {
+                var b = _kit.Btn(NexusRole.Ghost, "контроллер", () =>
+                {
+                    ViewCodeGenerator.GenerateController(kind, id, out var msg);
+                    Context.SetStatus($"Создан контроллер: {msg}", StatusKind.Ok);
+                    Render();
+                }, small: true);
+                b.tooltip = controllerPath;
+                b.style.marginRight = 0f;
+                row.Add(b);
+            }
+
+            return row;
+        }
+
+        // ============================================================ скаффолд
+
+        private sealed class Item
+        {
+            public string Label;
+            public string Path;
+            public Func<bool> Create;
+        }
+
+        private List<Item> Items() => new()
+        {
+            new() { Label = "AppStyle.uss", Path = AppCorePaths.AppStyleUssPath, Create = () => WriteIfMissing(AppCorePaths.AppStyleUssPath, AppStyleContent()) },
+            new() { Label = "Tags.uss", Path = AppCorePaths.TagsUssPath, Create = () => WriteIfMissing(AppCorePaths.TagsUssPath, TagsContent()) },
+            new() { Label = "AppTheme.tss", Path = AppCorePaths.AppThemePath, Create = () => WriteIfMissing(AppCorePaths.AppThemePath, "@import url(\"unity-theme://default\");\n\nVisualElement {\n}\n") },
+            new() { Label = "App Settings (PanelSettings)", Path = AppCorePaths.PanelSettingsPath, Create = CreatePanelSettings },
+            new() { Label = "Шаблон страницы/попапа", Path = AppCorePaths.DefaultViewTemplatePath, Create = () => WriteIfMissing(AppCorePaths.DefaultViewTemplatePath, ViewScaffold.DefaultViewUxml()) },
+            new() { Label = "Шаблон фрагмента", Path = AppCorePaths.DefaultFragmentTemplatePath, Create = () => WriteIfMissing(AppCorePaths.DefaultFragmentTemplatePath, ViewScaffold.DefaultFragmentUxml()) },
+            new() { Label = "LoadingScreen.uxml", Path = AppCorePaths.LoadingScreenPath, Create = () => WriteIfMissing(AppCorePaths.LoadingScreenPath, ViewScaffold.DefaultViewUxml()) },
+            new() { Label = "NavigationSettings", Path = AppCorePaths.NavigationSettingsPath, Create = () => AppCoreAssets.EnsureNavigationSettings() != null },
+            new() { Label = "BuildInfo", Path = AppCorePaths.BuildInfoPath, Create = () => AppCoreAssets.EnsureBuildInfo() != null },
+            new() { Label = "TextSettings", Path = AppCorePaths.TextSettingsPath, Create = () => AppCoreAssets.EnsureTextSettings() != null },
+        };
+
+        private void RenderScaffold()
+        {
+            var items = Items();
+            var missing = items.FindAll(i => !Exists(i.Path));
+
+            var all = _kit.Btn(NexusRole.Common, "Создать недостающее", () =>
+            {
+                var sb = new StringBuilder();
+                foreach (var item in Items())
+                {
+                    if (Exists(item.Path)) continue;
+                    try { sb.Append(item.Create() ? "+ " : "! ").AppendLine(item.Path); }
+                    catch (Exception e) { sb.AppendLine($"! {item.Path}: {e.Message}"); }
+                }
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+                Context.SetStatus(sb.Length == 0 ? "Всё на месте." : sb.ToString().Replace("\n", "  "), StatusKind.Ok);
+                Render();
+            }, small: true);
+            all.style.marginRight = 0f;
+            all.SetEnabled(missing.Count > 0);
+
+            var card = _kit.Card("Скаффолд Assets/App",
+                $"Файлы по умолчанию. Есть {items.Count - missing.Count} из {items.Count}. Существующее не трогается.", all);
+
+            foreach (var item in items)
+            {
+                var exists = Exists(item.Path);
+                var path = item.Path;
+                var row = _kit.ListRow(exists ? () =>
+                {
+                    var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+                    if (obj != null) EditorGUIUtility.PingObject(obj);
+                } : null);
+                row.style.flexWrap = Wrap.NoWrap;
+
+                row.Add(_kit.Dot(exists ? NexusToken.Ok : NexusToken.Warning));
+                var label = _kit.Text(item.Label);
+                label.style.width = 210f;
+                row.Add(label);
+                var p = _kit.Mono(item.Path, NexusToken.TextDim);
+                p.style.flexGrow = 1;
+                p.style.flexShrink = 1;
+                row.Add(p);
+
+                if (!exists)
+                {
+                    var create = item.Create;
+                    var b = _kit.Btn(NexusRole.Ghost, "Создать", () =>
+                    {
+                        create();
+                        AssetDatabase.SaveAssets();
+                        AssetDatabase.Refresh();
+                        Render();
+                    }, small: true);
+                    b.style.marginRight = 0f;
+                    row.Add(b);
+                }
+
+                card.Add(row);
+            }
+
+            _root.Add(card);
+        }
+
+        private static bool Exists(string path) =>
+            AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path) != null || File.Exists(path);
+
+        private static bool WriteIfMissing(string path, string content)
+        {
+            if (Exists(path)) return true;
+            AppCoreAssets.EnsureFolder(Path.GetDirectoryName(path));
+            File.WriteAllText(path, content, new UTF8Encoding(false));
+            AssetDatabase.ImportAsset(path);
+            return true;
+        }
+
+        private static bool CreatePanelSettings()
+        {
+            if (Exists(AppCorePaths.PanelSettingsPath)) return true;
+
+            if (!Exists(AppCorePaths.AppThemePath))
+                WriteIfMissing(AppCorePaths.AppThemePath, "@import url(\"unity-theme://default\");\n\nVisualElement {\n}\n");
+
+            AppCoreAssets.EnsureFolder(Path.GetDirectoryName(AppCorePaths.PanelSettingsPath));
+
+            var ps = ScriptableObject.CreateInstance<PanelSettings>();
+            ps.scaleMode = PanelScaleMode.ScaleWithScreenSize;
+            ps.referenceResolution = new Vector2Int(1920, 1080);
+
+            var theme = AssetDatabase.LoadAssetAtPath<ThemeStyleSheet>(AppCorePaths.AppThemePath);
+            if (theme != null) ps.themeStyleSheet = theme;
+
+            AssetDatabase.CreateAsset(ps, AppCorePaths.PanelSettingsPath);
+            return true;
+        }
+
+        private static string AppStyleContent() =>
+            "/* AppStyle.uss — общий стиль приложения. Подключается в шаблонах вёрстки.\n" +
+            "   Изначально пуст — расширяй под проект. */\n";
+
+        private static string TagsContent() =>
+            "/* Tags.uss — служебные классы AppCore.\n" +
+            "   .signal-button — кнопка поднимает сигнал AppSignals с id, равным её имени. */\n\n" +
+            ".signal-button {\n}\n";
+    }
+}

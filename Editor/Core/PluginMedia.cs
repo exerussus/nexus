@@ -1,4 +1,5 @@
 using System.IO;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Deployment;
 using UnityEditor;
 using UnityEngine;
@@ -17,8 +18,8 @@ namespace Exerussus.Nexus.Core
     {
         public const string IconFile = "page_logo.png";
 
-        // дефолтная иконка хаба; используется, если у плагина нет своей page_logo.png
-        private const string DefaultIconAssetPath = NexusPaths.EditorAssetRoot + "/Media/default_page_icon.png";
+        // дефолтная иконка хаба; путь зависит от того, где лежит движок (Assets или пакет)
+        private static string DefaultIconAssetPath => NexusPaths.EditorAssetRoot + "/Media/default_page_icon.png";
 
         private static readonly string[] ReadmeNames =
             { "README.md", "readme.md", "Readme.md", "README.txt", "readme.txt" };
@@ -42,7 +43,11 @@ namespace Exerussus.Nexus.Core
             var path = ReadmePath(id);
             if (path == null) return null;
             try { return File.ReadAllText(path); }
-            catch { return null; }
+            catch (System.Exception ex)
+            {
+                NexusDiagnostics.Swallowed($"чтение README '{path}'", ex);
+                return null;
+            }
         }
 
         private static string ReadmePath(string id)

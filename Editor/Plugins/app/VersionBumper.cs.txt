@@ -1,0 +1,377 @@
+// ============================================================
+//  VersionBumper.cs — Major / Minor / Patch для версии игры.
+//
+//  bundleVersion остаётся чистым semver «X.Y.Z»: iOS/Android не принимают
+//  буквенные суффиксы. Префикс/постфикс живут только в BuildInfo.
+//  Нечисловые хвосты частей отбрасываются («1.2.3b» → 1.2.3), недостающие
+//  части = 0. Младшие части при подъёме старшей обнуляются.
+//  Опционально поднимает Android versionCode и iOS buildNumber (+1).
+//
+//  ВАЖНО (Unity 6 Build Profiles): профиль может переопределять Player Settings —
+//  тогда у него СВОЯ копия bundleVersion/versionCode/buildNumber. Статический
+//  PlayerSettings.* пишет только в активные настройки (глобальные ИЛИ активного
+//  профиля), а билд профиля и штамп BuildInfo читают копию профиля. Поэтому
+//  версия пишется во ВСЕ носители сразу: ProjectSettings + каждый профиль
+//  с переопределением. «Текущая» версия = максимальная среди носителей.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.Build.Profile;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal enum BumpKind
+    {
+        Major,
+        Minor,
+        Patch,
+    }
+
+    /// <summary>Что делать с Android versionCode / iOS buildNumber при записи версии.</summary>
+    internal enum BuildNumbersMode
+    {
+        Keep,       // не трогать
+        Align,      // выровнять по максимуму среди носителей
+        Increment,  // максимум + 1
+    }
+
+    /// <summary>Носитель версии: глобальные Player Settings или профиль с переопределением.</summary>
+    internal sealed class VersionCarrier
+    {
+        public string         Label;       // для UI: «Project Settings» / «профиль X»
+        public string         AssetPath;   // ProjectSettings/ProjectSettings.asset или путь профиля
+        public BuildProfile   Profile;     // null для глобальных
+        public PlayerSettings Settings;
+        public string         Version;
+        public int            AndroidCode;
+        public string         IosBuild;
+    }
+
+    /// <summary>Итог записи версии.</summary>
+    internal sealed class VersionWriteResult
+    {
+        public string       Version;
+        public int          Written;
+        public List<string> Warnings = new List<string>();
+    }
+
+    internal static class VersionBumper
+    {
+        private const string GlobalSettingsPath = "ProjectSettings/ProjectSettings.asset";
+        private const string PropVersion        = "bundleVersion";
+        private const string PropAndroidCode    = "AndroidBundleVersionCode";
+        private const string PropBuildNumber    = "buildNumber";
+        private const string IosKey             = "iPhone";
+
+        // ============================================================ semver
+
+        public static bool TryParse(string version, out int major, out int minor, out int patch)
+        {
+            major = minor = patch = 0;
+            if (string.IsNullOrWhiteSpace(version)) return false;
+
+            var parts = version.Trim().Split('.');
+            if (!TryLeadingInt(parts[0], out major)) return false;
+            if (parts.Length > 1) TryLeadingInt(parts[1], out minor);
+            if (parts.Length > 2) TryLeadingInt(parts[2], out patch);
+            return true;
+        }
+
+        public static bool IsStrictSemver(string version)
+        {
+            if (!TryParse(version, out var a, out var b, out var c)) return false;
+            return version.Trim() == $"{a}.{b}.{c}";
+        }
+
+        public static string Bump(string version, BumpKind kind)
+        {
+            TryParse(version, out var major, out var minor, out var patch);
+            switch (kind)
+            {
+                case BumpKind.Major: major++; minor = 0; patch = 0; break;
+                case BumpKind.Minor: minor++; patch = 0;            break;
+                default:             patch++;                       break;
+            }
+            return $"{major}.{minor}.{patch}";
+        }
+
+        /// <summary>Сравнение по semver; неразбираемая версия меньше любой разбираемой.</summary>
+        public static int Compare(string a, string b)
+        {
+            var okA = TryParse(a, out var a1, out var a2, out var a3);
+            var okB = TryParse(b, out var b1, out var b2, out var b3);
+            if (!okA || !okB) return okA.CompareTo(okB);
+            if (a1 != b1) return a1.CompareTo(b1);
+            if (a2 != b2) return a2.CompareTo(b2);
+            return a3.CompareTo(b3);
+        }
+
+        // ============================================================ носители
+
+        /// <summary>Все места, где живёт версия: глобальные настройки + профили с переопределением.</summary>
+        public static List<VersionCarrier> Carriers()
+        {
+            var list   = new List<VersionCarrier>();
+            var global = GlobalSettings();
+            if (global != null) list.Add(Read(global, null, "Project Settings", GlobalSettingsPath));
+
+            foreach (var guid in AssetDatabase.FindAssets("t:BuildProfile"))
+            {
+                var path    = AssetDatabase.GUIDToAssetPath(guid);
+                var profile = AssetDatabase.LoadAssetAtPath<BuildProfile>(path);
+                if (profile == null) continue;
+
+                PlayerSettings ps;
+                try { ps = profile.GetComponent<PlayerSettings>(); }
+                catch (Exception ex) { NexusDiagnostics.Swallowed("Build: PlayerSettings профиля " + path, ex); continue; }
+
+                // Без переопределения GetComponent отдаёт глобальные — это не отдельный носитель.
+                if (ps == null || ps == global) continue;
+                list.Add(Read(ps, profile, $"профиль «{profile.name}»", path));
+            }
+
+            if (list.Count == 0)
+            {
+                // Фолбэк: глобальный ассет не загрузился — хотя бы статический API.
+                list.Add(new VersionCarrier
+                {
+                    Label       = "Player Settings",
+                    AssetPath   = GlobalSettingsPath,
+                    Version     = PlayerSettings.bundleVersion,
+                    AndroidCode = PlayerSettings.Android.bundleVersionCode,
+                    IosBuild    = PlayerSettings.iOS.buildNumber,
+                });
+            }
+            return list;
+        }
+
+        /// <summary>Текущая версия игры = максимальная среди носителей.</summary>
+        public static string Current() => Current(Carriers());
+
+        public static string Current(List<VersionCarrier> carriers)
+        {
+            string best = null;
+            foreach (var c in carriers)
+                if (best == null || Compare(c.Version, best) > 0) best = c.Version;
+            return best ?? PlayerSettings.bundleVersion;
+        }
+
+        public static int MaxAndroidCode(List<VersionCarrier> carriers)
+        {
+            var max = 0;
+            foreach (var c in carriers) max = Math.Max(max, c.AndroidCode);
+            return max;
+        }
+
+        public static int MaxIosBuild(List<VersionCarrier> carriers)
+        {
+            var max = 0;
+            foreach (var c in carriers)
+                if (int.TryParse(c.IosBuild, out var n)) max = Math.Max(max, n);
+            return max;
+        }
+
+        /// <summary>Все носители согласованы (версия и номера сборок совпадают).</summary>
+        public static bool InSync(List<VersionCarrier> carriers)
+        {
+            if (carriers.Count < 2) return true;
+            var first = carriers[0];
+            foreach (var c in carriers)
+            {
+                if (c.Version != first.Version || c.AndroidCode != first.AndroidCode || (c.IosBuild ?? "") != (first.IosBuild ?? ""))
+                    return false;
+            }
+            return true;
+        }
+
+        // ============================================================ запись
+
+        /// <summary>Поднять версию проекта во всех носителях.</summary>
+        public static VersionWriteResult Apply(BumpKind kind, bool bumpBuildNumbers)
+        {
+            var carriers = Carriers();
+            var next     = Bump(Current(carriers), kind);
+            return Write(carriers, next, bumpBuildNumbers ? BuildNumbersMode.Increment : BuildNumbersMode.Align);
+        }
+
+        /// <summary>Задать версию во всех носителях.</summary>
+        public static VersionWriteResult Set(string version, BuildNumbersMode mode = BuildNumbersMode.Align)
+            => Write(Carriers(), version.Trim(), mode);
+
+        /// <summary>Выровнять все носители по текущей (максимальной) версии. null — уже согласованы.</summary>
+        public static VersionWriteResult SyncIfNeeded()
+        {
+            var carriers = Carriers();
+            if (InSync(carriers)) return null;
+            return Write(carriers, Current(carriers), BuildNumbersMode.Align);
+        }
+
+        private static VersionWriteResult Write(List<VersionCarrier> carriers, string version, BuildNumbersMode mode)
+        {
+            var result = new VersionWriteResult { Version = version };
+
+            var android = MaxAndroidCode(carriers);
+            var ios     = MaxIosBuild(carriers);
+            if (mode == BuildNumbersMode.Increment) { android++; ios++; }
+
+            foreach (var c in carriers)
+            {
+                try
+                {
+                    if (c.Settings == null)
+                    {
+                        PlayerSettings.bundleVersion = version;
+                        if (mode != BuildNumbersMode.Keep)
+                        {
+                            PlayerSettings.Android.bundleVersionCode = android;
+                            PlayerSettings.iOS.buildNumber           = ios.ToString();
+                        }
+                        result.Written++;
+                        continue;
+                    }
+
+                    WriteSerialized(c.Settings, version, mode == BuildNumbersMode.Keep ? (int?)null : android,
+                        mode == BuildNumbersMode.Keep ? null : ios.ToString());
+
+                    if (c.Profile != null) SaveProfile(c, version, result);
+                    result.Written++;
+                }
+                catch (Exception ex)
+                {
+                    NexusDiagnostics.Error("Build: запись версии в " + c.AssetPath, ex);
+                    result.Warnings.Add($"{c.Label}: {ex.Message}");
+                }
+            }
+
+            AssetDatabase.SaveAssets();   // глобальные Player Settings → ProjectSettings.asset
+            return result;
+        }
+
+        private static void WriteSerialized(PlayerSettings settings, string version, int? androidCode, string iosBuild)
+        {
+            var so = new SerializedObject(settings);
+            so.Update();
+
+            var v = so.FindProperty(PropVersion);
+            if (IsString(v)) v.stringValue = version;
+
+            if (androidCode.HasValue)
+            {
+                var a = so.FindProperty(PropAndroidCode);
+                if (a != null && a.propertyType == SerializedPropertyType.Integer) a.intValue = androidCode.Value;
+            }
+
+            if (iosBuild != null) SetMapValue(so.FindProperty(PropBuildNumber), IosKey, iosBuild);
+
+            so.ApplyModifiedPropertiesWithoutUndo();
+            EditorUtility.SetDirty(settings);
+        }
+
+        /// <summary>
+        /// Профиль хранит свои Player Settings сериализованными внутри ассета. Unity сама
+        /// пересериализует их при OnDisable, но это поздно (и не до билда) — зовём её
+        /// внутренний SerializePlayerSettings, если он есть в этой версии Unity, и сохраняем.
+        /// </summary>
+        private static void SaveProfile(VersionCarrier c, string version, VersionWriteResult result)
+        {
+            var method = typeof(BuildProfile).GetMethod("SerializePlayerSettings",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+            if (method != null) method.Invoke(c.Profile, null);
+            else NexusDiagnostics.Trace("Build", "BuildProfile.SerializePlayerSettings не найден — полагаюсь на сохранение ассета.");
+
+            EditorUtility.SetDirty(c.Profile);
+            AssetDatabase.SaveAssetIfDirty(c.Profile);
+
+            // Проверка на диске: версия действительно попала в ассет профиля.
+            try
+            {
+                var text = File.ReadAllText(c.AssetPath);
+                if (!text.Contains("bundleVersion: " + version))
+                    result.Warnings.Add($"{c.Label}: версия не подтвердилась в ассете — откройте профиль и проверьте Player Settings.");
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Swallowed("Build: проверка ассета профиля " + c.AssetPath, ex);
+            }
+        }
+
+        // ============================================================ чтение
+
+        private static PlayerSettings GlobalSettings()
+        {
+            try
+            {
+                foreach (var o in AssetDatabase.LoadAllAssetsAtPath(GlobalSettingsPath))
+                    if (o is PlayerSettings ps) return ps;
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Swallowed("Build: загрузка " + GlobalSettingsPath, ex);
+            }
+            return null;
+        }
+
+        private static VersionCarrier Read(PlayerSettings settings, BuildProfile profile, string label, string path)
+        {
+            var so      = new SerializedObject(settings);
+            var version = so.FindProperty(PropVersion);
+            var code    = so.FindProperty(PropAndroidCode);
+            return new VersionCarrier
+            {
+                Label       = label,
+                AssetPath   = path,
+                Profile     = profile,
+                Settings    = settings,
+                Version     = IsString(version) ? version.stringValue : "",
+                AndroidCode = code != null && code.propertyType == SerializedPropertyType.Integer ? code.intValue : 0,
+                IosBuild    = GetMapValue(so.FindProperty(PropBuildNumber), IosKey) ?? "",
+            };
+        }
+
+        // map<string,string> сериализуется массивом пар first/second.
+        private static string GetMapValue(SerializedProperty map, string key)
+        {
+            if (map == null || !map.isArray) return null;
+            for (var i = 0; i < map.arraySize; i++)
+            {
+                var el = map.GetArrayElementAtIndex(i);
+                var k  = el.FindPropertyRelative("first");
+                if (!IsString(k) || k.stringValue != key) continue;
+                var v = el.FindPropertyRelative("second");
+                return IsString(v) ? v.stringValue : null;
+            }
+            return null;
+        }
+
+        private static void SetMapValue(SerializedProperty map, string key, string value)
+        {
+            if (map == null || !map.isArray) return;
+            for (var i = 0; i < map.arraySize; i++)
+            {
+                var el = map.GetArrayElementAtIndex(i);
+                var k  = el.FindPropertyRelative("first");
+                if (!IsString(k) || k.stringValue != key) continue;
+                var v = el.FindPropertyRelative("second");
+                if (IsString(v)) v.stringValue = value;
+                return;
+            }
+        }
+
+        private static bool IsString(SerializedProperty p)
+            => p != null && p.propertyType == SerializedPropertyType.String;
+
+        private static bool TryLeadingInt(string s, out int value)
+        {
+            value = 0;
+            if (string.IsNullOrEmpty(s)) return false;
+            var len = 0;
+            while (len < s.Length && len < 9 && char.IsDigit(s[len])) len++;
+            return len > 0 && int.TryParse(s.Substring(0, len), out value);
+        }
+    }
+}

@@ -1,6 +1,6 @@
 # Signals
 
-Swimlane-визуализация сигналов из `SignalRegistry`: одна дорожка на сигнал,
+Swimlane-визуализация сигналов шины `AppSignals` (AppCore) из `SignalRegistry`: одна дорожка на id сигнала,
 время идёт по горизонтали, маркеры окрашены по типу события. Клик по маркеру
 открывает строку исходника, породившую событие.
 
@@ -17,7 +17,7 @@ Swimlane-визуализация сигналов из `SignalRegistry`: одн
 конфигом и стилями. Значит:
 
 - **Включён** → рекордер материализуется, `[InitializeOnLoad]` ставит хуки
-  `Signal.EditorHook.*`, запись идёт, страница показывает данные.
+  `AppSignals.EditorHook.*`, запись идёт, страница показывает данные.
 - **Выключен** → все файлы вытесняются, рекордера в проекте нет: запись
   прекращается, оверхед хуков исчезает («off значит off»).
 
@@ -26,10 +26,9 @@ Swimlane-визуализация сигналов из `SignalRegistry`: одн
 
 ## Внешняя зависимость
 
-Единственная — рантайм-сборка `exerussus.signals`, откуда резолвятся
-`Signal` / `Signal.EditorHook` / `ISignal` / `SignalEventKind` и модель
-(`TimelineEvent` / `SignalTrackData` / `SignalTimelineModel`). Она существует
-всегда, т.к. на неё ссылается игровой код.
+Единственная — рантайм-сборка `Exerussus.AppCore`, откуда резолвится шина
+`AppSignals` и её `EditorHook`. Модель (`TimelineEvent` / `SignalTrackData` /
+`SignalTimelineModel`), `SignalEventKind` и экспорт едут в развёртке самой страницы.
 
 ## Внимание: SignalsConfig — это ассет
 

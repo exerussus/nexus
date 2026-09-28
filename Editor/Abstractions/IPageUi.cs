@@ -33,5 +33,17 @@ namespace Exerussus.Nexus.Abstractions
 
         /// <summary>Тонкий разделитель (хайрлайн) цветом Divider.</summary>
         VisualElement Divider();
+
+        /// <summary>
+        /// Вкладки верхнего уровня: строка текстовых кнопок, активная подчёркнута акцентом.
+        /// Клик переключает выделение и вызывает <paramref name="onSelected"/> с индексом.
+        /// </summary>
+        VisualElement Tabs(string[] labels, int selected, Action<int> onSelected);
+
+        /// <summary>
+        /// Сегмент-контрол для подвкладок и переключателей режима: «пилюли» на мягком фоне,
+        /// активная приподнята. Визуально отличается от <see cref="Tabs"/>, чтобы уровни не путались.
+        /// </summary>
+        VisualElement Segmented(string[] labels, int selected, Action<int> onSelected);
     }
 }

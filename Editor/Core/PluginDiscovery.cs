@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Deployment;
 using Exerussus.Nexus.Manifests;
 
@@ -41,7 +42,13 @@ namespace Exerussus.Nexus.Core
                 {
                     if (seen.Contains(id)) continue;
                     var manifest = ManifestIo.Load(Path.Combine(root, id, "manifest.json"));
-                    if (manifest == null) continue; // папка без валидного манифеста — не плагин
+                    if (manifest == null)
+                    {
+                        // папка без валидного манифеста — не плагин (частая причина «страница не появилась»)
+                        NexusDiagnostics.Trace("Дискавери",
+                            $"папка '{id}' пропущена: нет валидного manifest.json в {root}");
+                        continue;
+                    }
 
                     seen.Add(id);
                     var status = deployedIds.Contains(id) ? PluginStatus.Deployed : PluginStatus.Available;

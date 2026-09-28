@@ -1,0 +1,63 @@
+using System;
+using System.Collections.Generic;
+
+namespace Signals
+{
+    /// <summary>
+    /// Snapshot of every recorded signal lifetime + its events.
+    /// Lives in <see cref="SignalRegistry.Model"/>; consumed by the
+    /// editor page and serialized by <see cref="SignalTimelineExporter"/>.
+    /// </summary>
+    [Serializable]
+    public sealed class SignalTimelineModel
+    {
+        public List<SignalTrackData> Tracks = new();
+
+        public double RecordingStartTime; // session origin; UI renders relative to this
+        public double FirstTime;          // earliest event time (kept for stats/export)
+        public double LastTime;           // latest event time
+        public int    TotalEvents;
+        public int    Version;            // monotonic; bumped on every change
+        public string ExportedAtIso;      // populated when exporter writes the file
+    }
+
+    /// <summary>One swimlane = one signal id of AppSignals.</summary>
+    [Serializable]
+    public sealed class SignalTrackData
+    {
+        public int    Id;
+        public string Name;
+        public double CreatedAt;
+        public double DisposedAt = -1; // -1 while alive
+        public bool   IsAlive    = true;
+        public string CreatedFile;
+        public int    CreatedLine;
+        public string CreatedMember;
+        public List<TimelineEvent> Events = new();
+    }
+
+    /// <summary>One marker on a swimlane.</summary>
+    [Serializable]
+    public struct TimelineEvent
+    {
+        public int    Sequence;
+        public double Time;
+        public int    Kind;              // SignalEventKind as int
+        public string PayloadType;       // empty for Created/Disposed
+        public string PayloadSummary;    // populated for Invoked only
+        public string FilePath;
+        public int    LineNumber;
+        public string MemberName;
+        public int    SubscriberCountAtMoment;
+        public List<string> Errors;      // exceptions thrown by subscribers during Invoke; null if none
+
+        /// <summary>
+        /// For <see cref="SignalEventKind.Invoked"/> events only: the
+        /// <see cref="Sequence"/> of the Invoke this one was dispatched
+        /// inside of (i.e. a subscriber of that signal called this Invoke).
+        /// 0 means a root invocation — fired from non-signal code
+        /// (Update, input, a coroutine, …). Drives the Call Graph view.
+        /// </summary>
+        public int ParentSequence;
+    }
+}

@@ -33,7 +33,7 @@ namespace Exerussus.Nexus.Core
             foreach (var d in list.ToArray())
             {
                 try { ((Action<T>)d).Invoke(message); }
-                catch (Exception ex) { Debug.LogError($"[Nexus] Обработчик шины упал: {ex.Message}"); }
+                catch (Exception ex) { NexusDiagnostics.Error("Обработчик шины упал", ex); }
             }
         }
 

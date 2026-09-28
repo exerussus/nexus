@@ -1,0 +1,350 @@
+// ============================================================
+//  AppKit.cs — визуальный набор страницы App.
+//
+//  Мягко, но с видимыми контурами: карточки на BgSoft с рамкой Divider и скруглением 8,
+//  поля ввода утоплены (BgHard), статусы — мягкая заливка + точка цвета статуса + обычный
+//  текст. Accent — только для активного и интерактивного. Все цвета — токены темы Nexus,
+//  литералов нет (контракт темы: палитра меняется — страница следует за ней).
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using Exerussus.Nexus.Abstractions;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class AppKit
+    {
+        public readonly IPageContext Context;
+
+        private static readonly Color Clear = new(0f, 0f, 0f, 0f);
+
+        public AppKit(IPageContext context) => Context = context;
+
+        public Color Tok(NexusToken token) => Context.Theme.Get(token);
+
+        // ============================================================ поверхности
+
+        /// <summary>Карточка: заголовок, пояснение, справа — необязательные действия.</summary>
+        public VisualElement Card(string title, string hint = null, VisualElement headerRight = null)
+        {
+            var card = new VisualElement();
+            card.style.backgroundColor = Tok(NexusToken.BgSoft);
+            SetBorder(card, Tok(NexusToken.Divider), 1f, 8f);
+            card.style.paddingLeft = 14f; card.style.paddingRight = 14f;
+            card.style.paddingTop = 12f;  card.style.paddingBottom = 12f;
+            card.style.marginBottom = 12f;
+
+            if (!string.IsNullOrEmpty(title) || headerRight != null)
+            {
+                var head = Row();
+                head.style.alignItems = Align.FlexStart;
+                head.style.marginBottom = 8f;
+
+                var texts = new VisualElement();
+                texts.style.flexGrow = 1;
+                texts.style.flexShrink = 1;
+                if (!string.IsNullOrEmpty(title)) texts.Add(Title(title));
+                if (!string.IsNullOrEmpty(hint)) texts.Add(Hint(hint));
+                head.Add(texts);
+
+                if (headerRight != null) head.Add(headerRight);
+                card.Add(head);
+            }
+
+            return card;
+        }
+
+        /// <summary>Сетка из двух колонок: левая — гибкая, правая — фиксированной ширины.</summary>
+        public VisualElement Columns(out VisualElement left, out VisualElement right, float rightWidth = 380f)
+        {
+            var row = Row();
+            row.style.alignItems = Align.FlexStart;
+            row.style.flexWrap = Wrap.NoWrap;
+
+            left = new VisualElement();
+            left.style.flexGrow = 1;
+            left.style.flexShrink = 1;
+            left.style.minWidth = 280f;
+            left.style.marginRight = 12f;
+
+            right = new VisualElement();
+            right.style.width = rightWidth;
+            right.style.flexShrink = 0;
+
+            row.Add(left);
+            row.Add(right);
+            return row;
+        }
+
+        public VisualElement Divider(float margin = 8f)
+        {
+            var line = new VisualElement();
+            line.style.height = 1f;
+            line.style.flexShrink = 0;
+            line.style.backgroundColor = Tok(NexusToken.Divider);
+            line.style.marginTop = margin;
+            line.style.marginBottom = margin;
+            return line;
+        }
+
+        /// <summary>Строка списка: ховер поверхностью, скругление 6.</summary>
+        public VisualElement ListRow(Action onClick = null)
+        {
+            var row = Row();
+            row.style.paddingLeft = 8f; row.style.paddingRight = 8f;
+            row.style.paddingTop = 5f;  row.style.paddingBottom = 5f;
+            row.style.minHeight = 26f;
+            SetRadius(row, 6f);
+
+            var hover = Tok(NexusToken.BgRaised);
+            row.RegisterCallback<PointerEnterEvent>(_ => row.style.backgroundColor = hover);
+            row.RegisterCallback<PointerLeaveEvent>(_ => row.style.backgroundColor = Clear);
+
+            if (onClick != null)
+                row.RegisterCallback<PointerDownEvent>(e => { if (e.button == 0) onClick(); });
+
+            return row;
+        }
+
+        // ============================================================ текст
+
+        public Label Title(string text)
+        {
+            var l = Text(text, NexusToken.TextNormal, 13);
+            l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            return l;
+        }
+
+        public Label Hint(string text)
+        {
+            var l = Text(text, NexusToken.TextDim, 11);
+            l.style.marginTop = 3f;
+            return l;
+        }
+
+        public Label Faint(string text) => Text(text, NexusToken.TextFaint, 11);
+
+        public Label Text(string text, NexusToken token = NexusToken.TextNormal, int size = 12)
+        {
+            var l = new Label(text);
+            l.style.color = Tok(token);
+            l.style.fontSize = size;
+            l.style.whiteSpace = WhiteSpace.Normal;
+            l.style.marginLeft = 0f; l.style.marginRight = 0f;
+            l.style.paddingLeft = 0f; l.style.paddingRight = 0f;
+            return l;
+        }
+
+        /// <summary>Текст для путей, кодов и версий — мельче и приглушённее основного.</summary>
+        public Label Mono(string text, NexusToken token = NexusToken.TextNormal) => Text(text, token, 11);
+
+        // ============================================================ статусы
+
+        /// <summary>Статус: мягкая заливка, точка цвета статуса, обычный текст. Деталь — ниже, приглушённо.</summary>
+        public VisualElement Status(StatusKind kind, string text, string detail = null)
+        {
+            var (soft, solid) = kind switch
+            {
+                StatusKind.Ok => (NexusToken.OkSoft, NexusToken.Ok),
+                StatusKind.Warning => (NexusToken.WarningSoft, NexusToken.Warning),
+                StatusKind.Error => (NexusToken.ErrorSoft, NexusToken.Error),
+                _ => (NexusToken.AccentSoft, NexusToken.Accent),
+            };
+
+            var box = new VisualElement();
+            box.style.backgroundColor = Tok(soft);
+            SetRadius(box, 6f);
+            box.style.paddingLeft = 10f; box.style.paddingRight = 10f;
+            box.style.paddingTop = 6f;   box.style.paddingBottom = 6f;
+            box.style.marginTop = 4f;    box.style.marginBottom = 4f;
+
+            var line = Row();
+            line.style.flexWrap = Wrap.NoWrap;
+            line.Add(Dot(solid));
+            var label = Text(text);
+            label.style.flexShrink = 1;
+            line.Add(label);
+            box.Add(line);
+
+            if (!string.IsNullOrEmpty(detail))
+            {
+                var d = Mono(detail, NexusToken.TextDim);
+                d.style.marginLeft = 15f;
+                d.style.marginTop = 3f;
+                box.Add(d);
+            }
+
+            return box;
+        }
+
+        /// <summary>Маленькая плашка статуса в строку (для заголовков).</summary>
+        public VisualElement Badge(StatusKind kind, string text)
+        {
+            var s = Status(kind, text);
+            s.style.paddingTop = 2f; s.style.paddingBottom = 2f;
+            s.style.marginTop = 0f; s.style.marginBottom = 0f;
+            s.style.alignSelf = Align.Center;
+            return s;
+        }
+
+        public VisualElement Dot(NexusToken token)
+        {
+            var dot = new VisualElement();
+            dot.style.width = 7f;
+            dot.style.height = 7f;
+            dot.style.flexShrink = 0;
+            dot.style.marginRight = 8f;
+            dot.style.backgroundColor = Tok(token);
+            SetRadius(dot, 4f);
+            return dot;
+        }
+
+        // ============================================================ управление
+
+        public Button Btn(NexusRole role, string text, Action onClick, bool small = false)
+        {
+            var b = Context.Ui.Button(role, text, onClick);
+            SetRadius(b, 6f);
+            b.style.height = small ? 22f : 26f;
+            b.style.paddingLeft = small ? 9f : 13f;
+            b.style.paddingRight = small ? 9f : 13f;
+            b.style.fontSize = small ? 11 : 12;
+            b.style.unityFontStyleAndWeight = FontStyle.Bold;
+            b.style.marginLeft = 0f;
+            b.style.marginRight = 6f;
+            return b;
+        }
+
+        public TextField Input(string value, Action<string> onChanged)
+        {
+            var f = Context.Ui.Input(value, onChanged);
+            f.style.marginLeft = 0f; f.style.marginRight = 0f;
+            f.style.minHeight = 24f;
+            PaintFieldInput(f);
+            return f;
+        }
+
+        public Toggle Check(string label, bool value, Action<bool> onChanged)
+        {
+            var t = new Toggle(label) { value = value };
+            t.style.marginLeft = 0f;
+            t.style.marginRight = 16f;
+            t.style.marginTop = 3f; t.style.marginBottom = 3f;
+            t.RegisterValueChangedCallback(e => onChanged?.Invoke(e.newValue));
+            PaintLabels(t);
+            return t;
+        }
+
+        public DropdownField Dropdown(string label, List<string> choices, int index, Action<int> onChanged)
+        {
+            var dd = new DropdownField(label, choices, Mathf.Clamp(index, 0, Math.Max(0, choices.Count - 1)));
+            dd.style.marginLeft = 0f; dd.style.marginRight = 0f;
+            dd.RegisterValueChangedCallback(e =>
+            {
+                var i = choices.IndexOf(e.newValue);
+                if (i >= 0) onChanged?.Invoke(i);
+            });
+            PaintLabels(dd);
+            PaintFieldInput(dd);
+            return dd;
+        }
+
+        /// <summary>Строка «подпись слева — поле справа» с общей шириной подписи.</summary>
+        public VisualElement Labeled(string label, VisualElement field, float labelWidth = 104f)
+        {
+            var row = Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            row.style.marginTop = 4f;
+            row.style.marginBottom = 4f;
+
+            var l = Text(label, NexusToken.TextDim, 11);
+            l.style.width = labelWidth;
+            l.style.flexShrink = 0;
+            row.Add(l);
+
+            field.style.flexGrow = 1;
+            field.style.flexShrink = 1;
+            row.Add(field);
+            return row;
+        }
+
+        public VisualElement Row()
+        {
+            var r = new VisualElement();
+            r.style.flexDirection = FlexDirection.Row;
+            r.style.alignItems = Align.Center;
+            r.style.flexWrap = Wrap.Wrap;
+            return r;
+        }
+
+        public VisualElement Spacer()
+        {
+            var s = new VisualElement();
+            s.style.flexGrow = 1;
+            return s;
+        }
+
+        public VisualElement Gap(float width)
+        {
+            var g = new VisualElement();
+            g.style.width = width;
+            g.style.flexShrink = 0;
+            return g;
+        }
+
+        // ============================================================ покраска стандартных полей
+
+        public void PaintLabels(VisualElement root)
+        {
+            var dim = Tok(NexusToken.TextDim);
+            var normal = Tok(NexusToken.TextNormal);
+            root.Query<Label>(className: "unity-base-field__label").ForEach(l => l.style.color = dim);
+            root.Query<Label>(className: "unity-toggle__text").ForEach(l => l.style.color = normal);
+        }
+
+        public void PaintFieldInput(VisualElement root)
+        {
+            var bg = Tok(NexusToken.BgHard);
+            var border = Tok(NexusToken.Divider);
+            var focus = Tok(NexusToken.Focus);
+            var text = Tok(NexusToken.TextNormal);
+
+            void Paint(VisualElement input)
+            {
+                input.style.backgroundColor = bg;
+                input.style.color = text;
+                SetBorder(input, border, 1f, 6f);
+                input.RegisterCallback<FocusInEvent>(_ => SetBorderColor(input, focus));
+                input.RegisterCallback<FocusOutEvent>(_ => SetBorderColor(input, border));
+            }
+
+            root.Query<VisualElement>(className: "unity-base-text-field__input").ForEach(Paint);
+            root.Query<VisualElement>(className: "unity-base-popup-field__input").ForEach(Paint);
+        }
+
+        // ============================================================ утилиты
+
+        public static void SetBorder(VisualElement e, Color c, float width, float radius)
+        {
+            e.style.borderTopWidth = width;    e.style.borderRightWidth = width;
+            e.style.borderBottomWidth = width; e.style.borderLeftWidth = width;
+            SetBorderColor(e, c);
+            SetRadius(e, radius);
+        }
+
+        public static void SetBorderColor(VisualElement e, Color c)
+        {
+            e.style.borderTopColor = c;    e.style.borderRightColor = c;
+            e.style.borderBottomColor = c; e.style.borderLeftColor = c;
+        }
+
+        public static void SetRadius(VisualElement e, float r)
+        {
+            e.style.borderTopLeftRadius = r;    e.style.borderTopRightRadius = r;
+            e.style.borderBottomLeftRadius = r; e.style.borderBottomRightRadius = r;
+        }
+    }
+}

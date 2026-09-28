@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Deployment;
 using Exerussus.Nexus.Manifests;
 using UnityEditor;
@@ -50,6 +51,7 @@ namespace Exerussus.Nexus.Core
                 var gate = DependencyGate.Check(dp?.Manifest);
                 if (gate.Count > 0)
                 {
+                    NexusDiagnostics.Trace("Gate", $"'{it.Id}' отклонён: {string.Join("; ", gate)}");
                     refusals.Add($"• «{name}»: {string.Join("; ", gate)}");
                     continue;
                 }
@@ -57,6 +59,8 @@ namespace Exerussus.Nexus.Core
                 // нет нужного UPM-пакета → не деплоим сейчас, уводим в двухфазную установку
                 if (DependencyGate.MissingPackages(dp?.Manifest).Count > 0 && dp != null)
                 {
+                    NexusDiagnostics.Trace("Gate",
+                        $"'{it.Id}' ждёт UPM-пакеты: {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest).Select(p => p.Name))}");
                     needsPackages.Add(dp);
                     continue;
                 }
@@ -225,6 +229,25 @@ namespace Exerussus.Nexus.Core
         }
 
         public static void RemoveScanPath(string projectRelative) => NexusConfigStore.RemoveScanPath(projectRelative);
+
+        // ---- корни плагинов по маркеру nexus-plugins.json ----
+
+        /// <summary>Поиск корней по маркеру (только вручную, из Manage). Пишет конфиг, если
+        /// что-то изменилось; перезагрузку домена не вызывает — дискавери читает диск заново.</summary>
+        public static RootScanResult ScanPluginRoots() => PluginRootScanner.Scan();
+
+        /// <summary>Все корни с диагностикой — для секции «Корни плагинов» в Manage.</summary>
+        public static List<PluginRootRow> DescribePluginRoots()
+            => PluginRoots.Describe().Select(i => new PluginRootRow
+            {
+                Kind      = i.Source == PluginRootSource.BuiltIn  ? PluginRootKind.BuiltIn
+                          : i.Source == PluginRootSource.ScanPath ? PluginRootKind.ScanPath
+                          : PluginRootKind.Marker,
+                Path      = i.Display,
+                Name      = i.Name,
+                Exists    = i.Exists,
+                Duplicate = i.Duplicate,
+            }).ToList();
 
         /// <summary>Затереть персональные настройки/кэш страницы (UserSettings/&lt;id&gt;) —
         /// деструктивно и ОТДЕЛЬНО от Restore (тот префы не трогает). Файлы вне Assets,

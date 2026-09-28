@@ -44,12 +44,16 @@ namespace Exerussus.Nexus.Pages.App
     {
         public static List<ProfileOption> List()
         {
+            // «Текущее» — то, что активно сейчас: ассет Build Profile, если он активен, иначе классическая платформа.
+            var current = BuildProfile.GetActiveBuildProfile();
             var list = new List<ProfileOption>
             {
                 new ProfileOption
                 {
                     Key  = ProfileOption.PlatformKey,
-                    Name = $"Текущая платформа ({EditorUserBuildSettings.activeBuildTarget})",
+                    Name = current != null
+                        ? $"Текущий профиль ({current.name})"
+                        : $"Текущая платформа ({EditorUserBuildSettings.activeBuildTarget})",
                     Path = "",
                 },
             };
@@ -74,6 +78,21 @@ namespace Exerussus.Nexus.Pages.App
             return null;
         }
 
+        /// <summary>
+        /// Профиль, который реально стоит за вариантом: выбранный ассет, а для «текущего» — активный
+        /// ассет Build Profile. <c>null</c> — классическая платформа без ассета (глобальный Scene List).
+        /// </summary>
+        public static BuildProfile Resolve(ProfileOption option)
+        {
+            if (option == null) return null;
+            if (option.Profile != null) return option.Profile;
+            return option.IsPlatform ? BuildProfile.GetActiveBuildProfile() : null;
+        }
+
+        /// <summary>Сцены сборки с учётом переопределения списка сцен в профиле.</summary>
+        public static EditorBuildSettingsScene[] ScenesFor(BuildProfile profile)
+            => profile != null ? profile.GetScenesForBuild() : EditorBuildSettings.scenes;
+
         public static string ActiveName()
         {
             var active = BuildProfile.GetActiveBuildProfile();
@@ -86,7 +105,7 @@ namespace Exerussus.Nexus.Pages.App
     internal sealed class BuildRequest
     {
         public string profileKey  = "";
-        public string profilePath = "";   // пусто — сборка «текущей платформы» без профиля
+        public string profilePath = "";   // пусто — «текущее»: активный профиль или платформа без профиля
         public string configPath  = "";
         public string historyPath = "";
         public bool   development;
@@ -158,6 +177,14 @@ namespace Exerussus.Nexus.Pages.App
             if (EditorApplication.isPlayingOrWillChangePlaymode) { message = "Выйдите из Play Mode.";                    return StartResult.Rejected; }
             if (EditorApplication.isCompiling)                   { message = "Идёт компиляция — дождитесь окончания.";   return StartResult.Rejected; }
             if (EditorUtility.scriptCompilationFailed)           { message = "В проекте ошибки компиляции.";             return StartResult.Rejected; }
+
+            // «Текущее» = активный профиль. Без этого сборка шла по глобальному Scene List (без
+            // переопределения сцен профиля), а свитч ниже снимал активный профиль на голую платформу.
+            if (string.IsNullOrEmpty(req.profilePath))
+            {
+                var current = BuildProfile.GetActiveBuildProfile();
+                if (current != null) req.profilePath = AssetDatabase.GetAssetPath(current);
+            }
 
             BuildProfile target = null;
             if (!string.IsNullOrEmpty(req.profilePath))
@@ -293,7 +320,7 @@ namespace Exerussus.Nexus.Pages.App
                 entry.dirty      = ctx.IsDirty;
                 entry.outputPath = ctx.OutputPath;
 
-                var scenes = profile != null ? profile.GetScenesForBuild() : EditorBuildSettings.scenes;
+                var scenes = BuildProfiles.ScenesFor(profile);
                 if (!HasEnabledScenes(scenes)) { Fill(entry, false, "В списке сцен для сборки нет ни одной включённой сцены."); return; }
 
                 var steps    = BuildStepRegistry.All();

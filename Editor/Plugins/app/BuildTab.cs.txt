@@ -200,10 +200,14 @@ namespace Exerussus.Nexus.Pages.App
             var selected = SelectedProfile();
             if (selected != null)
             {
-                var scenes = selected.Profile != null ? selected.Profile.GetScenesForBuild() : EditorBuildSettings.scenes;
+                var resolved = BuildProfiles.Resolve(selected);
+                var scenes = BuildProfiles.ScenesFor(resolved);
                 var count = 0;
                 if (scenes != null) foreach (var s in scenes) if (s != null && s.enabled) count++;
-                if (count == 0) card.Add(_kit.Status(StatusKind.Error, "В профиле нет включённых сцен — сборка не начнётся."));
+                if (count == 0)
+                    card.Add(_kit.Status(StatusKind.Error, resolved != null
+                        ? "В профиле нет включённых сцен — сборка не начнётся."
+                        : "Глобальный Scene List пуст, а профиль не активен — выберите профиль со своим списком сцен."));
                 else card.Add(_kit.Faint($"Активен сейчас: {BuildProfiles.ActiveName()} · сцен в сборке: {count}"));
             }
 
@@ -535,10 +539,10 @@ namespace Exerussus.Nexus.Pages.App
 
         private BuildStepContext PreviewContext()
         {
-            var selected = SelectedProfile();
+            var resolved = BuildProfiles.Resolve(SelectedProfile());
             return new BuildStepContext
             {
-                ProfileName = selected?.Profile != null ? selected.Profile.name : EditorUserBuildSettings.activeBuildTarget.ToString(),
+                ProfileName = resolved != null ? resolved.name : EditorUserBuildSettings.activeBuildTarget.ToString(),
                 Target = EditorUserBuildSettings.activeBuildTarget,
                 ProductName = PlayerSettings.productName,
                 Version = VersionBumper.Current(),

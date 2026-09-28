@@ -230,6 +230,25 @@ namespace Exerussus.Nexus.Core
 
         public static void RemoveScanPath(string projectRelative) => NexusConfigStore.RemoveScanPath(projectRelative);
 
+        // ---- корни плагинов по маркеру nexus-plugins.json ----
+
+        /// <summary>Поиск корней по маркеру (только вручную, из Manage). Пишет конфиг, если
+        /// что-то изменилось; перезагрузку домена не вызывает — дискавери читает диск заново.</summary>
+        public static RootScanResult ScanPluginRoots() => PluginRootScanner.Scan();
+
+        /// <summary>Все корни с диагностикой — для секции «Корни плагинов» в Manage.</summary>
+        public static List<PluginRootRow> DescribePluginRoots()
+            => PluginRoots.Describe().Select(i => new PluginRootRow
+            {
+                Kind      = i.Source == PluginRootSource.BuiltIn  ? PluginRootKind.BuiltIn
+                          : i.Source == PluginRootSource.ScanPath ? PluginRootKind.ScanPath
+                          : PluginRootKind.Marker,
+                Path      = i.Display,
+                Name      = i.Name,
+                Exists    = i.Exists,
+                Duplicate = i.Duplicate,
+            }).ToList();
+
         /// <summary>Затереть персональные настройки/кэш страницы (UserSettings/&lt;id&gt;) —
         /// деструктивно и ОТДЕЛЬНО от Restore (тот префы не трогает). Файлы вне Assets,
         /// поэтому без AssetDatabase.Refresh и без domain reload.</summary>

@@ -109,6 +109,53 @@ namespace Exerussus.Nexus.Deployment
             var packages = Norm(Path.Combine(ProjectRoot, "Packages"));
             if (p.StartsWith(packages + "/")) return "Packages" + p.Substring(packages.Length);
 
+            // прочие пакеты (git/registry) лежат в кэше — сопоставляем по их реальному пути
+            try
+            {
+                foreach (var info in UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages())
+                {
+                    var resolved = Norm(info?.resolvedPath);
+                    if (string.IsNullOrEmpty(resolved) || string.IsNullOrEmpty(info.assetPath)) continue;
+                    if (p == resolved) return Norm(info.assetPath);
+                    if (p.StartsWith(resolved + "/")) return Norm(info.assetPath) + p.Substring(resolved.Length);
+                }
+            }
+            catch (System.Exception ex) { NexusDiagnostics.Swallowed("сопоставление пути с пакетом", ex); }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Asset-путь («Assets/…» или «Packages/&lt;имя&gt;/…») → абсолютный путь в файловой
+        /// системе. Для пакетов из кэша (git/registry) берётся их реальная папка.
+        /// null — если путь пуст или не похож на asset-путь.
+        /// </summary>
+        public static string AssetToAbsolute(string assetPath)
+        {
+            if (string.IsNullOrWhiteSpace(assetPath)) return null;
+            var a = Norm(assetPath.Trim());
+
+            if (a == "Assets" || a.StartsWith("Assets/"))
+                return Norm(Path.Combine(ProjectRoot, a));
+
+            if (a.StartsWith("Packages/"))
+            {
+                try
+                {
+                    var info = UnityEditor.PackageManager.PackageInfo.FindForAssetPath(a);
+                    if (info != null && !string.IsNullOrEmpty(info.resolvedPath) && !string.IsNullOrEmpty(info.assetPath))
+                    {
+                        var pkgRoot = Norm(info.assetPath);
+                        if (a == pkgRoot) return Norm(info.resolvedPath);
+                        if (a.StartsWith(pkgRoot + "/")) return Norm(info.resolvedPath) + a.Substring(pkgRoot.Length);
+                    }
+                }
+                catch (System.Exception ex) { NexusDiagnostics.Swallowed("путь пакета для " + a, ex); }
+
+                // встроенный пакет без регистрации (напр. сразу после добавления папки)
+                return Norm(Path.Combine(ProjectRoot, a));
+            }
+
             return null;
         }
 

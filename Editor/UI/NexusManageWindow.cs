@@ -151,11 +151,11 @@ namespace Exerussus.Nexus.UI
             if (_list == null) return;
             _list.Clear();
 
-            _list.Add(ScanPathsSection());
+            _list.Add(PluginRootsSection());
 
             if (_plugins.Count == 0)
             {
-                _list.Add(Hint("Плагины не найдены. Положите Plugins/<id>/manifest.json."));
+                _list.Add(Hint("Плагины не найдены. Положите Plugins/<id>/manifest.json или отметьте свою папку маркером nexus-plugins.json и нажмите «Найти корни плагинов»."));
             }
             else
             {
@@ -174,34 +174,92 @@ namespace Exerussus.Nexus.UI
             UpdatePending();
         }
 
-        // доп. корни сканирования плагинов (проектные плагины вне основной папки Nexus)
-        private VisualElement ScanPathsSection()
-        {
-            var fold = new Foldout { text = "Scan paths (доп. корни плагинов)" };
-            const string key = "Exerussus.Nexus.manage.scanfold";
-            fold.value = SessionState.GetBool(key, false);
-            fold.RegisterValueChangedCallback(e => SessionState.SetBool(key, e.newValue));
+        // корни плагинов: встроенный, ручные пути и найденные по маркеру nexus-plugins.json
+        private const string RootsFoldKey   = "Exerussus.Nexus.manage.scanfold";
+        private const string RootsStatusKey = "Exerussus.Nexus.manage.rootscan";
 
-            foreach (var path in ApplyService.GetScanPaths())
+        private VisualElement PluginRootsSection()
+        {
+            var rows    = ApplyService.DescribePluginRoots();
+            var markers = rows.Count(r => r.Kind == PluginRootKind.Marker);
+            var missing = rows.Count(r => r.Kind != PluginRootKind.BuiltIn && !r.Exists);
+
+            var section = new VisualElement();
+            section.style.paddingLeft = 8f;
+            section.style.paddingRight = 8f;
+            section.style.paddingBottom = 4f;
+
+            // шапка: счётчик + поиск (поиск — только по кнопке, фоном ничего не сканируется)
+            var head = new VisualElement();
+            head.style.flexDirection = FlexDirection.Row;
+            head.style.alignItems = Align.Center;
+            var caption = $"Корни плагинов: {rows.Count(r => r.Exists && !r.Duplicate)}";
+            if (missing > 0) caption += $" · пропало: {missing}";
+            head.Add(new Label(caption) { style = { flexGrow = 1f, color = missing > 0 ? NexusTheme.Get(NexusToken.Warning) : TextDim } });
+            var scan = NexusStyles.Button("Найти корни плагинов", ScanPluginRoots);
+            scan.tooltip = "Найти все файлы nexus-plugins.json в Assets и пакетах и запомнить их папки " +
+                           "как корни плагинов (ProjectSettings/Nexus.json). Запускается только вручную.";
+            head.Add(scan);
+            section.Add(head);
+
+            var status = SessionState.GetString(RootsStatusKey, "");
+            if (!string.IsNullOrEmpty(status)) section.Add(SmallHint(status));
+
+            var fold = new Foldout { text = $"Подробнее (по маркеру: {markers}, вручную: {rows.Count(r => r.Kind == PluginRootKind.ScanPath)})" };
+            fold.value = SessionState.GetBool(RootsFoldKey, false);
+            fold.RegisterValueChangedCallback(e => SessionState.SetBool(RootsFoldKey, e.newValue));
+
+            foreach (var r in rows)
             {
                 var row = new VisualElement();
                 row.style.flexDirection = FlexDirection.Row;
                 row.style.alignItems = Align.Center;
-                row.Add(new Label(path) { style = { flexGrow = 1f, color = TextDim } });
-                row.Add(NexusStyles.Button("Remove", () => { ApplyService.RemoveScanPath(path); Reload(); }));
+
+                var kind = r.Kind == PluginRootKind.BuiltIn ? "встроенный"
+                         : r.Kind == PluginRootKind.ScanPath ? "вручную"
+                         : "маркер";
+                row.Add(new Label(kind) { style = { width = 70f, color = TextDim, fontSize = 10f } });
+
+                var text = string.IsNullOrEmpty(r.Name) ? r.Path : $"{r.Name} — {r.Path}";
+                if (!r.Exists)     text += "  (нет на диске)";
+                else if (r.Duplicate) text += "  (дубль, игнорируется)";
+                var color = !r.Exists ? NexusTheme.Get(NexusToken.Warning) : r.Duplicate ? TextDim : NexusTheme.Get(NexusToken.TextNormal);
+                row.Add(new Label(text) { style = { flexGrow = 1f, flexShrink = 1f, color = color, whiteSpace = WhiteSpace.Normal } });
+
+                if (r.Kind == PluginRootKind.ScanPath)
+                {
+                    var path = r.Path;
+                    row.Add(NexusStyles.Button("Remove", () => { ApplyService.RemoveScanPath(path); Reload(); }));
+                }
+
                 fold.Add(row);
             }
 
             fold.Add(NexusStyles.Button("Add scan path…", AddScanPathDialog));
+            fold.Add(SmallHint("Положите nexus-plugins.json ({\"schemaVersion\": 1, \"name\": \"…\"}) в папку с плагинами " +
+                               "(<id>/manifest.json) — в Assets или в пакете — и нажмите «Найти корни плагинов». " +
+                               "Папки с «~» на конце Unity не импортирует — маркер там не найдётся. " +
+                               "Ручной путь — запасной вариант для папок без маркера."));
 
-            var hint = new Label("Папки с Plugins-структурой (<id>/manifest.json), напр. проектные плагины. Должны быть внутри проекта.");
+            section.Add(fold);
+            return section;
+        }
+
+        private void ScanPluginRoots()
+        {
+            var result = ApplyService.ScanPluginRoots();
+            SessionState.SetString(RootsStatusKey, result.Summary());
+            Reload();
+        }
+
+        private static Label SmallHint(string message)
+        {
+            var hint = new Label(message);
             hint.style.color = TextDim;
             hint.style.fontSize = 10f;
             hint.style.whiteSpace = WhiteSpace.Normal;
             hint.style.marginTop = 2f;
-            fold.Add(hint);
-
-            return fold;
+            return hint;
         }
 
         private void AddScanPathDialog()

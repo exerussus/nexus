@@ -12,6 +12,9 @@
 - `NexusPaths.AssetToAbsolute`; `ToAssetPath` понимает пакеты из кэша (иконки плагинов из git-пакетов).
 - `CHANGELOG.md`, README движка.
 
+### Удалено
+- Плагин `resources-auditor`. Если он был развёрнут, в Manage он станет «осиротевшим» — удалите его там кнопкой Clean.
+
 ### Изменено
 - Nexus устанавливается как UPM-пакет: зависимость `com.unity.nuget.newtonsoft-json` объявлена
   в `package.json` (раньше Newtonsoft должен был быть в проекте сам). Если в проекте лежит

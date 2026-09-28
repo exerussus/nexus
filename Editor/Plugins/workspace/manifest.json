@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "1825940fec254aa2a877082a27ec8bcf",
   "id": "workspace",
-  "version": "1.1",
+  "version": "1.2",
   "typeName": "Exerussus.Nexus.Pages.Workspace.WorkspacePage",
   "display": {
     "name": "Рабочая область",

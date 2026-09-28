@@ -23,7 +23,6 @@ namespace Exerussus.Nexus.Core
         private readonly IPageMessageBus _bus;
         private readonly IPageTheme _theme;
         private readonly IPageUi _ui;
-        private readonly Action<string, StatusKind> _status;
         private readonly Dictionary<string, Entry> _entries = new Dictionary<string, Entry>();
 
         private string _activeId;        // id активной страницы (или null — напр. Health)
@@ -31,6 +30,7 @@ namespace Exerussus.Nexus.Core
 
         private sealed class Entry
         {
+            public string        Name;      // имя страницы для журнала статусов
             public IEditorPage   Page;
             public VisualElement Root;
             public bool          Faulted;
@@ -39,12 +39,11 @@ namespace Exerussus.Nexus.Core
             public bool          Focused;   // получила OnFocus и ещё не OnUnfocus
         }
 
-        public PageHost(IPageMessageBus bus, IPageTheme theme, IPageUi ui, Action<string, StatusKind> status)
+        public PageHost(IPageMessageBus bus, IPageTheme theme, IPageUi ui)
         {
             _bus    = bus;
             _theme  = theme;
             _ui     = ui;
-            _status = status;
             PageHostRegistry.Register(this);
         }
 
@@ -175,7 +174,7 @@ namespace Exerussus.Nexus.Core
             if (_entries.TryGetValue(id, out var existing))
                 return existing.Faulted ? null : existing.Root;
 
-            var entry = new Entry();
+            var entry = new Entry { Name = p.DisplayName ?? id };
             _entries[id] = entry;
 
             try
@@ -188,7 +187,7 @@ namespace Exerussus.Nexus.Core
 
                 var page = (IEditorPage)Activator.CreateInstance(type);
                 entry.Page = page;                       // до BuildUI — чтобы Reload/Dispose сняли подписки даже при падении
-                page.Initialize(new NexusPageContext(id, _bus, _theme, _ui, _status));
+                page.Initialize(new NexusPageContext(id, entry.Name, _bus, _theme, _ui));
                 entry.Root = page.BuildUI() ?? new VisualElement();
                 return entry.Root;
             }
@@ -210,7 +209,7 @@ namespace Exerussus.Nexus.Core
                 e.Faulted = true;
                 e.Error   = $"{what}: {ex.Message}";
                 NexusDiagnostics.Error($"Страница '{id}' упала в {what}", ex);
-                _status?.Invoke($"Страница «{id}» упала: {what}", StatusKind.Error);
+                NexusStatusLog.Add(e.Name ?? id, $"Страница упала в {what}: {ex.Message}\n\n{ex}", StatusKind.Error);
             }
         }
 
@@ -219,6 +218,7 @@ namespace Exerussus.Nexus.Core
             e.Faulted = true;
             e.Error   = error;
             NexusDiagnostics.Error("Страница не загрузилась", error);
+            NexusStatusLog.Add(e.Name ?? "Nexus", "Страница не загрузилась: " + error, StatusKind.Error);
             return null;
         }
 

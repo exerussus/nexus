@@ -20,6 +20,9 @@ namespace Exerussus.Nexus.Pages.Workspace
             {
                 AssetDatabase.TryGetGUIDAndLocalFileIdentifier(obj, out string guid, out long localId);
                 if (string.IsNullOrEmpty(guid)) return null;
+                // главный ассет файла (сцена, префаб, материал…) — без localId: иначе при
+                // каждом резолве пошёл бы перебор всех объектов файла (для сцены — ошибки Unity)
+                if (AssetDatabase.IsMainAsset(obj)) localId = 0;
                 return new WorkspaceEntry
                 {
                     kind = WorkspaceEntryKind.Asset,
@@ -72,16 +75,23 @@ namespace Exerussus.Nexus.Pages.Workspace
                 {
                     string path = AssetDatabase.GUIDToAssetPath(entry.assetGuid);
                     if (string.IsNullOrEmpty(path)) return null;
-                    if (entry.assetLocalId != 0)
-                    {
-                        foreach (var a in AssetDatabase.LoadAllAssetsAtPath(path))
-                        {
-                            if (a == null) continue;
-                            if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(a, out _, out long lid) && lid == entry.assetLocalId)
-                                return a;
-                        }
-                    }
-                    return AssetDatabase.LoadMainAssetAtPath(path);
+
+                    var main = AssetDatabase.LoadMainAssetAtPath(path);
+                    if (entry.assetLocalId == 0 || main == null) return main;
+
+                    // localId указывает на сам главный ассет (так сохранялись записи до 1.2)
+                    if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(main, out _, out long mainId) && mainId == entry.assetLocalId)
+                        return main;
+
+                    // В сцене сабассетов нет, а LoadAllAssetsAtPath по .unity сыплет
+                    // «Do not use ReadObjectThreaded on scene objects» на каждый вызов.
+                    if (main is SceneAsset) return main;
+
+                    // Настоящий сабассет (спрайт в атласе, меш в FBX…): сначала видимые
+                    // представления, затем — все объекты файла (скрытые тоже).
+                    var found = FindByLocalId(AssetDatabase.LoadAllAssetRepresentationsAtPath(path), entry.assetLocalId)
+                             ?? FindByLocalId(AssetDatabase.LoadAllAssetsAtPath(path), entry.assetLocalId);
+                    return found ?? main;
                 }
                 case WorkspaceEntryKind.SceneObject:
                     return GlobalObjectId.TryParse(entry.globalObjectId, out var gid)
@@ -91,6 +101,18 @@ namespace Exerussus.Nexus.Pages.Workspace
                 default:
                     return null; // внешние файлы не имеют Unity-объекта
             }
+        }
+
+        private static UnityEngine.Object FindByLocalId(UnityEngine.Object[] objects, long localId)
+        {
+            if (objects == null) return null;
+            foreach (var o in objects)
+            {
+                if (o == null) continue;
+                if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(o, out _, out long lid) && lid == localId)
+                    return o;
+            }
+            return null;
         }
 
         // ---------- Иконки ----------

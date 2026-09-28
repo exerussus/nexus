@@ -1,6 +1,6 @@
 {
   "name": "com.exerussus.nexus",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "displayName": "Nexus",
   "description": "Editor-feature engine: deployable plugin pages, static services, theme. All mutable data lives OUTSIDE this folder — deployed code in Assets/Plugins/NexusStates, project config in ProjectSettings/Nexus.json, personal data in UserSettings/Exerussus.Nexus — so the package can be read-only / updated cleanly. Plugin roots can live anywhere (Assets or packages): mark a folder with nexus-plugins.json and press «Найти корни плагинов» in Manage.",
   "unity": "6000.4",

@@ -35,6 +35,8 @@ namespace Exerussus.Nexus.UI
         private VisualElement _sidebar;
         private VisualElement _content;
         private Label         _status;
+        private Label         _statusMore;
+        private Button        _journal;
 
         private Dictionary<string, DiscoveredPlugin> _byId = new Dictionary<string, DiscoveredPlugin>();
 
@@ -57,6 +59,8 @@ namespace Exerussus.Nexus.UI
             NexusView.Changed += RebuildSidebar;
             NexusTheme.Changed -= OnThemeChanged;
             NexusTheme.Changed += OnThemeChanged;
+            NexusStatusLog.Changed -= ShowStatus;
+            NexusStatusLog.Changed += ShowStatus;
             if (_sidebar != null) RebuildSidebar();
         }
 
@@ -64,6 +68,7 @@ namespace Exerussus.Nexus.UI
         {
             NexusView.Changed -= RebuildSidebar;
             NexusTheme.Changed -= OnThemeChanged;
+            NexusStatusLog.Changed -= ShowStatus;
             _host?.Dispose();
             _host = null;
         }
@@ -103,7 +108,7 @@ namespace Exerussus.Nexus.UI
 
                 _bus  = new PageMessageBus();
                 _ui ??= new NexusUi();
-                _host = new PageHost(_bus, NexusTheme.PageTheme, _ui, SetStatus);
+                _host = new PageHost(_bus, NexusTheme.PageTheme, _ui);
 
                 root.style.flexDirection = FlexDirection.Column;
                 root.style.backgroundColor = BgHard;
@@ -139,13 +144,38 @@ namespace Exerussus.Nexus.UI
 
             bar.Add(new Label("Nexus") { style = { unityFontStyleAndWeight = FontStyle.Bold } });
 
-            _status = new Label(string.Empty) { style = { flexGrow = 1f, marginLeft = 10f, color = TextDim } };
+            // статус: одна строка с многоточием; клик — окно сообщений с полным текстом
+            _status = new Label(string.Empty);
+            _status.style.flexGrow = 1f;
+            _status.style.flexShrink = 1f;
+            _status.style.minWidth = 0f;
+            _status.style.marginLeft = 10f;
+            _status.style.overflow = Overflow.Hidden;
+            _status.style.textOverflow = TextOverflow.Ellipsis;
+            _status.style.whiteSpace = WhiteSpace.NoWrap;
+            _status.style.unityTextAlign = TextAnchor.MiddleLeft;
+            _status.style.color = TextDim;
+            _status.RegisterCallback<ClickEvent>(_ => OpenLastStatus());
             bar.Add(_status);
 
+            _statusMore = new Label("подробнее ›");
+            _statusMore.style.flexShrink = 0f;
+            _statusMore.style.marginLeft = 6f;
+            _statusMore.style.marginRight = 6f;
+            _statusMore.style.color = NexusTheme.Get(NexusToken.Accent);
+            _statusMore.RegisterCallback<ClickEvent>(_ => OpenLastStatus());
+            bar.Add(_statusMore);
+
+            _journal = NexusStyles.Button("Сообщения", OpenLastStatus);
+            _journal.tooltip = "Журнал сообщений: полный текст последнего и всех предыдущих, с копированием";
+            bar.Add(_journal);
             bar.Add(NexusStyles.Button("Refresh", OnRefreshClicked));
             bar.Add(NexusStyles.Button("Manage…", NexusManageWindow.Open));
+            ShowStatus();
             return bar;
         }
+
+        private static void OpenLastStatus() => NexusStatusWindow.ShowLast();
 
         private void OnRefreshClicked()
         {
@@ -375,14 +405,37 @@ namespace Exerussus.Nexus.UI
             });
         }
 
-        private void SetStatus(string text, StatusKind kind)
+        // тулбар показывает последнее сообщение журнала; кнопка «Сообщения» — красная,
+        // пока есть непрочитанная ошибка
+        private void ShowStatus()
         {
             if (_status == null) return;
-            _status.text = text ?? string.Empty;
-            _status.style.color = kind == StatusKind.Error ? ErrCol
-                                : kind == StatusKind.Warning ? WarnCol
-                                : kind == StatusKind.Ok ? OkCol
-                                : TextDim;
+            var last = NexusStatusLog.Last;
+            if (last == null)
+            {
+                _status.text = string.Empty;
+                _status.tooltip = string.Empty;
+                _statusMore.style.display = DisplayStyle.None;
+            }
+            else
+            {
+                var summary = last.Summary;
+                _status.text = last.Repeat > 1 ? $"{summary}  ×{last.Repeat}" : summary;
+                _status.tooltip = "Клик — полный текст";
+                _status.style.color = NexusStatusWindow.KindColor(last.Kind);
+                _statusMore.style.display = last.HasDetails || summary.Length > 120 ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+
+            if (_journal != null)
+            {
+                _journal.SetEnabled(last != null);
+                var alarm = NexusStatusLog.HasUnseenError;
+                var c = alarm ? ErrCol : NexusTheme.Get(NexusToken.Border);
+                _journal.style.color = alarm ? ErrCol : NexusTheme.Get(NexusToken.TextNormal);
+                _journal.style.borderTopColor = c;  _journal.style.borderBottomColor = c;
+                _journal.style.borderLeftColor = c; _journal.style.borderRightColor = c;
+                _journal.text = alarm ? "Сообщения ●" : "Сообщения";
+            }
         }
 
         private static Label Dim(string text) => new Label(text) { style = { color = TextDim } };

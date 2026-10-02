@@ -7,8 +7,10 @@
 //  rclone получает их через окружение (argv виден всем процессам машины).
 //
 //  Порядок: [снять маркеры папок Selectel] → sync/copy папки сборки → copyto zip.
+//  Путь в бакете: [главная папка/]папка версии — главная папка по желанию (по умолчанию
+//  выключена: версии лежат прямо в корне бакета, «v0.3.2/…»).
 //  sync делает папку в бакете точной копией локальной (лишнее удаляется), поэтому
-//  папка в бакете обязана быть непустой и без «..» — иначе sync снёс бы чужое.
+//  итоговый путь обязан быть непустым и без «..» — иначе sync снёс бы чужое.
 //
 //  rclone ставится отдельно: https://rclone.org/downloads/ (в PATH или путь в настройках).
 // ============================================================
@@ -44,7 +46,10 @@ namespace Exerussus.Nexus.Pages.App
             public string bucket         = "";
 
             // --- куда и что ---
-            public string prefixTemplate = "{product}/v{version}";
+            public bool   useRootFolder  = false;            // главная папка над версиями — по желанию
+            public string rootFolder     = "{product}";
+            public string versionFolder  = "v{version}";
+            public string prefixTemplate = "";               // устарело (до App 2.3): переносится в поля выше
             public bool   uploadFolder   = true;
             public bool   uploadZip      = false;
             public bool   mirror         = true;    // true — sync (точная копия), false — copy (только добавить)
@@ -59,6 +64,30 @@ namespace Exerussus.Nexus.Pages.App
             // --- дополнительно ---
             public bool   removeDirectoryMarkers = true;
             public string extraArgs      = "";
+
+            /// <summary>Итоговый шаблон пути в бакете: [главная папка/]папка версии.</summary>
+            public string PrefixTemplate
+            {
+                get
+                {
+                    var version = (versionFolder ?? "").Trim().Trim('/');
+                    var root = useRootFolder ? (rootFolder ?? "").Trim().Trim('/') : "";
+                    return root.Length > 0 ? root + "/" + version : version;
+                }
+            }
+
+            /// <summary>Старый единый шаблон «a/b/c» → главная папка «a/b» + папка версии «c». true — перенесено.</summary>
+            public bool MigrateLegacyPrefix()
+            {
+                if (string.IsNullOrWhiteSpace(prefixTemplate)) return false;
+                var t = prefixTemplate.Trim().Trim('/');
+                var slash = t.LastIndexOf('/');
+                useRootFolder = slash > 0;
+                rootFolder    = slash > 0 ? t.Substring(0, slash) : "{product}";
+                versionFolder = slash > 0 ? t.Substring(slash + 1) : t;
+                prefixTemplate = "";
+                return true;
+            }
         }
 
         // ============================================================ выполнение
@@ -68,7 +97,9 @@ namespace Exerussus.Nexus.Pages.App
             if (string.IsNullOrWhiteSpace(s.bucket)) throw new InvalidOperationException("не указан бакет.");
             if (!s.uploadFolder && !s.uploadZip) throw new InvalidOperationException("не выбрано, что заливать (папка и/или zip).");
 
-            var prefix = ResolvePrefix(s.prefixTemplate, BuildTokens.Expand(s.prefixTemplate ?? "", ctx, DateTime.Now));
+            s.MigrateLegacyPrefix();
+            var template = s.PrefixTemplate;
+            var prefix = ResolvePrefix(template, BuildTokens.Expand(template, ctx, DateTime.Now));
 
             var creds = S3Credentials.Load(ctx.UserConfigPath(CredentialsFile));
             var keys  = S3Credentials.Resolve(creds, s);
@@ -220,14 +251,16 @@ namespace Exerussus.Nexus.Pages.App
             root.Add(Field(kit, "Бакет", s.bucket, v => { s.bucket = v; changed(); }));
 
             // --- куда ---
+            if (s.MigrateLegacyPrefix()) changed();
             var preview = kit.Faint("");
             void UpdatePreview()
             {
                 try
                 {
-                    var expanded = BuildTokens.Expand(s.prefixTemplate ?? "", PlayerSettings.productName, PlayerSettings.bundleVersion,
+                    var template = s.PrefixTemplate;
+                    var expanded = BuildTokens.Expand(template, PlayerSettings.productName, PlayerSettings.bundleVersion,
                         "1a2b3c4", "<профиль>", EditorUserBuildSettings.activeBuildTarget.ToString(), DateTime.Now);
-                    preview.text = $"Будет: {Or(s.bucket, "<бакет>")}/{ResolvePrefix(s.prefixTemplate, expanded)}/  ·  {BuildTokens.Help}";
+                    preview.text = $"Будет: {Or(s.bucket, "<бакет>")}/{ResolvePrefix(template, expanded)}/  ·  {BuildTokens.Help}";
                     preview.style.color = kit.Tok(NexusToken.TextFaint);
                 }
                 catch (Exception ex)
@@ -236,7 +269,18 @@ namespace Exerussus.Nexus.Pages.App
                     preview.style.color = kit.Tok(NexusToken.Error);
                 }
             }
-            root.Add(Field(kit, "Папка в бакете", s.prefixTemplate, v => { s.prefixTemplate = v; changed(); UpdatePreview(); }));
+            VisualElement rootRow = null;
+            root.Add(kit.Check("Главная папка над версиями", s.useRootFolder, v =>
+            {
+                s.useRootFolder = v;
+                changed();
+                rootRow?.SetEnabled(v);
+                UpdatePreview();
+            }));
+            rootRow = Field(kit, "Главная папка", s.rootFolder, v => { s.rootFolder = v; changed(); UpdatePreview(); });
+            rootRow.SetEnabled(s.useRootFolder);
+            root.Add(rootRow);
+            root.Add(Field(kit, "Папка версии", s.versionFolder, v => { s.versionFolder = v; changed(); UpdatePreview(); }));
             UpdatePreview();
             preview.style.marginLeft = 130f;
             root.Add(preview);

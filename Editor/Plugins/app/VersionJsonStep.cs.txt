@@ -71,7 +71,7 @@ namespace Exerussus.Nexus.Pages.App
             ctx.Log($"version.json: {full} → {path}");
         }
 
-        protected override VisualElement BuildSettingsUI(Settings settings, Action changed, IPageUi ui)
+        protected override VisualElement BuildSettingsUI(Settings settings, Action changed, AppKit kit)
         {
             var root = new VisualElement();
             root.style.flexDirection = FlexDirection.Row;
@@ -81,7 +81,7 @@ namespace Exerussus.Nexus.Pages.App
             label.style.width = 90;
             root.Add(label);
 
-            var input = ui.Input(settings.fileName, v =>
+            var input = kit.Context.Ui.Input(settings.fileName, v =>
             {
                 settings.fileName = v;
                 changed();

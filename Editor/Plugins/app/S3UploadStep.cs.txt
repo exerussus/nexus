@@ -1,0 +1,609 @@
+// ============================================================
+//  S3UploadStep.cs — пост-шаг: заливка сборки в S3-бакет через rclone.
+//
+//  Общие настройки (endpoint, бакет, папка в бакете, режим…) — в build-config.json,
+//  коммитятся. Ключи — ТОЛЬКО личные: UserSettings (s3-credentials.json, git-ignored)
+//  или переменные окружения. В конфиг, логи и аргументы процесса ключи не попадают:
+//  rclone получает их через окружение (argv виден всем процессам машины).
+//
+//  Порядок: [снять маркеры папок Selectel] → sync/copy папки сборки → copyto zip.
+//  sync делает папку в бакете точной копией локальной (лишнее удаляется), поэтому
+//  папка в бакете обязана быть непустой и без «..» — иначе sync снёс бы чужое.
+//
+//  rclone ставится отдельно: https://rclone.org/downloads/ (в PATH или путь в настройках).
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using Exerussus.Nexus.Abstractions;
+using Newtonsoft.Json.Linq;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Debug = UnityEngine.Debug;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    [BuildStep("s3-upload", "Заливка в S3 (rclone)", BuildStage.Post,
+        Description = "Заливает папку сборки и/или zip в S3-бакет через rclone. Ключи — личные (UserSettings или переменные окружения). Ставьте после Zip.")]
+    internal sealed class S3UploadStep : BuildStep<S3UploadStep.Settings>
+    {
+        internal const string CredentialsFile = "s3-credentials.json";
+
+        [Serializable]
+        internal sealed class Settings
+        {
+            // --- хранилище ---
+            public string endpoint       = "https://s3.ru-3.storage.selcloud.ru";
+            public string region         = "ru-3";
+            public string provider       = "Other";
+            public string bucket         = "";
+
+            // --- куда и что ---
+            public string prefixTemplate = "{product}/v{version}";
+            public bool   uploadFolder   = true;
+            public bool   uploadZip      = false;
+            public bool   mirror         = true;    // true — sync (точная копия), false — copy (только добавить)
+            public string excludeMasks   = ZipStep.DefaultExcludeMasks;
+
+            // --- ключи ---
+            public string keySet         = "default";   // имя набора личных ключей
+            public string accessKeyEnv   = "SELECTEL_S3_ACCESS_KEY";
+            public string secretKeyEnv   = "SELECTEL_S3_SECRET_KEY";
+            public bool   skipWithoutKeys = true;
+
+            // --- дополнительно ---
+            public bool   removeDirectoryMarkers = true;
+            public string extraArgs      = "";
+        }
+
+        // ============================================================ выполнение
+
+        protected override void Execute(BuildStepContext ctx, Settings s)
+        {
+            if (string.IsNullOrWhiteSpace(s.bucket)) throw new InvalidOperationException("не указан бакет.");
+            if (!s.uploadFolder && !s.uploadZip) throw new InvalidOperationException("не выбрано, что заливать (папка и/или zip).");
+
+            var prefix = ResolvePrefix(s.prefixTemplate, BuildTokens.Expand(s.prefixTemplate ?? "", ctx, DateTime.Now));
+
+            var creds = S3Credentials.Load(ctx.UserConfigPath(CredentialsFile));
+            var keys  = S3Credentials.Resolve(creds, s);
+            if (keys.Source == KeySource.None)
+            {
+                var msg = $"нет ключей: ни в личных настройках (набор «{s.keySet}»), ни в переменных {s.accessKeyEnv} / {s.secretKeyEnv}";
+                if (!s.skipWithoutKeys) throw new InvalidOperationException(msg);
+                ctx.Log("S3: заливка пропущена — " + msg);
+                Debug.LogWarning("[Build] S3: заливка пропущена — " + msg);
+                return;
+            }
+
+            var rclone = Rclone.Executable(creds);
+            var env    = Rclone.Environment(s, keys);
+            var bucket = s.bucket.Trim().Trim('/');
+            var remote = $":s3:{bucket}/{prefix}";
+            ctx.Log($"S3: {bucket}/{prefix}/ (ключи: {keys.Describe()}, режим: {(s.mirror ? "sync" : "copy")})");
+
+            if (s.removeDirectoryMarkers) RemoveDirectoryMarkers(rclone, env, bucket, prefix, ctx);
+
+            string zipPath = null;
+            if (s.uploadZip)
+            {
+                zipPath = ctx.Artifacts.FindLast(a => a.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+                if (zipPath == null || !File.Exists(zipPath))
+                    throw new FileNotFoundException("zip не найден: включите шаг «Zip-архив сборки» и поставьте его ДО заливки.");
+            }
+
+            if (s.uploadFolder)
+            {
+                var single = ctx.OutputIsSingleFile && File.Exists(ctx.OutputPath);
+                if (single)
+                {
+                    Rclone.Run(rclone, CommonArgs(s, "copyto", ctx.OutputPath, $"{remote}/{Path.GetFileName(ctx.OutputPath)}"),
+                        env, "Заливка в S3", ctx);
+                }
+                else
+                {
+                    var dir = (ctx.OutputDirectory ?? "").TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (!Directory.Exists(dir)) throw new DirectoryNotFoundException($"папка сборки не найдена: {dir}");
+
+                    var args = CommonArgs(s, s.mirror ? "sync" : "copy", dir, remote);
+                    foreach (var mask in SplitMasks(s.excludeMasks))
+                    {
+                        // без «/» в начале шаблон rclone совпадает на любом уровне вложенности
+                        args.Add("--exclude"); args.Add(mask);
+                        args.Add("--exclude"); args.Add(mask + "/**");
+                    }
+                    // zip в том же префиксе: sync не должен удалять его при каждой заливке папки
+                    if (zipPath != null) { args.Add("--exclude"); args.Add("/" + Path.GetFileName(zipPath)); }
+
+                    Rclone.Run(rclone, args, env, "Заливка в S3", ctx);
+                }
+            }
+
+            if (zipPath != null)
+                Rclone.Run(rclone, CommonArgs(s, "copyto", zipPath, $"{remote}/{Path.GetFileName(zipPath)}"), env, "Заливка zip в S3", ctx);
+
+            ctx.Log($"S3: залито в {bucket}/{prefix}/");
+        }
+
+        private static List<string> CommonArgs(Settings s, string command, string source, string destination)
+        {
+            var args = new List<string>
+            {
+                command, source, destination,
+                "--checksum",               // у S3 нет mtime как у ФС — сверка по хэшу
+                "--transfers", "8",
+                "--s3-no-check-bucket",     // сервисному пользователю может быть не выдано право на бакет целиком
+                "--stats", "2s",
+                "--stats-one-line",
+                "--stats-log-level", "NOTICE",
+            };
+            args.AddRange(Rclone.SplitArgs(s.extraArgs));
+            return args;
+        }
+
+        /// <summary>Папка в бакете. Пустая, «/», с «..» — отказ: sync туда снёс бы чужие файлы.</summary>
+        internal static string ResolvePrefix(string template, string expanded)
+        {
+            var p = (expanded ?? "").Replace('\\', '/').Trim();
+            while (p.Contains("//")) p = p.Replace("//", "/");
+            p = p.Trim('/', ' ');
+            if (p.Length == 0)
+                throw new InvalidOperationException($"папка в бакете по шаблону «{template}» пустая — заливка в корень бакета запрещена.");
+            foreach (var segment in p.Split('/'))
+                if (segment == ".." || segment == ".")
+                    throw new InvalidOperationException($"папка в бакете «{p}» содержит «{segment}».");
+            return p;
+        }
+
+        private static IEnumerable<string> SplitMasks(string text)
+        {
+            if (string.IsNullOrEmpty(text)) yield break;
+            foreach (var raw in text.Split('\n', ';'))
+            {
+                var m = raw.Trim();
+                if (m.Length > 0) yield return m;
+            }
+        }
+
+        /// <summary>
+        /// Панель Selectel создаёт «папки» как нулевые объекты без завершающего слеша
+        /// («v0.1.4», «v0.1.4/Build»). Для rclone это файлы — sync падает с
+        /// «is a file not a directory». Снимаем строго по подписи: не папка, 0 байт,
+        /// mime «…directory», внутри своего префикса.
+        /// </summary>
+        private static void RemoveDirectoryMarkers(string rclone, Dictionary<string, string> env, string bucket, string prefix, BuildStepContext ctx)
+        {
+            var list = Rclone.Run(rclone, new List<string>
+            {
+                "lsjson", $":s3:{bucket}", "--recursive", "--s3-no-check-bucket",
+                // ведущий «/» якорит шаблон к корню бакета
+                "--include", $"/{prefix}", "--include", $"/{prefix}/**",
+            }, env, "S3: поиск маркеров папок", ctx, logOutput: false);
+
+            JArray items;
+            try { items = string.IsNullOrWhiteSpace(list) ? new JArray() : JArray.Parse(list); }
+            catch (Exception ex) { throw new InvalidOperationException("не разобрать вывод rclone lsjson: " + ex.Message); }
+
+            foreach (var t in items)
+            {
+                if (t["IsDir"]?.Value<bool>() == true) continue;
+                if (t["Size"]?.Value<long>() != 0) continue;
+                var mime = t["MimeType"]?.Value<string>();
+                if (string.IsNullOrEmpty(mime) || mime.IndexOf("directory", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var path = t["Path"]?.Value<string>();
+                if (string.IsNullOrEmpty(path)) continue;
+                if (path != prefix && !path.StartsWith(prefix + "/", StringComparison.Ordinal)) continue;
+
+                Rclone.Run(rclone, new List<string> { "deletefile", $":s3:{bucket}/{path}", "--s3-no-check-bucket" },
+                    env, "S3: снятие маркера папки", ctx, logOutput: false);
+                ctx.Log($"S3: снят маркер папки {path}");
+            }
+        }
+
+        // ============================================================ UI
+
+        protected override VisualElement BuildSettingsUI(Settings s, Action changed, AppKit kit)
+        {
+            var root = new VisualElement();
+            var credsPath = kit.Context.GetUserConfigPath(CredentialsFile);
+            var creds = S3Credentials.Load(credsPath);
+
+            // --- хранилище ---
+            root.Add(Section(kit, "Хранилище (общее, коммитится)"));
+            root.Add(Field(kit, "Endpoint", s.endpoint, v => { s.endpoint = v; changed(); }));
+            root.Add(Field(kit, "Регион", s.region, v => { s.region = v; changed(); }));
+            root.Add(Field(kit, "Бакет", s.bucket, v => { s.bucket = v; changed(); }));
+
+            // --- куда ---
+            var preview = kit.Faint("");
+            void UpdatePreview()
+            {
+                try
+                {
+                    var expanded = BuildTokens.Expand(s.prefixTemplate ?? "", PlayerSettings.productName, PlayerSettings.bundleVersion,
+                        "1a2b3c4", "<профиль>", EditorUserBuildSettings.activeBuildTarget.ToString(), DateTime.Now);
+                    preview.text = $"Будет: {Or(s.bucket, "<бакет>")}/{ResolvePrefix(s.prefixTemplate, expanded)}/  ·  {BuildTokens.Help}";
+                    preview.style.color = kit.Tok(NexusToken.TextFaint);
+                }
+                catch (Exception ex)
+                {
+                    preview.text = ex.Message;
+                    preview.style.color = kit.Tok(NexusToken.Error);
+                }
+            }
+            root.Add(Field(kit, "Папка в бакете", s.prefixTemplate, v => { s.prefixTemplate = v; changed(); UpdatePreview(); }));
+            UpdatePreview();
+            preview.style.marginLeft = 130f;
+            root.Add(preview);
+
+            // --- что ---
+            root.Add(Section(kit, "Что заливать"));
+            root.Add(kit.Check("Папку сборки", s.uploadFolder, v => { s.uploadFolder = v; changed(); }));
+            root.Add(kit.Check("Zip-архив (шаг Zip должен стоять раньше)", s.uploadZip, v => { s.uploadZip = v; changed(); }));
+            root.Add(kit.Labeled("Режим", kit.Dropdown(null,
+                new List<string> { "sync — точная копия (лишнее в папке бакета удаляется)", "copy — только добавить и перезаписать" },
+                s.mirror ? 0 : 1, i => { s.mirror = i == 0; changed(); }), 130f));
+            root.Add(new Label("Исключить из папки (маска на строку, * и ?):"));
+            var masks = kit.Context.Ui.Input(s.excludeMasks, v => { s.excludeMasks = v; changed(); });
+            masks.multiline = true;
+            masks.style.minHeight = 40;
+            root.Add(masks);
+
+            // --- ключи ---
+            root.Add(Section(kit, "Ключи доступа (личные — UserSettings, в git не попадают)"));
+            var keyStatus = kit.Faint("");
+            void UpdateKeys()
+            {
+                var k = S3Credentials.Resolve(S3Credentials.Load(credsPath), s);
+                keyStatus.text = k.Source == KeySource.None
+                    ? (s.skipWithoutKeys ? "Ключей нет — шаг будет пропущен." : "Ключей нет — шаг упадёт.")
+                    : "Ключи: " + k.Describe();
+                keyStatus.style.color = kit.Tok(k.Source == KeySource.None ? NexusToken.Warning : NexusToken.Ok);
+            }
+
+            root.Add(Field(kit, "Набор ключей", s.keySet, v => { s.keySet = v; changed(); UpdateKeys(); }));
+            var set = creds.Get(s.keySet);
+            root.Add(Field(kit, "Access Key", set?.accessKey ?? "", v =>
+            {
+                var c = S3Credentials.Load(credsPath);
+                c.GetOrCreate(s.keySet).accessKey = v.Trim();
+                c.Save(credsPath);
+                UpdateKeys();
+            }, password: true));
+            root.Add(Field(kit, "Secret Key", set?.secretKey ?? "", v =>
+            {
+                var c = S3Credentials.Load(credsPath);
+                c.GetOrCreate(s.keySet).secretKey = v.Trim();
+                c.Save(credsPath);
+                UpdateKeys();
+            }, password: true));
+            root.Add(Field(kit, "Или переменная Access", s.accessKeyEnv, v => { s.accessKeyEnv = v; changed(); UpdateKeys(); }));
+            root.Add(Field(kit, "Или переменная Secret", s.secretKeyEnv, v => { s.secretKeyEnv = v; changed(); UpdateKeys(); }));
+            root.Add(kit.Check("Нет ключей — пропустить шаг (иначе ошибка)", s.skipWithoutKeys,
+                v => { s.skipWithoutKeys = v; changed(); UpdateKeys(); }));
+            UpdateKeys();
+            keyStatus.style.marginLeft = 130f;
+            root.Add(keyStatus);
+
+            // --- rclone ---
+            root.Add(Section(kit, "rclone"));
+            root.Add(Field(kit, "Путь к rclone", creds.rclonePath, v =>
+            {
+                var c = S3Credentials.Load(credsPath);
+                c.rclonePath = v.Trim();
+                c.Save(credsPath);
+            }));
+            root.Add(Field(kit, "Доп. аргументы", s.extraArgs, v => { s.extraArgs = v; changed(); }));
+            root.Add(kit.Check("Снимать маркеры папок Selectel перед заливкой", s.removeDirectoryMarkers,
+                v => { s.removeDirectoryMarkers = v; changed(); }));
+            var personal = kit.Faint("Путь к rclone — личный (пусто — искать в PATH). Скачать: rclone.org/downloads.");
+            personal.style.marginLeft = 130f;
+            root.Add(personal);
+
+            var check = kit.Btn(NexusRole.Common, "Проверить подключение", () => TestConnection(kit, s, credsPath));
+            check.style.alignSelf = Align.FlexStart;
+            check.style.marginTop = 6f;
+            root.Add(check);
+            return root;
+        }
+
+        private static void TestConnection(AppKit kit, Settings s, string credsPath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(s.bucket)) throw new InvalidOperationException("не указан бакет.");
+                var creds = S3Credentials.Load(credsPath);
+                var keys = S3Credentials.Resolve(creds, s);
+                if (keys.Source == KeySource.None) throw new InvalidOperationException("нет ключей — впишите их выше или задайте переменные окружения.");
+
+                var rclone = Rclone.Executable(creds);
+                var version = Rclone.Run(rclone, new List<string> { "version" }, null, "rclone", null, logOutput: false);
+                var firstLine = (version ?? "").Split('\n')[0].Trim();
+
+                var bucket = s.bucket.Trim().Trim('/');
+                var list = Rclone.Run(rclone, new List<string> { "lsjson", $":s3:{bucket}", "--max-depth", "1", "--s3-no-check-bucket" },
+                    Rclone.Environment(s, keys), "Проверка подключения к S3", null, logOutput: false);
+                var count = string.IsNullOrWhiteSpace(list) ? 0 : JArray.Parse(list).Count;
+
+                kit.Context.SetStatus($"S3: подключение есть — бакет «{bucket}», в корне {count} объект(ов). Ключи: {keys.Describe()}. {firstLine}", StatusKind.Ok);
+            }
+            catch (OperationCanceledException)
+            {
+                kit.Context.SetStatus("S3: проверка отменена", StatusKind.Warning);
+            }
+            catch (Exception ex)
+            {
+                kit.Context.SetStatus("S3: подключения нет — " + ex.Message, StatusKind.Error);
+            }
+        }
+
+        private static Label Section(AppKit kit, string title)
+        {
+            var l = kit.Text(title, NexusToken.TextDim, 11);
+            l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            l.style.marginTop = 8f;
+            l.style.marginBottom = 2f;
+            return l;
+        }
+
+        private static VisualElement Field(AppKit kit, string label, string value, Action<string> onChanged, bool password = false)
+        {
+            var input = kit.Input(value ?? "", onChanged);
+            input.isDelayed = true;   // писать файл/конфиг по завершении ввода, а не на каждую букву
+            if (password) input.isPasswordField = true;
+            input.style.flexGrow = 1f;
+            return kit.Labeled(label, input, 130f);
+        }
+
+        private static string Or(string v, string fallback) => string.IsNullOrWhiteSpace(v) ? fallback : v.Trim();
+    }
+
+    // ================================================================ ключи
+
+    internal enum KeySource { None, Personal, Environment }
+
+    internal readonly struct S3Keys
+    {
+        public readonly KeySource Source;
+        public readonly string AccessKey;
+        public readonly string SecretKey;
+        public readonly string Detail;
+
+        public S3Keys(KeySource source, string access, string secret, string detail)
+        {
+            Source = source; AccessKey = access; SecretKey = secret; Detail = detail;
+        }
+
+        /// <summary>Откуда ключи — без самих ключей (для лога и статуса).</summary>
+        public string Describe() => Source == KeySource.Personal ? $"личные (набор «{Detail}»)"
+                                  : Source == KeySource.Environment ? $"переменные окружения ({Detail})"
+                                  : "нет";
+    }
+
+    /// <summary>Личный файл UserSettings/…/app/s3-credentials.json: наборы ключей и путь к rclone.</summary>
+    [Serializable]
+    internal sealed class S3Credentials
+    {
+        public string rclonePath = "";
+        public List<S3KeySet> sets = new List<S3KeySet>();
+
+        public static S3Credentials Load(string path) => JsonStore.Load<S3Credentials>(path);
+
+        public void Save(string path) => JsonStore.Save(path, this);
+
+        public S3KeySet Get(string name)
+        {
+            name = Norm(name);
+            foreach (var s in sets)
+                if (s != null && Norm(s.name) == name) return s;
+            return null;
+        }
+
+        public S3KeySet GetOrCreate(string name)
+        {
+            var s = Get(name);
+            if (s != null) return s;
+            s = new S3KeySet { name = Norm(name) };
+            sets.Add(s);
+            return s;
+        }
+
+        /// <summary>Сначала личный набор, затем переменные окружения.</summary>
+        public static S3Keys Resolve(S3Credentials creds, S3UploadStep.Settings s)
+        {
+            var set = creds?.Get(s.keySet);
+            if (set != null && !string.IsNullOrEmpty(set.accessKey) && !string.IsNullOrEmpty(set.secretKey))
+                return new S3Keys(KeySource.Personal, set.accessKey, set.secretKey, Norm(s.keySet));
+
+            var access = string.IsNullOrWhiteSpace(s.accessKeyEnv) ? null : System.Environment.GetEnvironmentVariable(s.accessKeyEnv.Trim());
+            var secret = string.IsNullOrWhiteSpace(s.secretKeyEnv) ? null : System.Environment.GetEnvironmentVariable(s.secretKeyEnv.Trim());
+            if (!string.IsNullOrEmpty(access) && !string.IsNullOrEmpty(secret))
+                return new S3Keys(KeySource.Environment, access, secret, $"{s.accessKeyEnv} / {s.secretKeyEnv}");
+
+            return new S3Keys(KeySource.None, null, null, null);
+        }
+
+        private static string Norm(string name) => string.IsNullOrWhiteSpace(name) ? "default" : name.Trim();
+    }
+
+    [Serializable]
+    internal sealed class S3KeySet
+    {
+        public string name = "default";
+        public string accessKey = "";
+        public string secretKey = "";
+    }
+
+    // ================================================================ rclone
+
+    internal static class Rclone
+    {
+        public static string Executable(S3Credentials creds)
+        {
+            var path = creds?.rclonePath?.Trim().Trim('"');
+            if (string.IsNullOrEmpty(path)) return "rclone";
+            if (Directory.Exists(path)) path = Path.Combine(path, Application.platform == RuntimePlatform.WindowsEditor ? "rclone.exe" : "rclone");
+            return path;
+        }
+
+        /// <summary>Конфиг rclone целиком через окружение: ~/.rclone.conf не нужен, секрет не в argv.</summary>
+        public static Dictionary<string, string> Environment(S3UploadStep.Settings s, S3Keys keys)
+        {
+            var env = new Dictionary<string, string>
+            {
+                ["RCLONE_S3_PROVIDER"]          = string.IsNullOrWhiteSpace(s.provider) ? "Other" : s.provider.Trim(),
+                ["RCLONE_S3_ACCESS_KEY_ID"]     = keys.AccessKey,
+                ["RCLONE_S3_SECRET_ACCESS_KEY"] = keys.SecretKey,
+                ["RCLONE_S3_ENDPOINT"]          = (s.endpoint ?? "").Trim(),
+            };
+            if (!string.IsNullOrWhiteSpace(s.region)) env["RCLONE_S3_REGION"] = s.region.Trim();
+            return env;
+        }
+
+        /// <summary>
+        /// Запуск с прогресс-баром (последняя строка вывода rclone) и отменой. Ненулевой код
+        /// возврата и отмена — исключение. Возвращает stdout.
+        /// </summary>
+        public static string Run(string exe, List<string> args, Dictionary<string, string> env, string title,
+                                 BuildStepContext ctx, bool logOutput = true)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = JoinArgs(args),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+            };
+            if (env != null)
+                foreach (var pair in env) psi.EnvironmentVariables[pair.Key] = pair.Value ?? "";
+
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+            var last = "запуск rclone…";
+            var started = DateTime.UtcNow;
+
+            try
+            {
+                using (var p = new Process { StartInfo = psi })
+                {
+                    p.OutputDataReceived += (_, e) => { if (e.Data != null) lock (stdout) stdout.AppendLine(e.Data); };
+                    p.ErrorDataReceived += (_, e) =>
+                    {
+                        if (string.IsNullOrEmpty(e.Data)) return;
+                        lock (stderr) { stderr.AppendLine(e.Data); last = e.Data.Trim(); }
+                    };
+
+                    try
+                    {
+                        p.Start();
+                    }
+                    catch (Win32Exception)
+                    {
+                        throw new FileNotFoundException($"rclone не найден ({exe}). Установите его (rclone.org/downloads) и добавьте в PATH " +
+                                                        "или укажите путь в настройках шага «Заливка в S3».");
+                    }
+                    p.BeginOutputReadLine();
+                    p.BeginErrorReadLine();
+
+                    while (!p.WaitForExit(200))
+                    {
+                        string line;
+                        lock (stderr) line = last;
+                        var elapsed = (DateTime.UtcNow - started).TotalSeconds;
+                        // точного прогресса rclone не даёт — полоса медленно ползёт к концу
+                        var progress = (float)(1.0 - 1.0 / (1.0 + elapsed / 30.0));
+                        if (EditorUtility.DisplayCancelableProgressBar(title, $"{elapsed:0} с · {line}", progress))
+                        {
+                            try { p.Kill(); } catch { /* уже завершился */ }
+                            throw new OperationCanceledException("заливка отменена пользователем");
+                        }
+                    }
+                    p.WaitForExit();   // дочитать асинхронный вывод
+
+                    string err;
+                    lock (stderr) err = WithoutNoise(stderr.ToString());
+                    if (logOutput && ctx != null && err.Length > 0)
+                        foreach (var l in err.Split('\n')) ctx.Log("rclone: " + l.Trim());
+
+                    if (p.ExitCode != 0)
+                        throw new InvalidOperationException($"rclone {args[0]} завершился с кодом {p.ExitCode}:\n{(err.Length > 0 ? err : stdout.ToString().Trim())}");
+                }
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+
+            lock (stdout) return stdout.ToString();
+        }
+
+        // rclone без конфиг-файла каждый раз пишет «Config file … not found - using defaults» — это норма
+        private static string WithoutNoise(string text)
+        {
+            var sb = new StringBuilder();
+            foreach (var raw in text.Split('\n'))
+            {
+                var line = raw.TrimEnd('\r');
+                if (line.Trim().Length == 0) continue;
+                if (line.Contains("Config file") && line.Contains("not found")) continue;
+                sb.AppendLine(line);
+            }
+            return sb.ToString().Trim();
+        }
+
+        /// <summary>Разбор «доп. аргументов»: пробелы — разделители, кавычки группируют.</summary>
+        public static List<string> SplitArgs(string text)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrWhiteSpace(text)) return list;
+            var sb = new StringBuilder();
+            var quoted = false;
+            foreach (var c in text)
+            {
+                if (c == '"') { quoted = !quoted; continue; }
+                if (char.IsWhiteSpace(c) && !quoted)
+                {
+                    if (sb.Length > 0) { list.Add(sb.ToString()); sb.Clear(); }
+                    continue;
+                }
+                sb.Append(c);
+            }
+            if (sb.Length > 0) list.Add(sb.ToString());
+            return list;
+        }
+
+        /// <summary>Склейка аргументов по правилам Windows (CommandLineToArgvW): кавычки и обратные слеши перед ними.</summary>
+        private static string JoinArgs(List<string> args)
+        {
+            var sb = new StringBuilder();
+            foreach (var a in args)
+            {
+                if (sb.Length > 0) sb.Append(' ');
+                if (a.Length > 0 && a.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) { sb.Append(a); continue; }
+
+                sb.Append('"');
+                var slashes = 0;
+                foreach (var c in a)
+                {
+                    if (c == '\\') { slashes++; continue; }
+                    if (c == '"') { sb.Append('\\', slashes * 2 + 1); sb.Append('"'); slashes = 0; continue; }
+                    sb.Append('\\', slashes);
+                    slashes = 0;
+                    sb.Append(c);
+                }
+                sb.Append('\\', slashes * 2);
+                sb.Append('"');
+            }
+            return sb.ToString();
+        }
+    }
+}

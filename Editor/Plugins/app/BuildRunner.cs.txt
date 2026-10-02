@@ -108,6 +108,7 @@ namespace Exerussus.Nexus.Pages.App
         public string profilePath = "";   // пусто — «текущее»: активный профиль или платформа без профиля
         public string configPath  = "";
         public string historyPath = "";
+        public string userConfigDir = "";   // личные настройки страницы (ключи шагов и т.п.)
         public bool   development;
         public bool   cleanBuild;
 
@@ -308,6 +309,7 @@ namespace Exerussus.Nexus.Pages.App
                     CommitHash  = git.Hash,
                     IsDirty     = git.IsDirty,
                     Development = req.development,
+                    UserConfigDir = req.userConfigDir ?? "",
                 };
                 ctx.OutputDirectory = ResolveOutputDir(config.outputTemplate, ctx);
                 ctx.OutputPath      = LocationFor(target, ctx.OutputDirectory, ctx.ProductName);
@@ -378,8 +380,9 @@ namespace Exerussus.Nexus.Pages.App
                 ctx.Stage = BuildStage.Post;
                 err = RunSteps(pipeline, steps, BuildStage.Post, ctx);
                 entry.artifacts.AddRange(ctx.Artifacts);
-                if (ctx.Artifacts.Count > 0 && File.Exists(ctx.Artifacts[0]))
-                    entry.zipBytes = new FileInfo(ctx.Artifacts[0]).Length;
+                // размер архива — именно .zip (первым артефактом может быть, например, version.json)
+                var zip = ctx.Artifacts.FindLast(a => a.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+                if (zip != null && File.Exists(zip)) entry.zipBytes = new FileInfo(zip).Length;
                 if (err != null) { Fill(entry, false, "Билд собран, но " + err); return; }
 
                 Fill(entry, true, ctx.Artifacts.Count > 0

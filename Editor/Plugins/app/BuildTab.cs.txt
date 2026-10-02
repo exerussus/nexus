@@ -508,6 +508,7 @@ namespace Exerussus.Nexus.Pages.App
                 profilePath = selected.Path ?? "",
                 configPath = AppCorePaths.BuildConfigPath,
                 historyPath = Context.GetUserConfigPath(HistoryFile),
+                userConfigDir = System.IO.Path.GetDirectoryName(Context.GetUserConfigPath(HistoryFile)) ?? "",
                 development = _prefs.development,
                 cleanBuild = _prefs.cleanBuild,
                 restoreProfile = _config.restoreProfileAfterBuild,

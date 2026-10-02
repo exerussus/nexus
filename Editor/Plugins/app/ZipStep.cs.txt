@@ -1,7 +1,8 @@
 // ============================================================
 //  ZipStep.cs — пост-процесс: zip собранного билда.
 //
-//  Имя: <productName>_<version>_<hash>.zip (без git — <productName>_<version>.zip).
+//  Имя — шаблон с токенами (по умолчанию {product}_{version}_{hash}; без git хэш
+//  выпадает вместе с разделителем). Например «media-poker_v{version}» → media-poker_v0.3.0.zip.
 //  По умолчанию исключает служебные папки Unity, которые нельзя поставлять:
 //    *_BurstDebugInformation_DoNotShip, *_BackUpThisFolder_ButDontShipItWithYourGame.
 //  Маски сравниваются с КАЖДЫМ сегментом относительного пути (папки и файлы),
@@ -28,15 +29,17 @@ using UnityEngine.UIElements;
 namespace Exerussus.Nexus.Pages.App
 {
     [BuildStep("zip", "Zip-архив сборки", BuildStage.Post,
-        Description = "Упаковывает билд в <product>_<version>_<hash>.zip, исключая служебные папки.")]
+        Description = "Упаковывает билд в zip (имя — по шаблону), исключая служебные папки.")]
     internal sealed class ZipStep : BuildStep<ZipStep.Settings>
     {
         /// <summary>Служебные папки Unity, которые не поставляются (Burst-символы, бэкап IL2CPP).</summary>
         internal const string DefaultExcludeMasks = "*_BurstDebugInformation_DoNotShip\n*_BackUpThisFolder_ButDontShipItWithYourGame";
+        internal const string DefaultNameTemplate = "{product}_{version}_{hash}";
 
         [Serializable]
         internal sealed class Settings
         {
+            public string nameTemplate  = DefaultNameTemplate;   // без .zip
             public string excludeMasks  = DefaultExcludeMasks;
             public bool   overwrite     = true;
             public bool   wrapInFolder  = false;   // корневая папка внутри архива
@@ -52,7 +55,7 @@ namespace Exerussus.Nexus.Pages.App
             if (string.IsNullOrEmpty(sourceDir) || !Directory.Exists(sourceDir))
                 throw new DirectoryNotFoundException($"Папка сборки не найдена: {sourceDir}");
 
-            var baseName = MakeBaseName(ctx);
+            var baseName = MakeBaseName(ctx, s.nameTemplate);
             var targetDir = string.IsNullOrWhiteSpace(s.outputDir)
                 ? Path.GetDirectoryName(Path.GetFullPath(sourceDir))
                 : Path.GetFullPath(Path.Combine(GitInfo.ProjectRoot, s.outputDir.Trim()));
@@ -124,9 +127,17 @@ namespace Exerussus.Nexus.Pages.App
             ctx.Log($"Zip: {files.Count} файл(ов), {FormatSize(total)} → {FormatSize(zipSize)}: {zipPath}");
         }
 
-        protected override VisualElement BuildSettingsUI(Settings s, Action changed, IPageUi ui)
+        protected override VisualElement BuildSettingsUI(Settings s, Action changed, AppKit kit)
         {
+            var ui = kit.Context.Ui;
             var root = new VisualElement();
+
+            root.Add(new Label("Имя архива (без .zip):"));
+            var preview = kit.Faint("");
+            void UpdatePreview() => preview.text = "Будет: " + PreviewName(s.nameTemplate) + ".zip  ·  " + BuildTokens.Help;
+            root.Add(ui.Input(s.nameTemplate, v => { s.nameTemplate = v; changed(); UpdatePreview(); }));
+            UpdatePreview();
+            root.Add(preview);
 
             root.Add(new Label("Исключить (маска на строку, * и ?):"));
             var masks = ui.Input(s.excludeMasks, v => { s.excludeMasks = v; changed(); });
@@ -149,10 +160,22 @@ namespace Exerussus.Nexus.Pages.App
 
         // ------------------------------------------------------------ helpers
 
-        internal static string MakeBaseName(BuildStepContext ctx)
+        internal static string MakeBaseName(BuildStepContext ctx, string template)
         {
-            var name = $"{ctx.ProductName}_{ctx.Version}";
-            if (!string.IsNullOrEmpty(ctx.CommitHash)) name += "_" + ctx.CommitHash;
+            var name = BuildTokens.Expand(string.IsNullOrWhiteSpace(template) ? DefaultNameTemplate : template.Trim(), ctx, DateTime.Now);
+            if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4);
+            name = SanitizeFileName(name);
+            if (string.IsNullOrEmpty(name)) throw new IOException($"Имя архива по шаблону «{template}» получилось пустым.");
+            return name;
+        }
+
+        /// <summary>Предпросмотр имени в UI: текущие продукт и версия, хэш — для примера.</summary>
+        internal static string PreviewName(string template)
+        {
+            var name = BuildTokens.Expand(string.IsNullOrWhiteSpace(template) ? DefaultNameTemplate : template.Trim(),
+                PlayerSettings.productName, PlayerSettings.bundleVersion, "1a2b3c4", "<профиль>",
+                EditorUserBuildSettings.activeBuildTarget.ToString(), DateTime.Now);
+            if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4);
             return SanitizeFileName(name);
         }
 

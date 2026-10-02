@@ -19,7 +19,7 @@ part of AppCore (no separate deployment).
 - **Text** — character sets, source scanning, font chain, bake + coverage report (logic in AppCore).
 - **Сборка** — sub-tabs:
   - **Билд** — profile, version bump, output folder, run, history;
-  - **Пайплайн** — per-profile pre/post steps (`BuildStep<T>` + `[BuildStep]`), incl. Zip and version.json;
+  - **Пайплайн** — per-profile pre/post steps (`BuildStep<T>` + `[BuildStep]`), incl. Zip (name template), version.json and S3 upload via rclone (personal keys in UserSettings);
   - **BuildInfo** — current values, stamp settings, version overlay, migration of the old deployment.
 
 ## Visual language

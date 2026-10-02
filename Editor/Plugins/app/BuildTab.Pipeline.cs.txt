@@ -95,7 +95,7 @@ namespace Exerussus.Nexus.Pages.App
                 {
                     entry.settingsJson = d.Step.SaveSettings(settings);
                     RequestConfigSave();
-                }, Context.Ui);
+                }, _kit);
             }
             catch (System.Exception ex)
             {

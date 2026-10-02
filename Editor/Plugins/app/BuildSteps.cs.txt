@@ -11,7 +11,10 @@
 //    в историю пишется, какой шаг упал.
 //  • Pre-шаги выполняются после активации профиля, до BuildPlayer.
 //    Post-шаги — только после УСПЕШНОГО билда.
-//  • Настройки — [Serializable]-класс с публичными полями (JsonUtility).
+//  • Настройки — [Serializable]-класс с публичными полями (JsonUtility). Они ОБЩИЕ
+//    (build-config.json, коммитится) — секретов там быть не должно.
+//  • Личное (ключи, пути на машине) — в UserSettings: в UI через kit.Context.GetUserConfigPath,
+//    при выполнении через context.UserConfigPath.
 //  • Состояние между вызовами не хранить: экземпляр создаётся заново.
 // ============================================================
 
@@ -51,7 +54,7 @@ namespace Exerussus.Nexus.Pages.App
     {
         object        LoadSettings(string json);
         string        SaveSettings(object settings);
-        VisualElement BuildSettingsUI(object settings, Action changed, IPageUi ui);
+        VisualElement BuildSettingsUI(object settings, Action changed, AppKit kit);
         void          Execute(BuildStepContext context, object settings);
     }
 
@@ -71,14 +74,15 @@ namespace Exerussus.Nexus.Pages.App
 
         public string SaveSettings(object settings) => JsonUtility.ToJson(settings);
 
-        public VisualElement BuildSettingsUI(object settings, Action changed, IPageUi ui)
-            => BuildSettingsUI((TSettings)settings, changed, ui);
+        public VisualElement BuildSettingsUI(object settings, Action changed, AppKit kit)
+            => BuildSettingsUI((TSettings)settings, changed, kit);
 
         public void Execute(BuildStepContext context, object settings)
             => Execute(context, (TSettings)settings);
 
-        /// <summary>UI настроек (null — настроек нет). После правки вызвать changed().</summary>
-        protected virtual VisualElement BuildSettingsUI(TSettings settings, Action changed, IPageUi ui) => null;
+        /// <summary>UI настроек (null — настроек нет). После правки вызвать changed().
+        /// kit.Context — контекст страницы (статус, личные файлы, тема).</summary>
+        protected virtual VisualElement BuildSettingsUI(TSettings settings, Action changed, AppKit kit) => null;
 
         protected abstract void Execute(BuildStepContext context, TSettings settings);
     }
@@ -105,6 +109,11 @@ namespace Exerussus.Nexus.Pages.App
         /// рядом лежат _Data, UnityPlayer.dll и пр., поставляется вся папка.</summary>
         public bool OutputIsSingleFile;
 
+        /// <summary>Папка личных настроек страницы (UserSettings) — для ключей и путей машины.</summary>
+        public string UserConfigDir = "";
+
+        public string UserConfigPath(string file) => System.IO.Path.Combine(UserConfigDir ?? "", file);
+
         /// <summary>Отчёт Unity; есть только у Post-шагов.</summary>
         public BuildReport Report;
 
@@ -118,6 +127,48 @@ namespace Exerussus.Nexus.Pages.App
             LogLines.Add(message);
             Debug.Log($"[Build] {message}");
         }
+    }
+
+    /// <summary>
+    /// Токены в шаблонах имён шагов: {product} {version} {hash} {profile} {platform} {date}.
+    /// Пустое значение (нет git → пустой {hash}) не оставляет висящих разделителей:
+    /// «{product}_{version}_{hash}» без git даёт «Game_1.0», а не «Game_1.0_».
+    /// </summary>
+    internal static class BuildTokens
+    {
+        public const string Help = "Токены: {product} {version} {hash} {profile} {platform} {date}";
+
+        public static string Expand(string template, string product, string version, string hash,
+                                    string profile, string platform, DateTime now)
+        {
+            const string Empty = "\u0000";   // метка пустого токена — вычищается вместе с разделителем
+            var s = (template ?? "")
+                .Replace("{product}",  Or(product))
+                .Replace("{version}",  Or(version))
+                .Replace("{hash}",     Or(hash))
+                .Replace("{profile}",  Or(profile))
+                .Replace("{platform}", Or(platform))
+                .Replace("{date}",     now.ToString("yyyyMMdd-HHmm"));
+
+            // пустой токен: «a_<пусто>_b» → «a_b», «a_<пусто>» → «a», «<пусто>_b» → «b»
+            for (var i = s.IndexOf(Empty, StringComparison.Ordinal); i >= 0; i = s.IndexOf(Empty, StringComparison.Ordinal))
+            {
+                var left  = i > 0 && IsSeparator(s[i - 1]);
+                var right = i + 1 < s.Length && IsSeparator(s[i + 1]);
+                if (left && right)                 s = s.Remove(i, 2);
+                else if (left && i + 1 == s.Length) s = s.Remove(i - 1, 2);
+                else if (right && i == 0)          s = s.Remove(i, 2);
+                else                               s = s.Remove(i, 1);
+            }
+            return s;
+
+            string Or(string v) => string.IsNullOrEmpty(v) ? Empty : v;
+        }
+
+        private static bool IsSeparator(char c) => c == '_' || c == '-' || c == '.' || c == '/' || c == ' ';
+
+        public static string Expand(string template, BuildStepContext ctx, DateTime now)
+            => Expand(template, ctx.ProductName, ctx.Version, ctx.CommitHash, ctx.ProfileName, ctx.Target.ToString(), now);
     }
 
     /// <summary>Найденный шаг: метаданные + экземпляр.</summary>

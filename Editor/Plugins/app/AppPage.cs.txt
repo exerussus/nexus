@@ -10,6 +10,7 @@
 //    Nav classes — стандартные навигационные классы;
 //    External    — внешний след страницы с путями и очисткой сгенерированного;
 //    Text        — наборы символов, цепочка шрифтов, запекание;
+//    Консоль     — настройки AppDeck (консоль, быстрые действия, метрики; app-core 4.1+);
 //    Сборка      — билд, пайплайн, BuildInfo и строка версии (бывшая страница Build).
 // ============================================================
 
@@ -68,6 +69,7 @@ namespace Exerussus.Nexus.Pages.App
             _tabs.Add(new NavClassesTab(_kit));
             _tabs.Add(new ExternalTab(_kit));
             _tabs.Add(new TextTab(_kit));
+            _tabs.Add(new DeckTab(_kit));
             _tabs.Add(new BuildTab(_kit));
         }
 
@@ -88,7 +90,7 @@ namespace Exerussus.Nexus.Pages.App
             title.style.unityFontStyleAndWeight = FontStyle.Bold;
             title.style.marginRight = 12f;
             header.Add(title);
-            header.Add(_kit.Mono("com.exerussus.app-core 4.0", NexusToken.TextFaint));
+            header.Add(_kit.Mono("com.exerussus.app-core 4.x", NexusToken.TextFaint));
             header.Add(_kit.Spacer());
 
             _headerStatus = new VisualElement();

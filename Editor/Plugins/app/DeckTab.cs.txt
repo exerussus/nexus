@@ -1,0 +1,439 @@
+// ============================================================
+//  DeckTab.cs — вкладка «Консоль»: настройки AppDeck (консоль, быстрые действия, метрики).
+//
+//  Настройки — ассет AppCore Assets/App/Settings/AppDeckSettings.asset (тип DeckSettings из сборки
+//  Exerussus.AppCore.Deck, app-core 4.1+). Страница на эту сборку НЕ ссылается: поля читаются и пишутся
+//  через SerializedObject по именам, тип ищется по имени. Поэтому плагин собирается и с app-core 4.0 —
+//  вкладка просто скажет, что AppDeck в проекте нет.
+//
+//  Создание ассета и Preloaded Assets — делом самого AppCore (пункт меню Exerussus/App/AppDeck Settings):
+//  один источник правды, вкладка лишь зовёт его и показывает итог.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using Exerussus.AppCore;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.UIElements;
+using Object = UnityEngine.Object;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class DeckTab : IAppTab
+    {
+        private const string SettingsTypeName = "Exerussus.AppCore.Deck.DeckSettings";
+        private const string DeckTypeName = "Exerussus.AppCore.Deck.AppDeck, Exerussus.AppCore.Deck";
+        private const string SettingsMenu = "Exerussus/App/AppDeck Settings";
+        private const string AssetPath = AppCorePaths.SettingsDir + "/AppDeckSettings.asset";
+
+        /// <summary>Ключи PlayerPrefs, в которых AppDeck помнит окно, историю и закрепления.</summary>
+        private static readonly string[] PrefsKeys =
+        {
+            "appdeck.layout", "appdeck.height", "appdeck.tab", "appdeck.pick", "appdeck.history",
+            "appdeck.console.mask", "appdeck.actions.pins", "appdeck.metrics.pins",
+        };
+
+        private readonly AppKit _kit;
+        private VisualElement _root;
+        private ScriptableObject _asset;
+        private SerializedObject _so;
+        private IVisualElementScheduledItem _save;
+
+        public string Title => "Консоль";
+
+        public DeckTab(AppKit kit) => _kit = kit;
+
+        private IPageContext Context => _kit.Context;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            return _root;
+        }
+
+        public void Show()
+        {
+            _asset = AssetDatabase.LoadAssetAtPath<ScriptableObject>(AssetPath);
+            _so = _asset != null ? new SerializedObject(_asset) : null;
+            Render();
+        }
+
+        public void Hide() => Flush();
+        public void Refresh() => Show();
+        public bool CanClose() => true;
+
+        public void Dispose()
+        {
+            Flush();
+            _so?.Dispose();
+            _so = null;
+        }
+
+        // ============================================================ сохранение
+
+        private void Changed()
+        {
+            if (_so == null) return;
+
+            _so.ApplyModifiedProperties();
+
+            // ввод текста не пишет ассет на каждый символ
+            _save ??= _root.schedule.Execute(Flush);
+            _save.ExecuteLater(500);
+        }
+
+        private void Flush()
+        {
+            if (_asset != null) AssetDatabase.SaveAssetIfDirty(_asset);
+        }
+
+        // ============================================================ рендер
+
+        private void Render()
+        {
+            _root.Clear();
+
+            if (!DeckAvailable())
+            {
+                var card = _kit.Card("AppDeck", "Консоль, быстрые действия и метрики поверх приложения.");
+                card.Add(_kit.Status(StatusKind.Warning, "В проекте нет сборки Exerussus.AppCore.Deck.",
+                                     "Нужен com.exerussus.app-core 4.1 или новее."));
+                _root.Add(card);
+                return;
+            }
+
+            if (_so == null)
+            {
+                var card = _kit.Card("AppDeck", "Консоль, быстрые действия и метрики поверх приложения.");
+                card.Add(_kit.Status(StatusKind.Warning, $"Нет ассета настроек: {AssetPath}"));
+                var create = _kit.Btn(NexusRole.Primary, "Создать", CreateAsset);
+                create.style.alignSelf = Align.FlexStart;
+                create.style.marginTop = 8f;
+                card.Add(create);
+                _root.Add(card);
+                return;
+            }
+
+            _so.Update();
+
+            var columns = _kit.Columns(out var left, out var right, 392f);
+            _root.Add(columns);
+
+            left.Add(LaunchCard());
+            left.Add(WindowCard());
+            left.Add(ConsoleCard());
+            right.Add(StateCard());
+            right.Add(PickCard());
+            right.Add(MetricsCard());
+            right.Add(RuntimeCard());
+        }
+
+        // ============================================================ карточки
+
+        private VisualElement StateCard()
+        {
+            var card = _kit.Card("Состояние", "Где AppDeck поднимется и увидит ли сборка настройки до первой сцены.");
+
+            var activation = Prop("activation");
+            int mode = activation != null ? activation.enumValueIndex : 1;
+
+            card.Add(Where("Редактор", mode >= 1));
+            card.Add(Where("Development-сборка", mode >= 1));
+            card.Add(Where("Релизная сборка", mode >= 2));
+
+            card.Add(_kit.Divider(8f));
+
+            bool preloaded = IsPreloaded();
+            card.Add(preloaded
+                ? _kit.Status(StatusKind.Ok, "Ассет в Preloaded Assets — сборка прочитает его без сцены.")
+                : _kit.Status(StatusKind.Warning, "Ассета нет в Preloaded Assets — в сборке AppDeck возьмёт умолчания."));
+
+            var buttons = _kit.Row();
+            buttons.style.marginTop = 8f;
+            if (!preloaded) buttons.Add(_kit.Btn(NexusRole.Primary, "Добавить", AddToPreloaded, small: true));
+            buttons.Add(_kit.Btn(NexusRole.Ghost, "Выделить ассет", () =>
+            {
+                Selection.activeObject = _asset;
+                EditorGUIUtility.PingObject(_asset);
+            }, small: true));
+            card.Add(buttons);
+
+            card.Add(_kit.Faint(AssetPath));
+            return card;
+        }
+
+        private VisualElement Where(string target, bool on) =>
+            _kit.Status(on ? StatusKind.Ok : StatusKind.Info, on ? $"{target}: включено" : $"{target}: выключено");
+
+        private VisualElement LaunchCard()
+        {
+            var card = _kit.Card("Запуск", "Когда поднимать AppDeck и чем открывать. Регистрация команд работает всегда — это данные.");
+
+            card.Add(EnumField("activation", "Режим"));
+            card.Add(EnumField("toggleKey", "Клавиша"));
+            card.Add(_kit.Faint("Shift + клавиша — шторка / весь экран. Esc — подсказки, затем окно."));
+            card.Add(BoolField("startOpen", "Открыть на старте"));
+            return card;
+        }
+
+        private VisualElement WindowCard()
+        {
+            var card = _kit.Card("Окно", "Своя панель поверх всех окон и экранов загрузки — копия настроек панели приложения.");
+
+            card.Add(EnumField("defaultLayout", "Размер"));
+            card.Add(FloatField("partialHeight", "Высота шторки", 0.15f, 0.95f, "доля экрана; дальше тянется мышью"));
+            card.Add(FloatField("sortingOrder", "Порядок отрисовки", -32000f, 32000f, "больше любой другой панели"));
+            card.Add(BoolField("unlockCursor", "Освобождать курсор"));
+            card.Add(ObjectField("panelSettings", "Настройки панели", typeof(PanelSettings)));
+            card.Add(ObjectField("styleSheet", "Стили", typeof(StyleSheet)));
+            return card;
+        }
+
+        private VisualElement ConsoleCard()
+        {
+            var card = _kit.Card("Консоль", "Логи — кольцо фиксированной ёмкости; старые вытесняются, память не растёт.");
+
+            card.Add(IntField("logCapacity", "Ёмкость", 64, 1 << 20, "записей, округляется до степени двойки"));
+            card.Add(BoolField("collapseDuplicates", "Сворачивать повторы"));
+            card.Add(IntField("historySize", "История команд", 8, 512, "строк (↑/↓)"));
+            return card;
+        }
+
+        private VisualElement PickCard()
+        {
+            var card = _kit.Card("Выбор цели", "В шторке клик по миру выбирает цель для команд (аргумент target).");
+
+            card.Add(BoolField("picking", "Выбор кликом"));
+            card.Add(BoolField("physicsPicker", "Встроенный физический пикер"));
+            card.Add(FloatField("pickDistance", "Дальность", 1f, 100000f, "м"));
+            card.Add(LayerField("pickLayers", "Слои"));
+            card.Add(_kit.Faint("Игра добавляет свои пикеры (AppDeck.RegisterPicker) — они главнее встроенного."));
+            return card;
+        }
+
+        private VisualElement MetricsCard()
+        {
+            var card = _kit.Card("Метрики и мини-HUD", "Метрика опрашивается, только когда её показывают.");
+
+            card.Add(IntField("metricsRate", "Опрос вкладки", 1, 60, "раз в секунду"));
+            card.Add(IntField("trackLength", "Длина истории", 16, 1024, "точек спарклайна"));
+            card.Add(_kit.Divider(6f));
+            card.Add(BoolField("hud", "Мини-HUD"));
+            card.Add(EnumField("hudCorner", "Угол"));
+            card.Add(IntField("hudRate", "Обновление HUD", 1, 30, "раз в секунду"));
+            return card;
+        }
+
+        private VisualElement RuntimeCard()
+        {
+            var card = _kit.Card("Сохранённое у игрока", "Окно (размер, высота, вкладка), история, фильтры и закрепления — в PlayerPrefs.");
+
+            var buttons = _kit.Row();
+            if (EditorApplication.isPlaying)
+                buttons.Add(_kit.Btn(NexusRole.Common, "Открыть / закрыть", ToggleDeck, small: true));
+
+            buttons.Add(_kit.Btn(NexusRole.Alarm, "Сбросить", ResetPrefs, small: true));
+            card.Add(buttons);
+            return card;
+        }
+
+        // ============================================================ поля по SerializedProperty
+
+        private SerializedProperty Prop(string name) => _so?.FindProperty(name);
+
+        private VisualElement Missing(string label, string name) =>
+            _kit.Labeled(label, _kit.Faint($"нет поля {name} — версия AppDeck другая"));
+
+        private VisualElement BoolField(string name, string label)
+        {
+            var p = Prop(name);
+            if (p == null) return Missing(label, name);
+
+            var toggle = _kit.Check(label, p.boolValue, v =>
+            {
+                p.boolValue = v;
+                Changed();
+            });
+            return toggle;
+        }
+
+        private VisualElement EnumField(string name, string label)
+        {
+            var p = Prop(name);
+            if (p == null) return Missing(label, name);
+
+            var choices = new List<string>(p.enumDisplayNames);
+            var dd = _kit.Dropdown(null, choices, p.enumValueIndex, i =>
+            {
+                p.enumValueIndex = i;
+                Changed();
+
+                // режим и прочее показываются в «Состоянии» — перерисовать
+                Render();
+            });
+            return _kit.Labeled(label, dd);
+        }
+
+        private VisualElement IntField(string name, string label, int min, int max, string unit)
+        {
+            var p = Prop(name);
+            if (p == null) return Missing(label, name);
+
+            var input = _kit.Input(p.intValue.ToString(CultureInfo.InvariantCulture), v =>
+            {
+                if (!int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)) return;
+                p.intValue = Mathf.Clamp(parsed, min, max);
+                Changed();
+            });
+            return WithUnit(label, input, unit);
+        }
+
+        private VisualElement FloatField(string name, string label, float min, float max, string unit)
+        {
+            var p = Prop(name);
+            if (p == null) return Missing(label, name);
+
+            var input = _kit.Input(p.floatValue.ToString("0.###", CultureInfo.InvariantCulture), v =>
+            {
+                string text = (v ?? string.Empty).Replace(',', '.');
+                if (!float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed)) return;
+                p.floatValue = Mathf.Clamp(parsed, min, max);
+                Changed();
+            });
+            return WithUnit(label, input, unit);
+        }
+
+        private VisualElement WithUnit(string label, VisualElement input, string unit)
+        {
+            input.style.width = 110f;
+            input.style.flexGrow = 0;
+
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            row.Add(input);
+            if (!string.IsNullOrEmpty(unit))
+            {
+                var u = _kit.Faint(unit);
+                u.style.marginLeft = 8f;
+                u.style.flexShrink = 1;
+                row.Add(u);
+            }
+
+            var line = _kit.Labeled(label, row);
+            return line;
+        }
+
+        private VisualElement ObjectField(string name, string label, Type type)
+        {
+            var p = Prop(name);
+            if (p == null) return Missing(label, name);
+
+            var field = new ObjectField { objectType = type, value = p.objectReferenceValue, allowSceneObjects = false };
+            field.RegisterValueChangedCallback(e =>
+            {
+                p.objectReferenceValue = e.newValue;
+                Changed();
+            });
+            _kit.PaintLabels(field);
+            return _kit.Labeled(label, field);
+        }
+
+        private VisualElement LayerField(string name, string label)
+        {
+            var p = Prop(name);
+            if (p == null) return Missing(label, name);
+
+            var field = new LayerMaskField { value = p.intValue };
+            field.RegisterValueChangedCallback(e =>
+            {
+                p.intValue = e.newValue;
+                Changed();
+            });
+            _kit.PaintLabels(field);
+            _kit.PaintFieldInput(field);
+            return _kit.Labeled(label, field);
+        }
+
+        // ============================================================ действия
+
+        private static bool DeckAvailable()
+        {
+            foreach (Type type in TypeCache.GetTypesDerivedFrom<ScriptableObject>())
+            {
+                if (type.FullName == SettingsTypeName) return true;
+            }
+
+            return false;
+        }
+
+        private void CreateAsset()
+        {
+            // создаёт сам AppCore: ассет, ссылки на панель и стили, Preloaded Assets
+            if (!EditorApplication.ExecuteMenuItem(SettingsMenu))
+            {
+                Context.SetStatus($"Нет пункта меню «{SettingsMenu}» — AppCore старше 4.1?", StatusKind.Error);
+                return;
+            }
+
+            Show();
+            Context.SetStatus(_so != null ? "Настройки AppDeck созданы." : $"Ассет не появился: {AssetPath}",
+                              _so != null ? StatusKind.Ok : StatusKind.Warning);
+        }
+
+        private bool IsPreloaded()
+        {
+            foreach (Object asset in PlayerSettings.GetPreloadedAssets())
+            {
+                if (asset == _asset) return true;
+            }
+
+            return false;
+        }
+
+        private void AddToPreloaded()
+        {
+            var list = new List<Object>();
+            foreach (Object asset in PlayerSettings.GetPreloadedAssets())
+            {
+                if (asset != null && asset != _asset) list.Add(asset);
+            }
+
+            list.Add(_asset);
+            PlayerSettings.SetPreloadedAssets(list.ToArray());
+
+            // настройки проекта пишутся на диск сразу, а не при закрытии редактора
+            AssetDatabase.SaveAssets();
+
+            Context.SetStatus("Настройки AppDeck добавлены в Preloaded Assets.", StatusKind.Ok);
+            Render();
+        }
+
+        private void ToggleDeck()
+        {
+            var method = Type.GetType(DeckTypeName)?.GetMethod("Toggle", Type.EmptyTypes);
+            if (method == null)
+            {
+                Context.SetStatus("AppDeck не найден.", StatusKind.Error);
+                return;
+            }
+
+            method.Invoke(null, null);
+        }
+
+        private void ResetPrefs()
+        {
+            if (!EditorUtility.DisplayDialog("AppDeck", "Сбросить размер окна, вкладку, историю команд, фильтры и закрепления?",
+                                             "Сбросить", "Отмена"))
+                return;
+
+            foreach (string key in PrefsKeys) PlayerPrefs.DeleteKey(key);
+            PlayerPrefs.Save();
+
+            Context.SetStatus("Сохранённое AppDeck сброшено. Окно перечитает его при следующем запуске.", StatusKind.Ok);
+        }
+    }
+}

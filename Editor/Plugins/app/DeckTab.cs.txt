@@ -33,7 +33,7 @@ namespace Exerussus.Nexus.Pages.App
         /// <summary>Ключи PlayerPrefs, в которых AppDeck помнит окно, историю и закрепления.</summary>
         private static readonly string[] PrefsKeys =
         {
-            "appdeck.layout", "appdeck.height", "appdeck.tab", "appdeck.pick", "appdeck.history",
+            "appdeck.layout", "appdeck.height", "appdeck.tab", "appdeck.history",
             "appdeck.console.mask", "appdeck.actions.pins", "appdeck.metrics.pins",
         };
 
@@ -127,7 +127,6 @@ namespace Exerussus.Nexus.Pages.App
             left.Add(WindowCard());
             left.Add(ConsoleCard());
             right.Add(StateCard());
-            right.Add(PickCard());
             right.Add(MetricsCard());
             right.Add(RuntimeCard());
         }
@@ -200,18 +199,6 @@ namespace Exerussus.Nexus.Pages.App
             card.Add(IntField("logCapacity", "Ёмкость", 64, 1 << 20, "записей, округляется до степени двойки"));
             card.Add(BoolField("collapseDuplicates", "Сворачивать повторы"));
             card.Add(IntField("historySize", "История команд", 8, 512, "строк (↑/↓)"));
-            return card;
-        }
-
-        private VisualElement PickCard()
-        {
-            var card = _kit.Card("Выбор цели", "В шторке клик по миру выбирает цель для команд (аргумент target).");
-
-            card.Add(BoolField("picking", "Выбор кликом"));
-            card.Add(BoolField("physicsPicker", "Встроенный физический пикер"));
-            card.Add(FloatField("pickDistance", "Дальность", 1f, 100000f, "м"));
-            card.Add(LayerField("pickLayers", "Слои"));
-            card.Add(_kit.Faint("Игра добавляет свои пикеры (AppDeck.RegisterPicker) — они главнее встроенного."));
             return card;
         }
 
@@ -339,22 +326,6 @@ namespace Exerussus.Nexus.Pages.App
                 Changed();
             });
             _kit.PaintLabels(field);
-            return _kit.Labeled(label, field);
-        }
-
-        private VisualElement LayerField(string name, string label)
-        {
-            var p = Prop(name);
-            if (p == null) return Missing(label, name);
-
-            var field = new LayerMaskField { value = p.intValue };
-            field.RegisterValueChangedCallback(e =>
-            {
-                p.intValue = e.newValue;
-                Changed();
-            });
-            _kit.PaintLabels(field);
-            _kit.PaintFieldInput(field);
             return _kit.Labeled(label, field);
         }
 

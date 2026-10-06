@@ -8,14 +8,20 @@
 //
 //  Создание ассета и Preloaded Assets — делом самого AppCore (пункт меню Exerussus/App/AppDeck Settings):
 //  один источник правды, вкладка лишь зовёт его и показывает итог.
+//
+//  Preloaded Assets у профиля сборки, переопределяющего Player Settings, — СВОЙ список. Статус читается
+//  из файлов (ProjectSettings.asset и .asset профилей), а не через PlayerSettings API: API показывает
+//  только активный контекст. С app-core 4.2.3 ассет добавляется в собираемый профиль перед сборкой сам.
 // ============================================================
 
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using Exerussus.AppCore;
 using Exerussus.Nexus.Abstractions;
 using UnityEditor;
+using UnityEditor.Build.Profile;
 using UnityEditor.UIElements;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -146,14 +152,24 @@ namespace Exerussus.Nexus.Pages.App
 
             card.Add(_kit.Divider(8f));
 
-            bool preloaded = IsPreloaded();
-            card.Add(preloaded
-                ? _kit.Status(StatusKind.Ok, "Ассет в Preloaded Assets — сборка прочитает его без сцены.")
-                : _kit.Status(StatusKind.Warning, "Ассета нет в Preloaded Assets — в сборке AppDeck возьмёт умолчания."));
+            card.Add(_kit.Text("Preloaded Assets (без них сборка не видит настройки и берёт умолчания):",
+                               NexusToken.TextDim, 11));
+            foreach (PreloadState state in PreloadStates())
+            {
+                if (state.UsesGlobal)
+                    card.Add(_kit.Status(StatusKind.Info, $"{state.Label}: общие Player Settings"));
+                else if (state.Present)
+                    card.Add(_kit.Status(StatusKind.Ok, $"{state.Label}: есть"));
+                else
+                    card.Add(_kit.Status(StatusKind.Warning, $"{state.Label}: нет",
+                        state.IsProfile ? "AppCore 4.2.3+ добавит перед первой сборкой этого профиля (закоммитьте файл профиля)." : null));
+            }
 
+            bool preloaded = IsPreloaded();
             var buttons = _kit.Row();
             buttons.style.marginTop = 8f;
-            if (!preloaded) buttons.Add(_kit.Btn(NexusRole.Primary, "Добавить", AddToPreloaded, small: true));
+            if (!preloaded)
+                buttons.Add(_kit.Btn(NexusRole.Primary, $"Добавить: {ActiveContextLabel()}", AddToPreloaded, small: true));
             buttons.Add(_kit.Btn(NexusRole.Ghost, "Выделить ассет", () =>
             {
                 Selection.activeObject = _asset;
@@ -355,6 +371,87 @@ namespace Exerussus.Nexus.Pages.App
                               _so != null ? StatusKind.Ok : StatusKind.Warning);
         }
 
+        private sealed class PreloadState
+        {
+            public string Label;
+            public bool   IsProfile;
+            public bool   UsesGlobal;   // профиль не переопределяет Player Settings
+            public bool   Present;
+        }
+
+        /// <summary>Общие Player Settings и каждый профиль сборки — по файлам на диске.</summary>
+        private List<PreloadState> PreloadStates()
+        {
+            var list = new List<PreloadState>();
+            string guid = AssetDatabase.AssetPathToGUID(AssetPath);
+
+            string projectSettings = Path.Combine(Directory.GetParent(Application.dataPath)!.FullName, "ProjectSettings", "ProjectSettings.asset");
+            list.Add(new PreloadState
+            {
+                Label = "Player Settings (общие)",
+                Present = ReadPreloaded(projectSettings, guid) == true,
+            });
+
+            foreach (string profileGuid in AssetDatabase.FindAssets("t:BuildProfile"))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(profileGuid);
+                bool? present = ReadPreloaded(path, guid);
+                list.Add(new PreloadState
+                {
+                    Label = $"Профиль «{Path.GetFileNameWithoutExtension(path)}»",
+                    IsProfile = true,
+                    UsesGlobal = present == null,
+                    Present = present == true,
+                });
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// Есть ли guid в списке preloadedAssets файла. null — списка нет (профиль без переопределения
+        /// Player Settings). В профиле Player Settings лежат строками «- line: '|   …'», префикс срезается.
+        /// </summary>
+        private static bool? ReadPreloaded(string path, string guid)
+        {
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            string[] lines;
+            try { lines = File.ReadAllLines(path); }
+            catch (Exception ex) { NexusDiagnostics.Swallowed($"AppDeck: чтение {path}", ex); return null; }
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = Unwrap(lines[i]);
+                if (!line.StartsWith("preloadedAssets:", StringComparison.Ordinal)) continue;
+                if (line.Contains("[]")) return false;
+
+                for (int j = i + 1; j < lines.Length; j++)
+                {
+                    string item = Unwrap(lines[j]);
+                    if (!item.StartsWith("- {", StringComparison.Ordinal)) break;
+                    if (!string.IsNullOrEmpty(guid) && item.Contains(guid)) return true;
+                }
+                return false;
+            }
+            return null;
+        }
+
+        private static string Unwrap(string raw)
+        {
+            string s = raw.Trim();
+            const string Wrapped = "- line: '|";
+            if (s.StartsWith(Wrapped, StringComparison.Ordinal)) s = s.Substring(Wrapped.Length).TrimEnd('\'').Trim();
+            return s;
+        }
+
+        /// <summary>Куда пишет PlayerSettings API сейчас: активный профиль или общие Player Settings.</summary>
+        private static string ActiveContextLabel()
+        {
+            BuildProfile profile = BuildProfile.GetActiveBuildProfile();
+            if (profile == null) return "Player Settings";
+            bool? own = ReadPreloaded(AssetDatabase.GetAssetPath(profile), "");
+            return own == null ? "Player Settings" : $"профиль «{profile.name}»";
+        }
+
         private bool IsPreloaded()
         {
             foreach (Object asset in PlayerSettings.GetPreloadedAssets())
@@ -379,7 +476,7 @@ namespace Exerussus.Nexus.Pages.App
             // настройки проекта пишутся на диск сразу, а не при закрытии редактора
             AssetDatabase.SaveAssets();
 
-            Context.SetStatus("Настройки AppDeck добавлены в Preloaded Assets.", StatusKind.Ok);
+            Context.SetStatus($"Настройки AppDeck добавлены в Preloaded Assets ({ActiveContextLabel()}).", StatusKind.Ok);
             Render();
         }
 

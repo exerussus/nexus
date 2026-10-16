@@ -8,6 +8,7 @@
 // ============================================================
 
 using System.Collections.Generic;
+using Exerussus.AppCore.Editor.Build;
 using Exerussus.Nexus.Abstractions;
 using UnityEngine.UIElements;
 
@@ -19,7 +20,8 @@ namespace Exerussus.Nexus.Pages.App
         {
             var head = _kit.Card("Пайплайн профиля",
                 "Пре-процессы выполняются после активации профиля, до билда; пост-процессы — только после успешного билда. " +
-                "Новый шаг — класс BuildStep<T> с атрибутом [BuildStep] в коде страницы App.");
+                "Шаги приходят из кода: класс BuildStep<T> с атрибутом [BuildStep] (AppCore, Exerussus.AppCore.Editor.Build) " +
+                "в любой сборке проекта — пакет может принести свой шаг.");
             head.Add(_kit.Labeled("Профиль", ProfileDropdown()));
             _content.Add(head);
 
@@ -78,9 +80,11 @@ namespace Exerussus.Nexus.Pages.App
             row.Add(down);
             box.Add(row);
 
-            if (!string.IsNullOrEmpty(d.Meta.Description))
+            var about = d.Meta.Description ?? "";
+            if (d.External) about = (about.Length > 0 ? about + "  ·  " : "") + "из " + d.Assembly;
+            if (about.Length > 0)
             {
-                var desc = _kit.Hint(d.Meta.Description);
+                var desc = _kit.Hint(about);
                 desc.style.marginLeft = 20f;
                 box.Add(desc);
             }
@@ -95,7 +99,7 @@ namespace Exerussus.Nexus.Pages.App
                 {
                     entry.settingsJson = d.Step.SaveSettings(settings);
                     RequestConfigSave();
-                }, _kit);
+                }, new AppStepHost(_kit));
             }
             catch (System.Exception ex)
             {
@@ -142,7 +146,7 @@ namespace Exerussus.Nexus.Pages.App
             if (missing.Count == 0) return;
 
             var card = _kit.Card("Шаги не найдены в коде",
-                "Записи сохранены в конфиге, но класса шага нет. Включённый ненайденный шаг остановит сборку.");
+                "Записи сохранены в конфиге, но класса шага нет (пакет с ним удалён?). Включённый ненайденный шаг остановит сборку.");
 
             foreach (var e in missing)
             {

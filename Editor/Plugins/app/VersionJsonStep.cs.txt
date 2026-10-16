@@ -12,6 +12,7 @@ using System.IO;
 using System.Text;
 using Exerussus.AppCore.Build;
 using Exerussus.AppCore.Editor;
+using Exerussus.AppCore.Editor.Build;
 using Exerussus.Nexus.Abstractions;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -71,8 +72,9 @@ namespace Exerussus.Nexus.Pages.App
             ctx.Log($"version.json: {full} → {path}");
         }
 
-        protected override VisualElement BuildSettingsUI(Settings settings, Action changed, AppKit kit)
+        protected override VisualElement BuildSettingsUI(Settings settings, Action changed, IBuildStepHost host)
         {
+            var kit = AppStepHost.Kit(host);
             var root = new VisualElement();
             root.style.flexDirection = FlexDirection.Row;
             root.style.alignItems = Align.Center;

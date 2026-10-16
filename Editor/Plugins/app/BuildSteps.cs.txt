@@ -1,197 +1,64 @@
 // ============================================================
-//  BuildSteps.cs — контракт пре-/пост-процессов сборки.
+//  BuildSteps.cs — поиск шагов сборки и хост их UI.
 //
-//  Как добавить шаг: создать в этой странице класс, унаследовать
-//  BuildStep<TSettings> и пометить [BuildStep(id, name, stage)]. Страница найдёт
-//  его сама (TypeCache), покажет в пайплайне каждого профиля, сохранит порядок,
-//  вкл/выкл и настройки (JSON) в build-config.json.
+//  Контракт шагов (BuildStep<TSettings>, [BuildStep], BuildStepContext, BuildTokens,
+//  IBuildStepHost) живёт в AppCore: Exerussus.AppCore.Editor.Build. Страница находит
+//  шаги во ВСЕХ сборках проекта (TypeCache), поэтому шаг может прийти из любого пакета,
+//  который ссылается на Exerussus.AppCore.Editor: нет пакета — нет шага.
 //
-//  Правила шага:
-//  • Execute бросает исключение при ошибке — сборка/пайплайн останавливается,
-//    в историю пишется, какой шаг упал.
-//  • Pre-шаги выполняются после активации профиля, до BuildPlayer.
-//    Post-шаги — только после УСПЕШНОГО билда.
-//  • Настройки — [Serializable]-класс с публичными полями (JsonUtility). Они ОБЩИЕ
-//    (build-config.json, коммитится) — секретов там быть не должно.
-//  • Личное (ключи, пути на машине) — в UserSettings: в UI через kit.Context.GetUserConfigPath,
-//    при выполнении через context.UserConfigPath.
-//  • Состояние между вызовами не хранить: экземпляр создаётся заново.
+//  Свои шаги страницы (zip, version.json, S3) — в соседних файлах; им доступен AppKit
+//  через AppStepHost.Kit(host).
 // ============================================================
 
 using System;
 using System.Collections.Generic;
+using Exerussus.AppCore.Editor.Build;
 using Exerussus.Nexus.Abstractions;
 using UnityEditor;
-using UnityEditor.Build.Reporting;
 using UnityEngine;
 using UnityEngine.UIElements;
 
 namespace Exerussus.Nexus.Pages.App
 {
-    internal enum BuildStage
-    {
-        Pre  = 0,
-        Post = 1,
-    }
-
-    [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
-    internal sealed class BuildStepAttribute : Attribute
-    {
-        public string     Id          { get; }
-        public string     Name        { get; }
-        public BuildStage Stage       { get; }
-        public string     Description { get; set; } = "";
-
-        public BuildStepAttribute(string id, string name, BuildStage stage)
-        {
-            Id    = id;
-            Name  = name;
-            Stage = stage;
-        }
-    }
-
-    internal interface IBuildStep
-    {
-        object        LoadSettings(string json);
-        string        SaveSettings(object settings);
-        VisualElement BuildSettingsUI(object settings, Action changed, AppKit kit);
-        void          Execute(BuildStepContext context, object settings);
-    }
-
-    /// <summary>База шага с типизированными настройками.</summary>
-    internal abstract class BuildStep<TSettings> : IBuildStep where TSettings : class, new()
-    {
-        public object LoadSettings(string json)
-        {
-            var s = new TSettings();
-            if (!string.IsNullOrEmpty(json))
-            {
-                try { JsonUtility.FromJsonOverwrite(json, s); }
-                catch (Exception ex) { NexusDiagnostics.Swallowed("Build: настройки шага", ex); }
-            }
-            return s;
-        }
-
-        public string SaveSettings(object settings) => JsonUtility.ToJson(settings);
-
-        public VisualElement BuildSettingsUI(object settings, Action changed, AppKit kit)
-            => BuildSettingsUI((TSettings)settings, changed, kit);
-
-        public void Execute(BuildStepContext context, object settings)
-            => Execute(context, (TSettings)settings);
-
-        /// <summary>UI настроек (null — настроек нет). После правки вызвать changed().
-        /// kit.Context — контекст страницы (статус, личные файлы, тема).</summary>
-        protected virtual VisualElement BuildSettingsUI(TSettings settings, Action changed, AppKit kit) => null;
-
-        protected abstract void Execute(BuildStepContext context, TSettings settings);
-    }
-
-    /// <summary>Всё, что шаг знает о текущей сборке.</summary>
-    internal sealed class BuildStepContext
-    {
-        public BuildStage  Stage;
-        public string      ProfileName     = "";
-        public BuildTarget Target;
-        public string      ProductName     = "";
-        public string      Version         = "";
-        public string      CommitHash      = "";   // пусто — git не найден
-        public bool        IsDirty;
-        public bool        Development;
-
-        /// <summary>locationPathName билда: файл (.exe/.apk/.app) или папка (WebGL/iOS).</summary>
-        public string OutputPath = "";
-
-        /// <summary>Папка сборки (корень, который упаковывается/публикуется).</summary>
-        public string OutputDirectory = "";
-
-        /// <summary>Билд — один самодостаточный файл (.apk/.aab). Для Windows .exe — false:
-        /// рядом лежат _Data, UnityPlayer.dll и пр., поставляется вся папка.</summary>
-        public bool OutputIsSingleFile;
-
-        /// <summary>Папка личных настроек страницы (UserSettings) — для ключей и путей машины.</summary>
-        public string UserConfigDir = "";
-
-        public string UserConfigPath(string file) => System.IO.Path.Combine(UserConfigDir ?? "", file);
-
-        /// <summary>Отчёт Unity; есть только у Post-шагов.</summary>
-        public BuildReport Report;
-
-        /// <summary>Файлы, созданные шагами (zip и т.п.) — попадают в историю.</summary>
-        public readonly List<string> Artifacts = new List<string>();
-
-        public readonly List<string> LogLines = new List<string>();
-
-        public void Log(string message)
-        {
-            LogLines.Add(message);
-            Debug.Log($"[Build] {message}");
-        }
-    }
-
-    /// <summary>
-    /// Токены в шаблонах имён шагов: {product} {version} {hash} {profile} {platform} {date}.
-    /// Пустое значение (нет git → пустой {hash}) не оставляет висящих разделителей:
-    /// «{product}_{version}_{hash}» без git даёт «Game_1.0», а не «Game_1.0_».
-    /// </summary>
-    internal static class BuildTokens
-    {
-        public const string Help = "Токены: {product} {version} {hash} {profile} {platform} {date}";
-
-        public static string Expand(string template, string product, string version, string hash,
-                                    string profile, string platform, DateTime now)
-        {
-            const string Empty = "\u0000";   // метка пустого токена — вычищается вместе с разделителем
-            var s = (template ?? "")
-                .Replace("{product}",  Or(product))
-                .Replace("{version}",  Or(version))
-                .Replace("{hash}",     Or(hash))
-                .Replace("{profile}",  Or(profile))
-                .Replace("{platform}", Or(platform))
-                .Replace("{date}",     now.ToString("yyyyMMdd-HHmm"));
-
-            // пустой токен: «a_<пусто>_b» → «a_b», «a_<пусто>» → «a», «<пусто>_b» → «b»
-            for (var i = s.IndexOf(Empty, StringComparison.Ordinal); i >= 0; i = s.IndexOf(Empty, StringComparison.Ordinal))
-            {
-                var left  = i > 0 && IsSeparator(s[i - 1]);
-                var right = i + 1 < s.Length && IsSeparator(s[i + 1]);
-                if (left && right)                 s = s.Remove(i, 2);
-                else if (left && i + 1 == s.Length) s = s.Remove(i - 1, 2);
-                else if (right && i == 0)          s = s.Remove(i, 2);
-                else                               s = s.Remove(i, 1);
-            }
-            return s;
-
-            string Or(string v) => string.IsNullOrEmpty(v) ? Empty : v;
-        }
-
-        private static bool IsSeparator(char c) => c == '_' || c == '-' || c == '.' || c == '/' || c == ' ';
-
-        public static string Expand(string template, BuildStepContext ctx, DateTime now)
-            => Expand(template, ctx.ProductName, ctx.Version, ctx.CommitHash, ctx.ProfileName, ctx.Target.ToString(), now);
-    }
-
     /// <summary>Найденный шаг: метаданные + экземпляр.</summary>
     internal sealed class StepDescriptor
     {
         public BuildStepAttribute Meta;
         public IBuildStep         Step;
+
+        /// <summary>Шаг не из страницы App (пришёл с пакетом).</summary>
+        public bool External;
+
+        /// <summary>Сборка, из которой пришёл шаг (для подсказки в UI).</summary>
+        public string Assembly = "";
     }
 
     internal static class BuildStepRegistry
     {
-        /// <summary>Все шаги страницы (без кэша — TypeCache и так быстрый).</summary>
+        /// <summary>Все шаги проекта (без кэша — TypeCache и так быстрый).</summary>
         public static List<StepDescriptor> All()
         {
             var list = new List<StepDescriptor>();
+            var own  = typeof(BuildStepRegistry).Assembly;
             foreach (var type in TypeCache.GetTypesWithAttribute<BuildStepAttribute>())
             {
                 if (type.IsAbstract || !typeof(IBuildStep).IsAssignableFrom(type)) continue;
                 var meta = (BuildStepAttribute)Attribute.GetCustomAttribute(type, typeof(BuildStepAttribute));
                 if (meta == null || string.IsNullOrEmpty(meta.Id)) continue;
+                if (Find(list, meta.Id) is { } dup)
+                {
+                    NexusDiagnostics.Error("Build", $"id шага «{meta.Id}» занят дважды — {dup.Step.GetType().FullName} и {type.FullName}; второй пропущен");
+                    continue;
+                }
                 try
                 {
-                    list.Add(new StepDescriptor { Meta = meta, Step = (IBuildStep)Activator.CreateInstance(type) });
+                    list.Add(new StepDescriptor
+                    {
+                        Meta     = meta,
+                        Step     = (IBuildStep)Activator.CreateInstance(type),
+                        External = type.Assembly != own,
+                        Assembly = type.Assembly.GetName().Name,
+                    });
                 }
                 catch (Exception ex)
                 {
@@ -227,6 +94,56 @@ namespace Exerussus.Nexus.Pages.App
                 changed = true;
             }
             return changed;
+        }
+    }
+
+    /// <summary>IBuildStepHost поверх AppKit: шаги из пакетов рисуются в стиле страницы.</summary>
+    internal sealed class AppStepHost : IBuildStepHost
+    {
+        public readonly AppKit AppKit;
+
+        public AppStepHost(AppKit kit) => AppKit = kit;
+
+        /// <summary>AppKit для шагов самой страницы.</summary>
+        public static AppKit Kit(IBuildStepHost host)
+            => (host as AppStepHost)?.AppKit ?? throw new InvalidOperationException("Шаг страницы App показан не страницей App");
+
+        public string UserConfigPath(string file) => AppKit.Context.GetUserConfigPath(file);
+
+        public void SetStatus(string text, BuildStepStatus status = BuildStepStatus.Info)
+            => AppKit.Context.SetStatus(text, status switch
+            {
+                BuildStepStatus.Ok      => StatusKind.Ok,
+                BuildStepStatus.Warning => StatusKind.Warning,
+                BuildStepStatus.Error   => StatusKind.Error,
+                _                       => StatusKind.Info,
+            });
+
+        public TextField Field(string value, Action<string> onChanged, bool password = false)
+        {
+            var f = AppKit.Input(value ?? "", onChanged);
+            f.isDelayed = true;
+            if (password) f.isPasswordField = true;
+            f.style.flexGrow = 1f;
+            return f;
+        }
+
+        public Toggle Toggle(string label, bool value, Action<bool> onChanged) => AppKit.Check(label, value, onChanged);
+
+        public Button Button(string text, Action onClick, bool primary = false)
+            => AppKit.Btn(primary ? NexusRole.Primary : NexusRole.Common, text, onClick, small: true);
+
+        public VisualElement Labeled(string label, VisualElement field) => AppKit.Labeled(label, field, 130f);
+
+        public Label Hint(string text) => AppKit.Hint(text);
+
+        public Label Section(string text)
+        {
+            var l = AppKit.Text(text, NexusToken.TextDim, 11);
+            l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            l.style.marginTop = 8f;
+            l.style.marginBottom = 2f;
+            return l;
         }
     }
 }

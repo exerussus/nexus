@@ -21,6 +21,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using Exerussus.AppCore.Editor.Build;
 using Exerussus.Nexus.Abstractions;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
@@ -238,8 +239,9 @@ namespace Exerussus.Nexus.Pages.App
 
         // ============================================================ UI
 
-        protected override VisualElement BuildSettingsUI(Settings s, Action changed, AppKit kit)
+        protected override VisualElement BuildSettingsUI(Settings s, Action changed, IBuildStepHost host)
         {
+            var kit = AppStepHost.Kit(host);
             var root = new VisualElement();
             var credsPath = kit.Context.GetUserConfigPath(CredentialsFile);
             var creds = S3Credentials.Load(credsPath);

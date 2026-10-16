@@ -20,7 +20,7 @@ part of AppCore (no separate deployment).
 - **Консоль** — AppDeck settings (app-core 4.1+): activation, hotkey, window, log capacity, metrics and mini-HUD, Preloaded Assets status, player-prefs reset. No compile reference to the Deck assembly — fields go through `SerializedObject`, so the plugin still builds with app-core 4.0.
 - **Сборка** — sub-tabs:
   - **Билд** — profile, version bump, output folder, run, history;
-  - **Пайплайн** — per-profile pre/post steps (`BuildStep<T>` + `[BuildStep]`), incl. Zip (name template), version.json and S3 upload via rclone (personal keys in UserSettings);
+  - **Пайплайн** — per-profile pre/post steps (`BuildStep<T>` + `[BuildStep]` from app-core `Exerussus.AppCore.Editor.Build`; steps are discovered in every assembly, so a package can ship its own), incl. Zip (name template), version.json and S3 upload via rclone (personal keys in UserSettings);
   - **BuildInfo** — current values, stamp settings, version overlay, migration of the old deployment.
 
 ## Visual language

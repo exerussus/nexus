@@ -127,8 +127,9 @@ namespace Exerussus.Nexus.Pages.App
             ctx.Log($"Zip: {files.Count} файл(ов), {FormatSize(total)} → {FormatSize(zipSize)}: {zipPath}");
         }
 
-        protected override VisualElement BuildSettingsUI(Settings s, Action changed, AppKit kit)
+        protected override VisualElement BuildSettingsUI(Settings s, Action changed, IBuildStepHost host)
         {
+            var kit = AppStepHost.Kit(host);
             var ui = kit.Context.Ui;
             var root = new VisualElement();
 

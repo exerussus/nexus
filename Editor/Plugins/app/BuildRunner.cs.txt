@@ -410,13 +410,14 @@ namespace Exerussus.Nexus.Pages.App
                 if (e == null || !e.enabled) continue;
                 var d = BuildStepRegistry.Find(all, e.id);
                 if (d == null)
-                    return $"шаг «{e.id}» включён, но не найден в коде страницы.";
+                    return $"шаг «{e.id}» включён, но не найден в коде проекта (пакет с ним удалён?).";
                 if (d.Meta.Stage != stage) continue;
 
                 try
                 {
                     ctx.Log($"{(stage == BuildStage.Pre ? "Пре" : "Пост")}-шаг «{d.Meta.Name}»…");
                     d.Step.Execute(ctx, d.Step.LoadSettings(e.settingsJson));
+                    ctx.CompletedSteps.Add(e.id);
                 }
                 catch (Exception ex)
                 {

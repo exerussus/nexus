@@ -1,0 +1,612 @@
+// ============================================================
+//  PlayFlowUploadStep.cs — пост-шаг: заливка серверной сборки в PlayFlow Cloud
+//  (https://playflowcloud.com) и, по желанию, перезапуск сервера на неё.
+//
+//  Public API PlayFlow (https://api.computeflow.cloud, заголовок «api-key: pf_…»):
+//    1. POST /api/v3/builds/upload-url?name=<имя сборки>&executable_path=<путь в zip>
+//       → build_id + presigned upload_url (живёт минуты — заливаем сразу);
+//    2. PUT <upload_url>, тело — zip, Content-Type: application/zip;
+//    3. GET /api/v3/builds/{build_id} — ждём status = ready | failed (логи — /logs);
+//    4. (опц.) POST /api/v3/servers/{instance_id}/restart {version_tag, version} — сервер
+//       поднимается на новой сборке. instance_id сохраняется, host и порт — НЕТ (PlayFlow
+//       выделяет новые): клиенту адрес надо узнавать по instance_id (GET /servers/{id}).
+//  Версии нумеруются сами внутри имени сборки (default v1, v2, …).
+//
+//  Архив — zip шага «Zip-архив сборки», если он есть в этом прогоне, иначе шаг пакует
+//  папку сборки сам во временный файл (без служебных папок Unity). executable_path
+//  находится в архиве по имени исполняемого файла сборки (в корне или в одной папке).
+//
+//  Общие настройки — build-config.json (коммитятся). Ключ — ТОЛЬКО личный: UserSettings
+//  (playflow-credentials.json, git-ignored) или переменная окружения. В конфиг и лог не пишется.
+// ============================================================
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Exerussus.AppCore.Editor.Build;
+using Exerussus.Nexus.Abstractions;
+using Newtonsoft.Json.Linq;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    [BuildStep("playflow-upload", "Заливка в PlayFlow", BuildStage.Post,
+        Description = "Заливает серверную сборку в PlayFlow Cloud (zip шага Zip или свой), ждёт готовности и по желанию перезапускает сервер на неё. Ключ — личный.")]
+    internal sealed class PlayFlowUploadStep : BuildStep<PlayFlowUploadStep.Settings>
+    {
+        internal const string CredentialsFile = "playflow-credentials.json";
+        internal const string DefaultApi = "https://api.computeflow.cloud";
+
+        [Serializable]
+        internal sealed class Settings
+        {
+            // --- куда ---
+            public string apiBase        = DefaultApi;
+            public string buildName      = "default";     // version_tag серверов; версии внутри растут сами
+
+            // --- архив ---
+            public bool   useZipStep     = true;          // взять zip шага «Zip-архив сборки», если он был
+            public string excludeMasks   = ZipStep.DefaultExcludeMasks;
+
+            // --- после заливки ---
+            public bool   waitReady      = true;
+            public int    timeoutMinutes = 15;
+            public bool   restartServer  = false;
+            public string instanceId     = "";
+
+            // --- ключ и условия ---
+            public string apiKeyEnv      = "PLAYFLOW_API_KEY";
+            public bool   skipWithoutKey = true;
+            public bool   releaseOnly    = false;
+        }
+
+        // ============================================================ выполнение
+
+        protected override void Execute(BuildStepContext ctx, Settings s)
+        {
+            if (s.releaseOnly && ctx.Development)
+            {
+                ctx.Log("PlayFlow: development-сборка — не заливается (включено «Только для релизных сборок»).");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(s.buildName)) throw new InvalidOperationException("PlayFlow: не указано имя сборки.");
+            if (s.restartServer && string.IsNullOrWhiteSpace(s.instanceId))
+                throw new InvalidOperationException("PlayFlow: включён перезапуск, но не указан instance id сервера.");
+
+            var key = PlayFlowKey.Resolve(ctx.UserConfigPath(CredentialsFile), s);
+            if (key.Value == null)
+            {
+                var msg = $"нет ключа: ни в личных настройках, ни в переменной {s.apiKeyEnv}";
+                if (!s.skipWithoutKey) throw new InvalidOperationException("PlayFlow: " + msg);
+                ctx.Log("PlayFlow: заливка пропущена — " + msg);
+                UnityEngine.Debug.LogWarning("[Build] PlayFlow: заливка пропущена — " + msg);
+                return;
+            }
+
+            var exeName = ExecutableName(ctx);
+            string tempZip = null;
+            try
+            {
+                var zip = s.useZipStep ? ctx.Artifacts.FindLast(a => a.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) : null;
+                if (zip == null || !File.Exists(zip))
+                {
+                    tempZip = Path.Combine(Path.GetTempPath(), $"playflow-{Guid.NewGuid():N}.zip");
+                    var (files, size) = PackBuild(ctx, s.excludeMasks, tempZip);
+                    zip = tempZip;
+                    ctx.Log($"PlayFlow: свой архив — {files} файл(ов), {ZipStep.FormatSize(size)}");
+                }
+                else ctx.Log($"PlayFlow: архив шага Zip — {zip}");
+
+                var executablePath = FindExecutable(zip, exeName)
+                    ?? throw new InvalidOperationException($"PlayFlow: в архиве нет {exeName} (ни в корне, ни в единственной папке) — {zip}");
+                ctx.Log($"PlayFlow: сборка «{s.buildName.Trim()}», исполняемый файл в архиве: {executablePath} (ключ: {key.Describe})");
+
+                var job = new PlayFlowJob(PlayFlowApi.Normalize(s.apiBase), key.Value);
+                var task = Task.Run(() => job.RunAsync(s, zip, executablePath));
+                Pump(task, job, ctx, Math.Max(1, s.timeoutMinutes));
+            }
+            finally
+            {
+                if (tempZip != null) try { File.Delete(tempZip); } catch (Exception) { /* временный файл */ }
+            }
+        }
+
+        /// <summary>
+        /// Ждём задачу на главном потоке: строки лога и фаза копятся в задании и выводятся отсюда
+        /// (ctx.Log и прогресс-бар — только главный поток). Отмена в прогресс-баре — честная отмена.
+        /// </summary>
+        private static void Pump(Task task, PlayFlowJob job, BuildStepContext ctx, int timeoutMinutes)
+        {
+            var deadline = DateTime.UtcNow.AddMinutes(timeoutMinutes + 5);   // запас поверх ожиданий внутри задания
+            var batch = Application.isBatchMode;
+            try
+            {
+                while (!task.Wait(200))
+                {
+                    while (job.Lines.TryDequeue(out var line)) ctx.Log("PlayFlow: " + line);
+                    if (DateTime.UtcNow > deadline) { job.Cancel(); throw new TimeoutException("PlayFlow: шаг не уложился во время и остановлен."); }
+                    if (!batch && EditorUtility.DisplayCancelableProgressBar("PlayFlow", job.Phase, job.Progress))
+                    {
+                        job.Cancel();
+                        throw new OperationCanceledException("PlayFlow: заливка прервана вручную.");
+                    }
+                }
+                while (job.Lines.TryDequeue(out var line)) ctx.Log("PlayFlow: " + line);
+                if (task.IsFaulted) throw Unwrap(task.Exception);
+            }
+            finally
+            {
+                if (!batch) EditorUtility.ClearProgressBar();
+            }
+        }
+
+        private static Exception Unwrap(AggregateException e)
+        {
+            var inner = e?.InnerException ?? e;
+            return inner is InvalidOperationException || inner is OperationCanceledException || inner is TimeoutException
+                ? inner
+                : new InvalidOperationException("PlayFlow: " + inner?.Message, inner);
+        }
+
+        /// <summary>Имя исполняемого файла сборки (Linux — Server.x86_64 и т.п.).</summary>
+        private static string ExecutableName(BuildStepContext ctx)
+        {
+            var name = Path.GetFileName(ctx.OutputPath ?? "");
+            return string.IsNullOrEmpty(name) || Directory.Exists(ctx.OutputPath) ? "Server.x86_64" : name;
+        }
+
+        /// <summary>Путь исполняемого файла внутри zip: в корне или в единственной папке верхнего уровня.</summary>
+        internal static string FindExecutable(string zipPath, string exeName)
+        {
+            using (var zip = ZipFile.OpenRead(zipPath))
+            {
+                var names = zip.Entries.Select(e => e.FullName.Replace('\\', '/')).Where(n => !n.EndsWith("/")).ToList();
+                if (names.Contains(exeName)) return exeName;
+                var tops = names.Select(n => n.Contains("/") ? n.Substring(0, n.IndexOf('/')) : "").Distinct().ToList();
+                if (tops.Count == 1 && tops[0].Length > 0 && names.Contains(tops[0] + "/" + exeName)) return tops[0] + "/" + exeName;
+                return null;
+            }
+        }
+
+        /// <summary>Свой архив папки сборки — те же исключения, что у шага Zip.</summary>
+        private static (int files, long size) PackBuild(BuildStepContext ctx, string masksText, string zipPath)
+        {
+            var dir = ctx.OutputDirectory;
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) throw new DirectoryNotFoundException($"PlayFlow: папка сборки не найдена: {dir}");
+
+            var masks = ZipStep.ParseMasks(masksText);
+            var root = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            int count = 0;
+            long total = 0;
+            try
+            {
+                using (var stream = new FileStream(zipPath, FileMode.CreateNew, FileAccess.Write))
+                using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, false, Encoding.UTF8))
+                {
+                    foreach (var full in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                    {
+                        var rel = full.Substring(root.Length + 1).Replace('\\', '/');
+                        if (ZipStep.IsExcluded(rel, masks)) continue;
+                        if (count % 16 == 0) EditorUtility.DisplayProgressBar("PlayFlow: архив", rel, 0f);
+                        var entry = zip.CreateEntry(rel, System.IO.Compression.CompressionLevel.Optimal);
+                        using (var src = File.OpenRead(full))
+                        using (var dst = entry.Open())
+                            src.CopyTo(dst);
+                        total += new FileInfo(full).Length;
+                        count++;
+                    }
+                }
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+            if (count == 0) throw new IOException("PlayFlow: нечего архивировать — после исключений не осталось файлов.");
+            return (count, total);
+        }
+
+        // ============================================================ UI
+
+        protected override VisualElement BuildSettingsUI(Settings s, Action changed, IBuildStepHost host)
+        {
+            var kit = AppStepHost.Kit(host);
+            var credsPath = kit.Context.GetUserConfigPath(CredentialsFile);
+            var root = new VisualElement();
+
+            root.Add(Section(kit, "Куда"));
+            root.Add(Field(kit, "Адрес API", s.apiBase, v => { s.apiBase = v; changed(); }));
+            root.Add(Field(kit, "Имя сборки", s.buildName, v => { s.buildName = v; changed(); }));
+            root.Add(kit.Hint("Имя сборки = version_tag серверов PlayFlow. Версии внутри имени PlayFlow нумерует сам (v1, v2, …); новый сервер берёт последнюю готовую."));
+
+            root.Add(Section(kit, "Архив"));
+            root.Add(kit.Check("Взять zip шага «Zip-архив сборки», если он был", s.useZipStep, v => { s.useZipStep = v; changed(); }));
+            root.Add(kit.Hint("Иначе (или без шага Zip) шаг пакует папку сборки сам во временный файл. Исполняемый файл ищется в архиве по имени сборки — в корне или в одной папке."));
+            root.Add(kit.Text("Исключить из своего архива (маска на строку, * и ?):", NexusToken.TextDim, 11));
+            var masks = kit.Input(s.excludeMasks, v => { s.excludeMasks = v; changed(); });
+            masks.multiline = true;
+            masks.isDelayed = true;
+            masks.style.minHeight = 40;
+            root.Add(masks);
+
+            root.Add(Section(kit, "После заливки"));
+            root.Add(kit.Check("Ждать, пока PlayFlow обработает сборку", s.waitReady, v => { s.waitReady = v; changed(); }));
+            root.Add(Field(kit, "Таймаут, мин", s.timeoutMinutes.ToString(), v =>
+            {
+                if (int.TryParse(v, out var n) && n > 0) { s.timeoutMinutes = n; changed(); }
+            }));
+            root.Add(kit.Check("Перезапустить сервер на новую сборку", s.restartServer, v => { s.restartServer = v; changed(); }));
+            root.Add(Field(kit, "Instance id", s.instanceId, v => { s.instanceId = (v ?? "").Trim(); changed(); }));
+            root.Add(kit.Hint("Перезапуск сохраняет instance id, но PlayFlow выделяет новые host и порт — клиент должен узнавать адрес по instance id (GET /api/v3/servers/{id}). Новый адрес шаг пишет в лог. Перезапуск подразумевает ожидание готовности."));
+
+            root.Add(Section(kit, "Ключ (личный)"));
+            var keyStatus = kit.Hint("");
+            void UpdateKey() => keyStatus.text = "Сейчас: " + PlayFlowKey.Resolve(credsPath, s).Describe;
+            root.Add(Field(kit, "Server API key", PlayFlowCredentials.Load(credsPath).apiKey, v =>
+            {
+                var c = PlayFlowCredentials.Load(credsPath);
+                c.apiKey = (v ?? "").Trim();
+                c.Save(credsPath);
+                UpdateKey();
+            }, password: true));
+            root.Add(Field(kit, "Или переменная", s.apiKeyEnv, v => { s.apiKeyEnv = v; changed(); UpdateKey(); }));
+            root.Add(keyStatus);
+            UpdateKey();
+            root.Add(kit.Hint("Серверный ключ pf_… (PlayFlow → Project Settings). Хранится только у вас: UserSettings/Exerussus.Nexus/app/" + CredentialsFile + ". В клиент его не кладут никогда."));
+            root.Add(kit.Check("Без ключа — пропускать шаг, а не падать", s.skipWithoutKey, v => { s.skipWithoutKey = v; changed(); }));
+            var row = kit.Row();
+            row.Add(kit.Btn(NexusRole.Common, "Проверить ключ", () => CheckKey(kit, s, credsPath), small: true));
+            root.Add(row);
+
+            root.Add(Section(kit, "Условия"));
+            root.Add(kit.Check("Только для релизных сборок", s.releaseOnly, v => { s.releaseOnly = v; changed(); }));
+            return root;
+        }
+
+        private static async void CheckKey(AppKit kit, Settings s, string credsPath)
+        {
+            var key = PlayFlowKey.Resolve(credsPath, s);
+            if (key.Value == null) { kit.Context.SetStatus("PlayFlow: нет ключа — впишите его или задайте переменную окружения", StatusKind.Warning); return; }
+
+            kit.Context.SetStatus("PlayFlow: проверяю ключ…");
+            try
+            {
+                var api = new PlayFlowApi(PlayFlowApi.Normalize(s.apiBase), key.Value);
+                var name = (s.buildName ?? "").Trim();
+                var list = await api.GetAsync($"/api/v3/builds?name={Uri.EscapeDataString(name)}&limit=100", CancellationToken.None);
+                var builds = list["builds"] as JArray ?? new JArray();
+                var last = builds.OrderByDescending(b => (int?)b["version"] ?? 0).FirstOrDefault();
+                var lastText = last == null ? "сборок ещё нет" : $"последняя v{last["version"]} ({last["status"]})";
+                kit.Context.SetStatus($"PlayFlow: ключ рабочий ({key.Describe}), сборка «{name}»: {lastText}", StatusKind.Ok);
+            }
+            catch (Exception ex)
+            {
+                kit.Context.SetStatus("PlayFlow: " + ex.Message, StatusKind.Error);
+            }
+        }
+
+        private static Label Section(AppKit kit, string title)
+        {
+            var l = kit.Text(title, NexusToken.TextDim, 11);
+            l.style.unityFontStyleAndWeight = FontStyle.Bold;
+            l.style.marginTop = 8f;
+            l.style.marginBottom = 2f;
+            return l;
+        }
+
+        private static VisualElement Field(AppKit kit, string label, string value, Action<string> onChanged, bool password = false)
+        {
+            var input = kit.Input(value ?? "", onChanged);
+            input.isDelayed = true;
+            if (password) input.isPasswordField = true;
+            input.style.flexGrow = 1f;
+            return kit.Labeled(label, input, 130f);
+        }
+    }
+
+    // ================================================================ задание (вне главного потока)
+
+    /// <summary>
+    /// Заливка, ожидание, перезапуск. Работает в пуле потоков и не трогает Unity API:
+    /// наружу — только строки лога, фаза и прогресс, их читает главный поток.
+    /// </summary>
+    internal sealed class PlayFlowJob
+    {
+        public readonly ConcurrentQueue<string> Lines = new ConcurrentQueue<string>();
+        public volatile string Phase = "Подготовка…";
+        private float _progress;
+        public float Progress => Volatile.Read(ref _progress);
+
+        private readonly PlayFlowApi _api;
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+
+        public PlayFlowJob(string apiBase, string key) => _api = new PlayFlowApi(apiBase, key);
+
+        public void Cancel() => _cts.Cancel();
+
+        private void Log(string line) => Lines.Enqueue(line);
+
+        public async Task RunAsync(PlayFlowUploadStep.Settings s, string zipPath, string executablePath)
+        {
+            var ct = _cts.Token;
+            var name = s.buildName.Trim();
+            var timeout = TimeSpan.FromMinutes(Math.Max(1, s.timeoutMinutes));
+
+            // 1. ссылка на заливку
+            Phase = "Запрос ссылки на заливку…";
+            var created = await _api.PostAsync(
+                $"/api/v3/builds/upload-url?name={Uri.EscapeDataString(name)}&executable_path={Uri.EscapeDataString(executablePath)}", null, ct);
+            var buildId = (string)created["build_id"] ?? throw new InvalidOperationException("PlayFlow: в ответе нет build_id");
+            var uploadUrl = (string)created["upload_url"] ?? throw new InvalidOperationException("PlayFlow: в ответе нет upload_url");
+            Log($"сборка создана: {buildId}");
+
+            // 2. сам zip
+            var size = new FileInfo(zipPath).Length;
+            Phase = $"Заливка {ZipStep.FormatSize(size)}…";
+            using (var file = File.OpenRead(zipPath))
+            using (var counting = new ProgressStream(file, size, p =>
+                   {
+                       Volatile.Write(ref _progress, p);
+                       Phase = $"Заливка {p * 100:0}% из {ZipStep.FormatSize(size)}";
+                   }))
+            {
+                var content = new StreamContent(counting, 81920);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/zip");
+                content.Headers.ContentLength = size;
+                await PlayFlowApi.UploadAsync(uploadUrl, content, ct);
+            }
+            Log($"залито {ZipStep.FormatSize(size)}");
+
+            if (!s.waitReady && !s.restartServer)
+            {
+                Log("обработку не ждём — статус сборки смотрите в панели PlayFlow");
+                return;
+            }
+
+            // 3. обработка
+            Volatile.Write(ref _progress, 0f);
+            var deadline = DateTime.UtcNow + timeout;
+            int version;
+            while (true)
+            {
+                var build = await _api.GetAsync($"/api/v3/builds/{Uri.EscapeDataString(buildId)}", ct);
+                var status = (string)build["status"] ?? "?";
+                version = (int?)build["version"] ?? 0;
+                Phase = $"Обработка в PlayFlow: {status}";
+                if (status == "ready") break;
+                if (status == "failed" || status == "deleted")
+                {
+                    await LogBuildTailAsync(buildId, ct);
+                    throw new InvalidOperationException($"PlayFlow: сборка {buildId} — {status}. Хвост логов обработки — выше.");
+                }
+                if (DateTime.UtcNow > deadline) throw new TimeoutException($"PlayFlow: сборка не готова за {timeout.TotalMinutes:0} мин (статус {status}).");
+                await Task.Delay(3000, ct);
+            }
+            Log($"готово: «{name}» v{version}");
+
+            if (!s.restartServer) return;
+
+            // 4. перезапуск сервера на эту версию
+            var instance = s.instanceId.Trim();
+            Phase = "Перезапуск сервера…";
+            var body = new JObject { ["version_tag"] = name };
+            if (version > 0) body["version"] = version;
+            var restarted = await _api.PostAsync($"/api/v3/servers/{Uri.EscapeDataString(instance)}/restart", body, ct);
+            Log($"сервер {instance} перезапускается на v{version} (статус {(string)restarted["status"] ?? "?"})");
+
+            while (true)
+            {
+                var server = await _api.GetAsync($"/api/v3/servers/{Uri.EscapeDataString(instance)}", ct);
+                var status = (string)server["status"] ?? "?";
+                Phase = $"Сервер: {status}";
+                if (status == "running")
+                {
+                    LogPorts(server);
+                    return;
+                }
+                if (status == "stopped") throw new InvalidOperationException($"PlayFlow: сервер {instance} остановился после перезапуска — смотрите его логи в панели.");
+                if (DateTime.UtcNow > deadline) throw new TimeoutException($"PlayFlow: сервер не поднялся за {timeout.TotalMinutes:0} мин (статус {status}).");
+                await Task.Delay(3000, ct);
+            }
+        }
+
+        private void LogPorts(JObject server)
+        {
+            if (!(server["network_ports"] is JArray ports) || ports.Count == 0)
+            {
+                Log("сервер запущен, портов в ответе нет");
+                return;
+            }
+            foreach (var p in ports)
+            {
+                var tls = (bool?)p["tls_enabled"] ?? false;
+                Log($"адрес: {(string)p["name"]} {(int?)p["internal_port"]}/{(string)p["protocol"]} → {(tls ? "wss" : "ws")}://{(string)p["host"]}:{(int?)p["external_port"]}");
+            }
+        }
+
+        private async Task LogBuildTailAsync(string buildId, CancellationToken ct)
+        {
+            try
+            {
+                var logs = await _api.GetAsync($"/api/v3/builds/{Uri.EscapeDataString(buildId)}/logs?limit=500", ct);
+                if (!(logs["logs"] is JArray items)) return;
+                foreach (var e in items.Skip(Math.Max(0, items.Count - 15)))
+                    Log($"[{(string)e["level"]}] {(string)e["phase"]}: {(string)e["message"]}");
+            }
+            catch (Exception ex) when (!(ex is OperationCanceledException))
+            {
+                Log("логи обработки не получены: " + ex.Message);
+            }
+        }
+    }
+
+    // ================================================================ HTTP
+
+    internal sealed class PlayFlowApi
+    {
+        // Один клиент на домен: заливка zip — минуты, отдельный таймаут на каждый запрос — через токен.
+        private static readonly HttpClient Http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+
+        private readonly string _base;
+        private readonly string _key;
+
+        public PlayFlowApi(string apiBase, string key)
+        {
+            _base = apiBase;
+            _key = key;
+        }
+
+        public static string Normalize(string apiBase)
+        {
+            var b = (apiBase ?? "").Trim().TrimEnd('/');
+            return b.Length == 0 ? PlayFlowUploadStep.DefaultApi : b;
+        }
+
+        public Task<JObject> GetAsync(string path, CancellationToken ct) => SendAsync(HttpMethod.Get, path, null, ct);
+
+        public Task<JObject> PostAsync(string path, JObject body, CancellationToken ct) => SendAsync(HttpMethod.Post, path, body, ct);
+
+        private async Task<JObject> SendAsync(HttpMethod method, string path, JObject body, CancellationToken ct)
+        {
+            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            using (var req = new HttpRequestMessage(method, _base + path))
+            {
+                timeout.CancelAfter(TimeSpan.FromSeconds(60));
+                req.Headers.Add("api-key", _key);
+                req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                if (body != null) req.Content = new StringContent(body.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
+
+                using (var r = await Http.SendAsync(req, timeout.Token).ConfigureAwait(false))
+                {
+                    var text = await r.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    if (!r.IsSuccessStatusCode)
+                        throw new InvalidOperationException($"PlayFlow API: {method} {path} — {(int)r.StatusCode} {Explain((int)r.StatusCode)} {ErrorText(text)}".TrimEnd());
+                    try { return string.IsNullOrWhiteSpace(text) ? new JObject() : JObject.Parse(text); }
+                    catch (Exception) { throw new InvalidOperationException($"PlayFlow API: {method} {path} — ответ не JSON"); }
+                }
+            }
+        }
+
+        /// <summary>PUT zip по presigned-ссылке: без api-key (ссылка сама подписана).</summary>
+        public static async Task UploadAsync(string url, HttpContent content, CancellationToken ct)
+        {
+            using (var req = new HttpRequestMessage(HttpMethod.Put, url) { Content = content })
+            using (var r = await Http.SendAsync(req, ct).ConfigureAwait(false))
+            {
+                if (!r.IsSuccessStatusCode)
+                {
+                    var text = await r.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    throw new InvalidOperationException($"PlayFlow: заливка zip — {(int)r.StatusCode} {Short(text)}".TrimEnd());
+                }
+            }
+        }
+
+        private static string Explain(int code)
+        {
+            switch (code)
+            {
+                case 401: return "(ключ не принят)";
+                case 403: return "(нет прав — нужен серверный ключ pf_…, не клиентский)";
+                case 404: return "(не найдено — проверьте instance id / build id)";
+                case 429: return "(слишком часто — лимит API)";
+                default:  return "";
+            }
+        }
+
+        private static string ErrorText(string text)
+        {
+            try
+            {
+                var o = JObject.Parse(text);
+                var detail = (string)o["detail"] ?? (string)o["error"];
+                if (!string.IsNullOrEmpty(detail)) return "— " + detail;
+            }
+            catch (Exception) { /* не JSON */ }
+            return Short(text);
+        }
+
+        private static string Short(string text)
+        {
+            text = (text ?? "").Trim();
+            return text.Length <= 300 ? text : text.Substring(0, 300) + "…";
+        }
+    }
+
+    /// <summary>Поток-обёртка: сообщает долю прочитанного (для прогресса заливки).</summary>
+    internal sealed class ProgressStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly long _length;
+        private readonly Action<float> _report;
+        private long _read;
+
+        public ProgressStream(Stream inner, long length, Action<float> report)
+        {
+            _inner = inner;
+            _length = Math.Max(1, length);
+            _report = report;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var n = _inner.Read(buffer, offset, count);
+            _read += n;
+            _report((float)_read / _length);
+            return n;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => _inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => _inner.Length;
+        public override long Position { get => _inner.Position; set { _inner.Position = value; _read = value; } }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { var p = _inner.Seek(offset, origin); _read = p; return p; }
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    // ================================================================ ключ
+
+    /// <summary>Личный файл UserSettings/…/app/playflow-credentials.json.</summary>
+    [Serializable]
+    internal sealed class PlayFlowCredentials
+    {
+        public string apiKey = "";
+
+        public static PlayFlowCredentials Load(string path) => JsonStore.Load<PlayFlowCredentials>(path);
+
+        public void Save(string path) => JsonStore.Save(path, this);
+    }
+
+    internal readonly struct PlayFlowKey
+    {
+        public readonly string Value;
+        public readonly string Describe;
+
+        private PlayFlowKey(string value, string describe)
+        {
+            Value = value;
+            Describe = describe;
+        }
+
+        /// <summary>Сначала личный файл, потом переменная окружения. Сам ключ наружу не описывается.</summary>
+        public static PlayFlowKey Resolve(string credsPath, PlayFlowUploadStep.Settings s)
+        {
+            var personal = PlayFlowCredentials.Load(credsPath).apiKey?.Trim();
+            if (!string.IsNullOrEmpty(personal)) return new PlayFlowKey(personal, "личный");
+            var env = string.IsNullOrWhiteSpace(s.apiKeyEnv) ? null : Environment.GetEnvironmentVariable(s.apiKeyEnv.Trim());
+            if (!string.IsNullOrWhiteSpace(env)) return new PlayFlowKey(env.Trim(), $"переменная {s.apiKeyEnv.Trim()}");
+            return new PlayFlowKey(null, "нет");
+        }
+    }
+}

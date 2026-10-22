@@ -76,6 +76,7 @@ namespace Exerussus.Nexus.UI
             if (root == null) return;
             root.Clear();
             root.style.backgroundColor = NexusTheme.Get(NexusToken.BgHard);
+            NexusTheme.ApplyTo(root);
             root.style.flexDirection = FlexDirection.Column;
 
             // --- тулбар ---

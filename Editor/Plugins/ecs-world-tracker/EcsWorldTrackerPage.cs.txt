@@ -61,7 +61,8 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         string _inspSig;
         readonly List<Label> _inspBodies = new List<Label>();
 
-        Color T(NexusToken tok) => Context.Theme.Get(tok);
+        // Цвета — только классами хаба (nx-*, NexusClass) и переменными палитры в USS страницы:
+        // в коде нет ни одного цвета, смена палитры перекрашивает построенное.
 
         // ── lifecycle ────────────────────────────────────────────────────────────
         protected override void OnInitialize() => LoadPrefs();
@@ -70,7 +71,6 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             _root = new VisualElement(); _root.AddToClassList("ecs-root"); _root.style.flexGrow = 1;
             var uss = Context.LoadDeployedAsset<StyleSheet>("EcsWorldTrackerPage.uss");
             if (uss != null) _root.styleSheets.Add(uss);
-            PaintBg(_root, NexusToken.BgHard);
             // Подписку на тик вешаем на события панели — их шлёт сам UI Toolkit,
             // когда элемент реально появляется/уходит с экрана. Не зависит от того,
             // зовёт ли хаб OnEnter/OnExit.
@@ -140,27 +140,21 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         VisualElement BuildToolbar() {
-            var tb = new VisualElement(); tb.AddToClassList("ecs-toolbar"); BorderColor(tb, NexusToken.Border);
-            tb.Add(TabButton("Обзор", Tab.Overview));
-            tb.Add(TabButton("Настройки", Tab.Settings));
+            var tb = new VisualElement(); tb.AddToClassList("ecs-toolbar");
+            tb.Add(Context.Ui.Tabs(new[] { "Обзор", "Настройки" }, (int)_tab, i => { _tab = (Tab)i; Render(); }));
             tb.Add(Spacer());
-            _toolInfo = new Label(); _toolInfo.AddToClassList("ecs-row-sub"); _toolInfo.style.marginRight = 8;
+            _toolInfo = new Label(); _toolInfo.AddToClassList("ecs-toolinfo");
             tb.Add(_toolInfo);
-            tb.Add(Context.Ui.Button(NexusRole.Common, "Refresh", RefreshAll));
+            tb.Add(Btn(NexusRole.Common, "Refresh", RefreshAll));
             UpdateToolInfo();
             return tb;
-        }
-
-        Button TabButton(string label, Tab tab) {
-            var active = _tab == tab;
-            return Context.Ui.Button(active ? NexusRole.Primary : NexusRole.Ghost, label, () => { _tab = tab; Render(); });
         }
 
         void UpdateToolInfo() {
             if (_toolInfo == null) return;
             var on = _link.Available;
             _toolInfo.text = (on ? "ECS online" : "ECS offline") + " · " + (_focused ? "focus" : "idle") + " · " + RateLabel() + " · ↻ " + _stamp;
-            _toolInfo.style.color = T(on ? NexusToken.TextDim : NexusToken.Warning);
+            NexusClass.SetFg(_toolInfo, on ? NexusToken.TextDim : NexusToken.Warning);
         }
 
         string RateLabel() => _intervalMs <= 0 ? "вручную" : (1000f / _intervalMs).ToString("0.##", CultureInfo.InvariantCulture) + " Гц";
@@ -168,8 +162,8 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         // ── OVERVIEW ───────────────────────────────────────────────────────────────
         void BuildOverview() {
             var body = new VisualElement(); body.AddToClassList("ecs-body");
-            _worldPane = Pane("ecs-world-pane"); BorderColor(_worldPane, NexusToken.Border);
-            _entityPane = Pane("ecs-entity-pane"); BorderColor(_entityPane, NexusToken.Border);
+            _worldPane = Pane("ecs-world-pane");
+            _entityPane = Pane("ecs-entity-pane");
             _inspectorPane = Pane("ecs-inspector-pane");
             body.Add(_worldPane); body.Add(_entityPane); body.Add(_inspectorPane);
             _content.Add(body);
@@ -204,7 +198,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             var scroll = new ScrollView(); scroll.AddToClassList("ecs-scroll");
             for (var i = 0; i < n; i++) {
                 var group = _link.WorldGroup(i);
-                if (group != curGroup) { curGroup = group; if (!string.IsNullOrEmpty(group)) scroll.Add(Dim(group)); }
+                if (group != curGroup) { curGroup = group; if (!string.IsNullOrEmpty(group)) scroll.Add(Group(group)); }
                 scroll.Add(WorldRow(i));
             }
             _worldPane.Add(scroll);
@@ -238,21 +232,18 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         VisualElement WorldRow(int i) {
-            var row = new VisualElement(); row.AddToClassList("ecs-row");
-            var sel = i == _worldIndex;
-            PaintBg(row, sel ? NexusToken.Selection : NexusToken.BgSoft);
+            var row = Context.Ui.ListRow(() => { _worldIndex = i; _archExpanded = null; RefreshWorlds(); RefreshEntities(); RefreshInspector(); }, i == _worldIndex);
+            row.AddToClassList("ecs-row");
             var st = _link.WorldStats(i);
-            var name = new Label(_link.WorldName(i)); name.style.color = T(sel ? NexusToken.OnAccent : NexusToken.TextNormal);
+            var name = new Label(_link.WorldName(i)); name.AddToClassList("ecs-row-name");
             var sub = new Label(st[0] + " ent · " + st[3] + " pools"); sub.AddToClassList("ecs-row-sub");
-            sub.style.color = T(sel ? NexusToken.OnAccent : NexusToken.TextDim);
-            var col = new VisualElement(); col.Add(name); col.Add(sub); row.Add(col);
+            var col = new VisualElement(); col.style.flexShrink = 1; col.Add(name); col.Add(sub); row.Add(col);
             if (!_link.WorldAlive(i)) row.Add(Context.Ui.Badge(NexusRole.Muted, "dead"));
-            row.RegisterCallback<ClickEvent>(_ => { _worldIndex = i; _archExpanded = null; RefreshWorlds(); RefreshEntities(); RefreshInspector(); });
             return row;
         }
 
         VisualElement WorldStatsCard(int i) {
-            var card = Context.Ui.Card();
+            var card = Context.Ui.Card(); card.AddToClassList("ecs-stats");
             var st = _link.WorldStats(i);
             long bytes = SumPoolBytes(i);
             card.Add(KV("alive", st[0].ToString()));
@@ -279,20 +270,16 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             _entityPane.Add(Title("ENTITIES"));
             if (!_link.Available || _worldIndex < 0) { _entityPane.Add(Empty("—")); return; }
             _entityPane.Add(ViewTabs());
-            if (_view == View.Matrix) { var c = Context.Ui.Card(); c.Add(Dim("Плотный вид (матрица) — v2")); _entityPane.Add(c); return; }
+            if (_view == View.Matrix) { _entityPane.Add(Empty("Плотный вид (матрица) — v2")); return; }
             if (_view == View.Archetypes && _archExpanded == null) { BuildArchetypes(); return; }
             BuildQueryBar();
             BuildEntityList();
         }
 
         VisualElement ViewTabs() {
-            var tabs = new VisualElement(); tabs.AddToClassList("ecs-viewtabs");
-            AddTab(tabs, "List", View.List); AddTab(tabs, "Archetypes", View.Archetypes); AddTab(tabs, "Matrix", View.Matrix);
+            var tabs = Context.Ui.Segmented(new[] { "List", "Archetypes", "Matrix" }, (int)_view, i => { _view = (View)i; _archExpanded = null; RefreshEntities(); });
+            tabs.AddToClassList("ecs-viewtabs");
             return tabs;
-        }
-
-        void AddTab(VisualElement host, string label, View v) {
-            host.Add(Context.Ui.Button(_view == v ? NexusRole.Primary : NexusRole.Ghost, label, () => { _view = v; _archExpanded = null; RefreshEntities(); }));
         }
 
         void BuildArchetypes() {
@@ -303,12 +290,11 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             foreach (var r in rows) {
                 var p = r.Split(EcsBridgeLink.US);
                 var csv = p[0]; var count = p.Length > 1 ? p[1] : "0";
-                var row = new VisualElement(); row.AddToClassList("ecs-row"); PaintBg(row, NexusToken.BgSoft);
+                var row = Context.Ui.ListRow(() => { _archExpanded = csv; RefreshEntities(); }); row.AddToClassList("ecs-row");
                 var lbl = new Label(string.IsNullOrEmpty(csv) ? "(без компонентов)" : csv.Replace(",", ", "));
-                lbl.style.color = T(NexusToken.TextNormal); lbl.style.whiteSpace = WhiteSpace.Normal; lbl.style.flexShrink = 1;
+                lbl.AddToClassList("ecs-row-name"); lbl.AddToClassList("ecs-arch");
                 row.Add(lbl);
                 var pill = CountPill(count); _archCounts[csv] = pill; row.Add(pill);
-                row.RegisterCallback<ClickEvent>(_ => { _archExpanded = csv; RefreshEntities(); });
                 scroll.Add(row);
             }
             _entityPane.Add(scroll);
@@ -317,8 +303,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
 
         // счётчик в строке архетипа — собственный Label (не Ui.Badge), чтобы менять текст на месте
         Label CountPill(string text) {
-            var l = new Label(text); l.AddToClassList("ecs-chip"); PaintBg(l, NexusToken.AccentSoft);
-            l.style.color = T(NexusToken.Accent); l.style.flexShrink = 0;
+            var l = new Label(text); l.AddToClassList("ecs-count");
             return l;
         }
 
@@ -348,21 +333,21 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
 
         void BuildQueryBar() {
             if (_archExpanded != null)
-                _entityPane.Add(Context.Ui.Button(NexusRole.Ghost, "← все архетипы", () => { _archExpanded = null; RefreshEntities(); }));
+                _entityPane.Add(Btn(NexusRole.Ghost, "← все архетипы", () => { _archExpanded = null; RefreshEntities(); }, "ecs-back"));
 
-            _chipsRow = new VisualElement(); _chipsRow.AddToClassList("ecs-chips"); BorderColor(_chipsRow, NexusToken.Border);
+            _chipsRow = new VisualElement(); _chipsRow.AddToClassList("ecs-chips"); _chipsRow.AddToClassList("nx-inset");
             RenderChips(); _entityPane.Add(_chipsRow);
 
             var add = new VisualElement(); add.AddToClassList("ecs-inline"); add.style.marginBottom = 6;
             var input = Context.Ui.Input("", _ => { }); input.style.flexGrow = 1; add.Add(input);
-            add.Add(Context.Ui.Button(NexusRole.Success, "+incl", () => { AddChip(input.value, _inc); input.value = ""; }));
-            add.Add(Context.Ui.Button(NexusRole.Alarm, "−excl", () => { AddChip(input.value, _exc); input.value = ""; }));
+            add.Add(Btn(NexusRole.Success, "+incl", () => { AddChip(input.value, _inc); input.value = ""; }));
+            add.Add(Btn(NexusRole.Alarm, "−excl", () => { AddChip(input.value, _exc); input.value = ""; }));
             _entityPane.Add(add);
 
             var idRow = new VisualElement(); idRow.AddToClassList("ecs-inline"); idRow.style.marginBottom = 6;
             idRow.Add(Dim("id"));
             var idInput = Context.Ui.Input(_idFilter, v => { _idFilter = v; RunQuery(); UpdateMatch(); }); idInput.style.flexGrow = 1; idRow.Add(idInput);
-            _matchLabel = new Label(); _matchLabel.AddToClassList("ecs-row-sub"); _matchLabel.style.color = T(NexusToken.TextDim); _matchLabel.style.marginLeft = 6;
+            _matchLabel = new Label(); _matchLabel.AddToClassList("nx-hint"); _matchLabel.AddToClassList("ecs-match");
             idRow.Add(_matchLabel); _entityPane.Add(idRow);
         }
 
@@ -375,17 +360,17 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         void RenderChips() {
             if (_chipsRow == null) return;
             _chipsRow.Clear();
-            AddChipViews(_inc, NexusToken.AccentSoft, NexusToken.Accent, "+");
-            AddChipViews(_exc, NexusToken.ErrorSoft, NexusToken.Error, "−");
+            AddChipViews(_inc, "ecs-chip--inc", "+");
+            AddChipViews(_exc, "ecs-chip--exc", "−");
             if (_inc.Count + _exc.Count == 0) _chipsRow.Add(Dim("фильтр по компонентам…"));
-            else _chipsRow.Add(Context.Ui.Button(NexusRole.Ghost, "clear", () => { _inc.Clear(); _exc.Clear(); RenderChips(); RunQuery(); UpdateMatch(); }));
+            else _chipsRow.Add(Btn(NexusRole.Ghost, "clear", () => { _inc.Clear(); _exc.Clear(); RenderChips(); RunQuery(); UpdateMatch(); }));
         }
 
-        void AddChipViews(List<string> list, NexusToken bg, NexusToken fg, string sign) {
+        void AddChipViews(List<string> list, string kind, string sign) {
             foreach (var name in list) {
-                var chip = new VisualElement(); chip.AddToClassList("ecs-chip"); PaintBg(chip, bg);
-                var l = new Label(sign + " " + name); l.style.color = T(fg); chip.Add(l);
-                var x = new Label(" ✕"); x.style.color = T(fg);
+                var chip = new VisualElement(); chip.AddToClassList("ecs-chip"); chip.AddToClassList(kind);
+                var l = new Label(sign + " " + name); chip.Add(l);
+                var x = new Label("✕"); x.AddToClassList("ecs-chip-x");
                 x.RegisterCallback<ClickEvent>(_ => { list.Remove(name); RenderChips(); RunQuery(); UpdateMatch(); });
                 chip.Add(x); _chipsRow.Add(chip);
             }
@@ -396,7 +381,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             _entityList = new ListView { fixedItemHeight = 22, selectionType = SelectionType.Single };
             _entityList.AddToClassList("ecs-entity-list");
             _entityList.itemsSource = _rows;
-            _entityList.makeItem = () => { var l = new Label(); l.AddToClassList("ecs-mono"); l.style.paddingLeft = 6; l.style.color = T(NexusToken.TextNormal); return l; };
+            _entityList.makeItem = () => { var l = new Label(); l.AddToClassList("ecs-entity"); return l; };
             _entityList.bindItem = (e, i) => ((Label)e).text = RowLabel(_rows[i]);
             _entityList.selectionChanged += OnEntityPicked;
             _entityPane.Add(_entityList);
@@ -443,10 +428,10 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             _inspectorPane.Add(Title("INSPECTOR"));
             if (!_link.Available || _worldIndex < 0 || _selId < 0) { _inspectorPane.Add(Empty("выбери сущность")); return; }
 
-            var head = new VisualElement(); head.AddToClassList("ecs-inline"); head.style.marginBottom = 6;
-            var h = new Label("entity #" + _selId + ":" + _selGen); h.style.color = T(NexusToken.TextNormal); h.style.flexGrow = 1; head.Add(h);
-            head.Add(Context.Ui.Button(_pinned ? NexusRole.Primary : NexusRole.Ghost, "pin", () => { _pinned = !_pinned; RefreshInspector(); }));
-            head.Add(Context.Ui.Button(_watch ? NexusRole.Primary : NexusRole.Ghost, "watch", () => { _watch = !_watch; RefreshInspector(); }));
+            var head = new VisualElement(); head.AddToClassList("ecs-inline"); head.AddToClassList("ecs-insp-head");
+            var h = Context.Ui.Title("entity #" + _selId + ":" + _selGen); h.style.flexGrow = 1; head.Add(h);
+            head.Add(Btn(_pinned ? NexusRole.Primary : NexusRole.Ghost, "pin", () => { _pinned = !_pinned; RefreshInspector(); }));
+            head.Add(Btn(_watch ? NexusRole.Primary : NexusRole.Ghost, "watch", () => { _watch = !_watch; RefreshInspector(); }));
             _inspectorPane.Add(head);
 
             if (!_link.EntityAliveGen(_worldIndex, _selId, _selGen)) {
@@ -489,14 +474,13 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         VisualElement ComponentCard(string typeName, string body) {
-            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
+            var card = Context.Ui.Card(); card.AddToClassList("ecs-card");
             var headRow = new VisualElement(); headRow.AddToClassList("ecs-card-head");
-            var tn = new Label(typeName); tn.style.color = T(NexusToken.TextNormal); headRow.Add(tn);
-            headRow.Add(Context.Ui.Button(NexusRole.Ghost, "+incl", () => AddChip(typeName, _inc)));
+            var tn = new Label(typeName); tn.AddToClassList("ecs-type"); headRow.Add(tn);
+            headRow.Add(Btn(NexusRole.Ghost, "+incl", () => AddChip(typeName, _inc)));
             card.Add(headRow);
 
-            var bodyLbl = new Label(BodyText(body)); bodyLbl.AddToClassList("ecs-card-body"); bodyLbl.AddToClassList("ecs-mono");
-            bodyLbl.style.color = T(NexusToken.TextDim); bodyLbl.style.whiteSpace = WhiteSpace.Normal;
+            var bodyLbl = Context.Ui.Code(BodyText(body)); bodyLbl.AddToClassList("ecs-card-body");
             card.Add(bodyLbl);
             _inspBodies.Add(bodyLbl);
 
@@ -505,7 +489,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
                 var rr = new VisualElement(); rr.AddToClassList("ecs-inline"); rr.style.flexWrap = Wrap.Wrap; rr.style.marginTop = 4;
                 foreach (var e in refs) {
                     int id = e.Key, gen = e.Value;
-                    rr.Add(Context.Ui.Button(NexusRole.Info, "→ #" + id + ":" + gen, () => { _selId = id; _selGen = gen; RefreshInspector(); }));
+                    rr.Add(Btn(NexusRole.Ghost, "→ #" + id + ":" + gen, () => { _selId = id; _selGen = gen; RefreshInspector(); }));
                 }
                 card.Add(rr);
             }
@@ -539,48 +523,37 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         VisualElement SettingsCore() {
-            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
-            var title = new Label("ECS-ядро"); title.AddToClassList("ecs-settings-title"); title.style.color = T(NexusToken.TextNormal); card.Add(title);
-            var desc = new Label("Форк Exerussus.EcsLite едет в плагине и разворачивается наружу, в Assets/. Это внешний footprint — он не стирается при выключении страницы.");
-            desc.AddToClassList("ecs-settings-desc"); desc.style.color = T(NexusToken.TextDim); card.Add(desc);
-            _statusCore = new Label(); _statusCore.AddToClassList("ecs-row-sub"); card.Add(_statusCore);
+            var card = SettingsCard("ECS-ядро", "Форк Exerussus.EcsLite едет в плагине и разворачивается наружу, в Assets/. Это внешний footprint — он не стирается при выключении страницы.");
+            _statusCore = new Label(); _statusCore.AddToClassList("ecs-status"); card.Add(_statusCore);
             var row = new VisualElement(); row.AddToClassList("ecs-inline"); row.style.marginTop = 8;
-            row.Add(Context.Ui.Button(NexusRole.Primary, "Развернуть ядро", DeployCore));
-            row.Add(Context.Ui.Button(NexusRole.Alarm, "Удалить", RemoveCore));
+            row.Add(Btn(NexusRole.Primary, "Развернуть ядро", DeployCore));
+            row.Add(Btn(NexusRole.Alarm, "Удалить", RemoveCore));
             card.Add(row);
             RefreshCoreStatus();
             return card;
         }
 
         VisualElement SettingsRefresh() {
-            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
-            var title = new Label("Автообновление"); title.AddToClassList("ecs-settings-title"); title.style.color = T(NexusToken.TextNormal); card.Add(title);
-            var desc = new Label("Обновляет данные, пока окно открыто — даже без фокуса. «Вручную» отключает автообновление (работает кнопка Refresh).");
-            desc.AddToClassList("ecs-settings-desc"); desc.style.color = T(NexusToken.TextDim); card.Add(desc);
+            var card = SettingsCard("Автообновление", "Обновляет данные, пока окно открыто — даже без фокуса. «Вручную» отключает автообновление (работает кнопка Refresh).");
 
-            var presets = new VisualElement(); presets.AddToClassList("ecs-presets");
-            AddPreset(presets, "Вручную", 0);
-            AddPreset(presets, "1 Гц", 1000);
-            AddPreset(presets, "4 Гц", 250);
-            AddPreset(presets, "10 Гц", 100);
+            var presets = Context.Ui.Segmented(PresetLabels, Array.IndexOf(PresetMs, _intervalMs), i => { _intervalMs = PresetMs[i]; _lastTick = 0; UpdateToolInfo(); Render(); });
+            presets.AddToClassList("ecs-presets");
             card.Add(presets);
 
             var custom = new VisualElement(); custom.AddToClassList("ecs-inline");
             custom.Add(Dim("Своя частота, Гц:"));
             var hz = Context.Ui.Input(_intervalMs > 0 ? (1000f / _intervalMs).ToString("0.##", CultureInfo.InvariantCulture) : "", _ => { });
             hz.style.width = 70; custom.Add(hz);
-            custom.Add(Context.Ui.Button(NexusRole.Common, "Применить", () => ApplyHz(hz.value)));
+            custom.Add(Btn(NexusRole.Common, "Применить", () => ApplyHz(hz.value)));
             card.Add(custom);
 
-            var now = new Label("Сейчас: " + RateLabel()); now.AddToClassList("ecs-row-sub"); now.style.color = T(NexusToken.TextDim); now.style.marginTop = 6;
+            var now = new Label("Сейчас: " + RateLabel()); now.AddToClassList("nx-hint"); now.AddToClassList("ecs-now");
             card.Add(now);
             return card;
         }
 
-        void AddPreset(VisualElement host, string label, int ms) {
-            var active = _intervalMs == ms;
-            host.Add(Context.Ui.Button(active ? NexusRole.Primary : NexusRole.Ghost, label, () => { _intervalMs = ms; _lastTick = 0; UpdateToolInfo(); Render(); }));
-        }
+        static readonly string[] PresetLabels = { "Вручную", "1 Гц", "4 Гц", "10 Гц" };
+        static readonly int[] PresetMs = { 0, 1000, 250, 100 };
 
         void ApplyHz(string raw) {
             var s = (raw ?? "").Trim().Replace(',', '.');
@@ -594,13 +567,17 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         VisualElement SettingsNaming() {
-            var card = new VisualElement(); card.AddToClassList("ecs-card"); PaintBg(card, NexusToken.BgRaised); BorderColor(card, NexusToken.Border);
-            var title = new Label("Имена миров"); title.AddToClassList("ecs-settings-title"); title.style.color = T(NexusToken.TextNormal); card.Add(title);
-            var desc = new Label("Имя можно задать прямо в конструкторе — оно станет меткой мира в дереве. Имя из EcsSystems.AddWorld(name) перекрывает его.");
-            desc.AddToClassList("ecs-settings-desc"); desc.style.color = T(NexusToken.TextDim); card.Add(desc);
-            var code = new Label("var combat = new EcsWorld(name: \"combat\");\n// или:  new EcsWorld(cfg, \"combat\");\nstring n = combat.GetName();");
-            code.AddToClassList("ecs-code"); code.AddToClassList("ecs-mono"); code.style.color = T(NexusToken.TextNormal); PaintBg(code, NexusToken.BgHard);
+            var card = SettingsCard("Имена миров", "Имя можно задать прямо в конструкторе — оно станет меткой мира в дереве. Имя из EcsSystems.AddWorld(name) перекрывает его.");
+            var code = Context.Ui.Code("var combat = new EcsWorld(name: \"combat\");\n// или:  new EcsWorld(cfg, \"combat\");\nstring n = combat.GetName();");
+            code.AddToClassList("ecs-code");
             card.Add(code);
+            return card;
+        }
+
+        VisualElement SettingsCard(string title, string desc) {
+            var card = Context.Ui.Card(); card.AddToClassList("ecs-settings-card");
+            card.Add(Context.Ui.Title(title));
+            var d = new Label(desc); d.AddToClassList("nx-hint"); d.AddToClassList("ecs-settings-desc"); card.Add(d);
             return card;
         }
 
@@ -610,8 +587,8 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
 
         void RefreshCoreStatus() {
             if (_statusCore == null) return;
-            if (File.Exists(CoreFileAbs)) { _statusCore.text = "развёрнуто · Assets/" + CoreDirRel + "/" + CoreFile; _statusCore.style.color = T(NexusToken.Ok); }
-            else { _statusCore.text = "не развёрнуто — нужен форк ECS в проекте"; _statusCore.style.color = T(NexusToken.Warning); }
+            if (File.Exists(CoreFileAbs)) { _statusCore.text = "развёрнуто · Assets/" + CoreDirRel + "/" + CoreFile; NexusClass.SetFg(_statusCore, NexusToken.Ok); }
+            else { _statusCore.text = "не развёрнуто — нужен форк ECS в проекте"; NexusClass.SetFg(_statusCore, NexusToken.Warning); }
         }
 
         void DeployCore() {
@@ -683,29 +660,33 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         // ── ui helpers ──────────────────────────────────────────────────────────────
-        Label Title(string t) { var l = new Label(t); l.AddToClassList("ecs-pane-title"); l.style.color = T(NexusToken.TextFaint); return l; }
-        Label Dim(string t) { var l = new Label(t); l.AddToClassList("ecs-row-sub"); l.style.color = T(NexusToken.TextDim); l.style.marginRight = 6; return l; }
-        Label Empty(string t) { var l = new Label(t); l.AddToClassList("ecs-empty"); l.style.color = T(NexusToken.TextDim); return l; }
+        // Подпись панели — мелкий капслок хаба; заголовки карточек — Context.Ui.Title.
+        Label Title(string t) { var l = new Label(t); l.AddToClassList("nx-label"); l.AddToClassList("ecs-pane-title"); return l; }
+        Label Group(string t) { var l = new Label(t); l.AddToClassList("nx-label"); l.AddToClassList("ecs-group"); return l; }
+        Label Dim(string t) { var l = new Label(t); l.AddToClassList("nx-hint"); l.AddToClassList("ecs-dim"); return l; }
+        Label Empty(string t) { var l = new Label(t); l.AddToClassList("nx-empty"); return l; }
         VisualElement Spacer() { var s = new VisualElement(); s.AddToClassList("ecs-spacer"); return s; }
 
+        // Кнопки страницы — компактные (nx-btn--sm): панели узкие, действий много.
+        Button Btn(NexusRole role, string text, Action onClick, string cls = null) {
+            var b = Context.Ui.Button(role, text, onClick);
+            b.AddToClassList("nx-btn--sm");
+            if (cls != null) b.AddToClassList(cls);
+            return b;
+        }
+
         VisualElement KV(string k, string v) {
-            var row = new VisualElement(); row.style.flexDirection = FlexDirection.Row; row.style.justifyContent = Justify.SpaceBetween;
-            var kk = new Label(k); kk.style.color = T(NexusToken.TextDim); kk.style.fontSize = 12;
-            var vv = new Label(v); vv.style.color = T(NexusToken.TextNormal); vv.style.fontSize = 12;
+            var row = new VisualElement(); row.AddToClassList("nx-kv");
+            var kk = new Label(k); kk.AddToClassList("nx-kv__key");
+            var vv = new Label(v); vv.AddToClassList("nx-kv__value");
             row.Add(kk); row.Add(vv); return row;
         }
 
         VisualElement Bar(float ratio) {
-            var bar = new VisualElement(); bar.AddToClassList("ecs-bar"); PaintBg(bar, NexusToken.Border);
-            var fill = new VisualElement(); fill.AddToClassList("ecs-bar-fill"); PaintBg(fill, NexusToken.Accent);
+            var bar = new VisualElement(); bar.AddToClassList("nx-bar");
+            var fill = new VisualElement(); fill.AddToClassList("nx-bar__fill");
             fill.style.width = Length.Percent(Mathf.Clamp01(ratio) * 100f);
             bar.Add(fill); return bar;
-        }
-
-        void PaintBg(VisualElement e, NexusToken tok) { if (e != null) e.style.backgroundColor = T(tok); }
-        void BorderColor(VisualElement e, NexusToken tok) {
-            if (e == null) return; var c = T(tok);
-            e.style.borderTopColor = c; e.style.borderBottomColor = c; e.style.borderLeftColor = c; e.style.borderRightColor = c;
         }
 
         static string FormatBytes(long b) {

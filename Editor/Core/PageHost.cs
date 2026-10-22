@@ -193,6 +193,8 @@ namespace Exerussus.Nexus.Core
             }
             catch (Exception ex)
             {
+                // Полный стек — в консоль: по одному «Object reference not set…» место не найти.
+                NexusDiagnostics.Error($"Страница '{id}' упала при сборке", ex);
                 return Fault(entry, ex.Message);
             }
         }

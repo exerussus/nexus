@@ -14,29 +14,22 @@ namespace Exerussus.Nexus.Pages.Workspace
         {
             var root = new VisualElement { name = "ws-group" };
             root.AddToClassList("ws-group");
-            root.style.backgroundColor = Col(NexusToken.BgSoft);
-            SetBorder(root, Col(NexusToken.Border));
 
             // --- Шапка ---
             var header = new VisualElement();
             header.AddToClassList("ws-group-header");
-            header.style.backgroundColor = Col(NexusToken.BgHard);
-            header.style.borderBottomColor = Col(NexusToken.Border);
 
             var chevron = new Label(group.collapsed ? "\u25B8" : "\u25BE");
             chevron.AddToClassList("ws-group-chevron");
-            chevron.style.color = Col(NexusToken.TextDim);
             header.Add(chevron);
 
-            var title = new Label(group.name);
+            var title = Context.Ui.Title(group.name);
             title.AddToClassList("ws-group-title");
-            title.style.color = Col(NexusToken.TextNormal);
             header.Add(title);
 
             int count = group.entries.Count;
             var countLabel = new Label(count == 0 ? "пусто" : count.ToString());
             countLabel.AddToClassList("ws-group-count");
-            countLabel.style.color = Col(NexusToken.TextDim);
             header.Add(countLabel);
 
             var spacer = new VisualElement();
@@ -46,10 +39,7 @@ namespace Exerussus.Nexus.Pages.Workspace
             var del = new Button(() => DeleteGroup(group)) { text = "\u00D7" };
             del.AddToClassList("ws-group-del");
             del.tooltip = "Удалить эту группу";
-            del.style.backgroundColor = Color.clear;
-            del.style.color = Col(NexusToken.TextDim);
-            del.RegisterCallback<PointerEnterEvent>(_ => del.style.color = Col(NexusToken.Error));
-            del.RegisterCallback<PointerLeaveEvent>(_ => del.style.color = Col(NexusToken.TextDim));
+            del.RemoveFromClassList(Button.ussClassName);   // вид — из USS страницы, не из темы редактора
             header.Add(del);
 
             // Клик по шапке сворачивает раздел; двойной клик по заголовку — переименование.
@@ -81,7 +71,6 @@ namespace Exerussus.Nexus.Pages.Workspace
                         ? "Перетащите сюда ассеты или объекты сцены"
                         : "Нет карточек по фильтру");
                     hint.AddToClassList("ws-drop-hint");
-                    hint.style.color = Col(NexusToken.TextDim);
                     body.Add(hint);
                 }
                 else
@@ -177,31 +166,20 @@ namespace Exerussus.Nexus.Pages.Workspace
             card.style.width = size;
             card.style.height = size;
             if (entry.pinned) card.AddToClassList("ws-card--pinned");
-            if (missing)
-            {
-                card.AddToClassList("ws-card--missing");
-                card.style.opacity = 0.85f;
-            }
+            if (missing) card.AddToClassList("ws-card--missing");
 
-            // Цвета: база + ховер. Бордер зависит от состояния (закреплено/отсутствует).
-            Color baseBorder = entry.pinned ? Col(NexusToken.Accent)
-                : missing ? Col(NexusToken.Error)
-                : Col(NexusToken.Border);
-            Color hoverBorder = missing ? Col(NexusToken.Error) : Col(NexusToken.Accent);
-            Color baseBg = Col(NexusToken.BgRaised);
-            WireHover(card, baseBg, Col(NexusToken.Hover), baseBorder, hoverBorder);
+            // Цвета и состояния (наведение, закреплено, отсутствует) — в USS; свечение — хабом.
+            Context.Ui.Glow(card);
 
             // Тип-метка в углу (A / S / F).
             var kindTag = new Label(KindTag(entry.kind));
             kindTag.AddToClassList("ws-card-kind");
-            kindTag.style.color = Col(NexusToken.TextDim);
             card.Add(kindTag);
 
             if (entry.pinned)
             {
                 var pin = new Label("\u25C9");
                 pin.AddToClassList("ws-card-pin");
-                pin.style.color = Col(NexusToken.Accent);
                 card.Add(pin);
             }
 
@@ -211,18 +189,17 @@ namespace Exerussus.Nexus.Pages.Workspace
 
             var name = new Label(string.IsNullOrEmpty(entry.cachedName) ? "(без имени)" : entry.cachedName);
             name.AddToClassList("ws-card-name");
-            name.style.color = Col(NexusToken.TextNormal);
             card.Add(name);
 
             var sub = new Label(missing ? "отсутствует" : ShortTypeName(entry));
             sub.AddToClassList("ws-card-sub");
-            sub.style.color = missing ? Col(NexusToken.Error) : Col(NexusToken.TextDim);
+            if (missing) sub.AddToClassList("ws-card-sub--error");
             card.Add(sub);
 
             card.tooltip = BuildInfo(entry, obj);
 
             WireCardInteractions(card, group, entry, missing);
-            MaybeFlash(card, entry, baseBg, baseBorder);
+            MaybeFlash(card, entry);
             return card;
         }
 
@@ -241,28 +218,22 @@ namespace Exerussus.Nexus.Pages.Workspace
             card.style.height = size;
             if (entry.pinned) card.AddToClassList("ws-card--pinned");
 
-            // Набор: фон глубокий, рамка акцентная (левая полоса 3px задаётся в USS).
-            Color baseBg = Col(NexusToken.BgHard);
-            Color baseBorder = Col(NexusToken.Accent);
-            WireHover(card, baseBg, Col(NexusToken.Hover), baseBorder, Col(NexusToken.Accent));
+            // Набор: утопленный фон, акцентная полоса слева — в USS.
+            Context.Ui.Glow(card);
 
             var kindTag = new Label("[ ]");
             kindTag.AddToClassList("ws-card-kind");
-            kindTag.style.color = Col(NexusToken.TextDim);
             card.Add(kindTag);
 
-            // Бейдж с количеством элементов (заливка Accent, цифра — на самом тёмном фоне для контраста).
+            // Бейдж с количеством элементов (заливка акцентом, цифра — цветом «на акценте»).
             var countBadge = new Label(total.ToString());
             countBadge.AddToClassList("ws-card-count");
-            countBadge.style.backgroundColor = Col(NexusToken.Accent);
-            countBadge.style.color = Col(NexusToken.BgHard);
             card.Add(countBadge);
 
             if (entry.pinned)
             {
                 var pin = new Label("\u25C9");
                 pin.AddToClassList("ws-card-pin");
-                pin.style.color = Col(NexusToken.Accent);
                 card.Add(pin);
             }
 
@@ -278,36 +249,27 @@ namespace Exerussus.Nexus.Pages.Workspace
 
             var name = new Label(BundleDisplayName(entry));
             name.AddToClassList("ws-card-name");
-            name.style.color = Col(NexusToken.TextNormal);
             card.Add(name);
 
             var sub = new Label(resolved == total ? $"{total} элем." : $"{resolved}/{total} элем.");
             sub.AddToClassList("ws-card-sub");
-            sub.style.color = resolved != total ? Col(NexusToken.Warning) : Col(NexusToken.TextDim);
             if (resolved != total) sub.AddToClassList("ws-card-sub--warn");
             card.Add(sub);
 
             card.tooltip = BuildBundleInfo(entry);
 
             WireCardInteractions(card, group, entry, missing: false);
-            MaybeFlash(card, entry, baseBg, baseBorder);
+            MaybeFlash(card, entry);
             return card;
         }
 
         /// <summary>Подсветка только что добавленной/дублированной карточки.</summary>
-        private void MaybeFlash(VisualElement card, WorkspaceEntry entry, Color baseBg, Color baseBorder)
+        private void MaybeFlash(VisualElement card, WorkspaceEntry entry)
         {
             if (_flashKey == null || entry.StableKey != _flashKey) return;
             _flashKey = null;
             card.AddToClassList("ws-card--flash");
-            card.style.backgroundColor = Col(NexusToken.Selection);
-            SetBorder(card, Col(NexusToken.Accent));
-            card.schedule.Execute(() =>
-            {
-                card.RemoveFromClassList("ws-card--flash");
-                card.style.backgroundColor = baseBg;
-                SetBorder(card, baseBorder);
-            }).StartingIn(750);
+            card.schedule.Execute(() => card.RemoveFromClassList("ws-card--flash")).StartingIn(750);
         }
 
         /// <summary>Инлайновое переименование набора (имя на самой карточке).</summary>

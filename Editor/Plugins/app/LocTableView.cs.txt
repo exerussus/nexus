@@ -1,0 +1,1578 @@
+// ============================================================
+//  LocTableView.cs — подвкладка «Таблица» вкладки «Локализация»: список ключей и конструктор строки.
+//
+//  Слева — ключи: как видит игрок (основной язык, с примерами вместо аргументов) и тип строки
+//  (Aa простой текст, {0} аргументы из кода, N зависит от числа, live живое значение игры).
+//  Справа — конструктор выбранного ключа: режим, аргументы с описаниями и примерами (хранятся
+//  комментарием над ключом в .loc: «# {0}: описание = пример»), поля языков или формы окончаний
+//  с подсказками чисел, панель вставки (аргументы, живые значения, жирный, цвет, перенос),
+//  проверки с исправлением в один клик, предпросмотр и готовый код.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Exerussus.AppCore.Editor.Localization;
+using Exerussus.AppCore.Localization;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class LocTableView
+    {
+        private const string AllGroups = "Все группы";
+        private const float KeyWidth = 210f;
+        private const float TypeWidth = 46f;
+        private const float PanelWidth = 560f;
+        private const float ListHeight = 640f;
+
+        private enum Mode { Simple, Args, Plural }
+
+        private readonly AppKit _kit;
+        private readonly LocalizationTab _owner;
+        private readonly List<LocEntry> _view = new();
+        private readonly List<string> _unknown = new();
+        private readonly Dictionary<string, Mode> _modeOverride = new(StringComparer.Ordinal);
+
+        private Dictionary<string, List<string>> _usage;
+
+        private string _search = string.Empty;
+        private string _group = AllGroups;
+        private bool _onlyMissing;
+        private bool _onlyUnused;
+        private string _newKey = string.Empty;
+
+        private string _selected;
+        private string _activeLanguage;
+        private string _activeForm;
+        private TextField _activeField;
+        private double _previewNumber = 21;
+
+        private ListView _list;
+        private Label _summary;
+        private Button _save;
+        private VisualElement _panel;
+        private VisualElement _checksHost;
+        private VisualElement _previewHost;
+        private Label _snippet;
+        private readonly Dictionary<string, Label> _formMarks = new();
+
+        public LocTableView(AppKit kit, LocalizationTab owner)
+        {
+            _kit = kit;
+            _owner = owner;
+        }
+
+        private IPageContext Context => _kit.Context;
+        private LocTable Table => _owner.Table;
+        private IReadOnlyList<LocLanguage> Languages => Table.Languages;
+        private string Primary => Languages.Count > 0 ? Languages[0].Code : "ru";
+
+        // ============================================================ окончания
+
+        private static readonly Dictionary<string, string> FormLabels = new()
+        {
+            ["zero"] = "ноль", ["one"] = "одна штука", ["two"] = "две штуки",
+            ["few"] = "несколько", ["many"] = "много",
+        };
+
+        /// <summary>Формы, которые различает правило языка (кроме other — это основное значение).</summary>
+        public static List<string> FormsOf(LocLanguage language)
+        {
+            var rule = PluralRules.RuleFor(language);
+            var seen = new HashSet<PluralCategory>();
+
+            for (var n = 0; n <= 200; n++) seen.Add(PluralRules.Select(rule, n));
+            seen.Add(PluralRules.Select(rule, 1.5));
+
+            var forms = new List<string>();
+            foreach (PluralCategory category in Enum.GetValues(typeof(PluralCategory)))
+                if (category != PluralCategory.Other && seen.Contains(category)) forms.Add(LocSlots.FormOf(category));
+            return forms;
+        }
+
+        /// <summary>Подсказка «для каких чисел»: первые числа категории и дробь, если попадает.</summary>
+        private static string NumbersFor(LocLanguage language, PluralCategory category)
+        {
+            var rule = PluralRules.RuleFor(language);
+            var numbers = new List<string>();
+            for (var n = 0; n <= 120 && numbers.Count < 6; n++)
+                if (PluralRules.Select(rule, n) == category) numbers.Add(n.ToString());
+
+            if (PluralRules.Select(rule, 1.5) == category) numbers.Add("1.5");
+            if (numbers.Count == 0) return "—";
+            return string.Join(", ", numbers) + "…";
+        }
+
+        // ============================================================ скан
+
+        public void Rescan()
+        {
+            try
+            {
+                _usage = LocKeyScanner.Scan();
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                Context.SetStatus("Скан проекта не удался — подробности в консоли.", StatusKind.Error);
+                _usage = null;
+            }
+
+            CollectUnknown();
+        }
+
+        private void CollectUnknown()
+        {
+            _unknown.Clear();
+            if (_usage == null || Table == null) return;
+
+            var settings = LocSettings.Current;
+            foreach (var key in _usage.Keys)
+                if (!Table.Contains(key) && !LocKeyScanner.IsBuiltin(key) && !LocKeyScanner.IsDynamic(key, settings))
+                    _unknown.Add(key);
+
+            _unknown.Sort(StringComparer.Ordinal);
+        }
+
+        private bool IsUsed(string key) =>
+            LocKeyScanner.IsDynamic(key, LocSettings.Current) || (_usage != null && _usage.ContainsKey(key));
+
+        private int UsageCount(string key) => _usage != null && _usage.TryGetValue(key, out var files) ? files.Count : 0;
+
+        // ============================================================ разметка
+
+        public VisualElement Build()
+        {
+            if (_usage == null) Rescan();
+
+            var root = new VisualElement();
+
+            if (_owner.ParseErrors.Count > 0)
+            {
+                var errors = string.Join("\n", _owner.ParseErrors.Take(12).Select(e => e.ToString()));
+                root.Add(_kit.Status(StatusKind.Error, $"Файл таблицы читается с ошибками: {_owner.ParseErrors.Count}", errors));
+            }
+
+            var columns = _kit.Row();
+            columns.style.flexWrap = Wrap.NoWrap;
+            columns.style.alignItems = Align.FlexStart;
+            root.Add(columns);
+
+            var left = new VisualElement();
+            left.style.flexGrow = 1;
+            left.style.flexShrink = 1;
+            left.style.minWidth = 320f;
+            left.style.marginRight = 14f;
+            columns.Add(left);
+
+            left.Add(Toolbar());
+            left.Add(Filters());
+            if (_unknown.Count > 0) left.Add(UnknownCard());
+            left.Add(Header());
+
+            _list = new ListView
+            {
+                fixedItemHeight = 30f,
+                selectionType = SelectionType.Single,
+                makeItem = MakeRow,
+                bindItem = BindRow,
+                itemsSource = _view,
+            };
+            _list.style.height = ListHeight;
+            _list.selectionChanged += items =>
+            {
+                foreach (var item in items)
+                    if (item is LocEntry entry) Select(entry.Key);
+            };
+            left.Add(_list);
+
+            _summary = _kit.Faint(string.Empty);
+            _summary.style.marginTop = 6f;
+            left.Add(_summary);
+            left.Add(_kit.Faint("«Тип»: Aa — простой текст · {0} — аргументы из кода · N — зависит от числа · live — живое значение игры. " +
+                                "Клик по строке открывает конструктор справа."));
+
+            _panel = new VisualElement();
+            _panel.style.width = PanelWidth;
+            _panel.style.flexShrink = 0;
+            columns.Add(_panel);
+
+            ApplyFilter();
+            RenderPanel();
+            return root;
+        }
+
+        private VisualElement Toolbar()
+        {
+            var bar = _kit.Row();
+            bar.style.marginBottom = 8f;
+
+            _save = _kit.Btn(NexusRole.Primary, "Сохранить", () =>
+            {
+                _owner.Save();
+                UpdateSummary();
+            });
+            bar.Add(_save);
+            bar.Add(_kit.Btn(NexusRole.Common, "Перечитать", _owner.Refresh, small: true));
+            bar.Add(_kit.Btn(NexusRole.Common, "Сканировать проект", () =>
+            {
+                Rescan();
+                _owner.Render();
+            }, small: true));
+
+            bar.Add(_kit.Gap(12f));
+
+            var key = _kit.Input(_newKey, v => _newKey = v);
+            key.tooltip = "Новый ключ: ГРУППА_СМЫСЛ, например MENU_SETTINGS";
+            key.style.width = 190f;
+            bar.Add(key);
+            bar.Add(_kit.Gap(6f));
+            bar.Add(_kit.Btn(NexusRole.Success, "+ Ключ", () => AddKey(key), small: true));
+            return bar;
+        }
+
+        private VisualElement Filters()
+        {
+            var bar = _kit.Row();
+            bar.style.marginBottom = 8f;
+
+            var search = _kit.Input(_search, v =>
+            {
+                _search = v ?? string.Empty;
+                ApplyFilter();
+            });
+            search.tooltip = "Поиск по ключу и тексту на любом языке";
+            search.style.width = KeyWidth;
+            bar.Add(search);
+            bar.Add(_kit.Gap(8f));
+
+            var groups = new List<string> { AllGroups };
+            groups.AddRange(Table.Entries.Select(e => GroupOf(e.Key)).Distinct().OrderBy(g => g, StringComparer.Ordinal));
+            if (!groups.Contains(_group)) _group = AllGroups;
+
+            var group = _kit.Dropdown(null, groups, groups.IndexOf(_group), i =>
+            {
+                _group = groups[i];
+                ApplyFilter();
+            });
+            group.style.width = 140f;
+            bar.Add(group);
+            bar.Add(_kit.Gap(8f));
+
+            bar.Add(_kit.Check("С пропусками", _onlyMissing, v =>
+            {
+                _onlyMissing = v;
+                ApplyFilter();
+            }));
+
+            var unused = _kit.Check("Без использования", _onlyUnused, v =>
+            {
+                _onlyUnused = v;
+                ApplyFilter();
+            });
+            unused.SetEnabled(_usage != null);
+            bar.Add(unused);
+            return bar;
+        }
+
+        private VisualElement UnknownCard()
+        {
+            var card = _kit.Card($"Нет в таблице: {_unknown.Count}", "Ключи из кода, вёрстки, префабов и сцен, которых нет в таблице — там сейчас «???».",
+                                 _kit.Btn(NexusRole.Warning, "Добавить все", () =>
+                                 {
+                                     foreach (var key in _unknown) Table.GetOrAdd(key);
+                                     _owner.MarkDirty();
+                                     CollectUnknown();
+                                     _owner.Render();
+                                     Context.SetStatus("Ключи добавлены без переводов — заполните и сохраните.", StatusKind.Warning);
+                                 }, small: true));
+
+            foreach (var key in _unknown.Take(8))
+                card.Add(_kit.Mono($"^{key} — {string.Join(", ", _usage[key].Take(2))}", NexusToken.TextDim));
+            if (_unknown.Count > 8) card.Add(_kit.Faint($"… и ещё {_unknown.Count - 8}"));
+            return card;
+        }
+
+        private VisualElement Header()
+        {
+            var header = _kit.Row();
+            header.style.flexWrap = Wrap.NoWrap;
+            header.style.borderBottomWidth = 1f;
+            header.AddToClassList(NexusClass.Border(NexusToken.Divider));
+            header.style.paddingLeft = 8f;
+            header.style.paddingBottom = 4f;
+            header.style.marginBottom = 2f;
+
+            header.Add(HeaderCell("Ключ", KeyWidth));
+            var preview = HeaderCell($"Как видит игрок ({Primary})", 0f);
+            preview.style.flexGrow = 1;
+            header.Add(preview);
+            header.Add(HeaderCell("Тип", TypeWidth));
+            return header;
+        }
+
+        private Label HeaderCell(string text, float width)
+        {
+            var label = _kit.Text(text, NexusToken.TextDim, 11);
+            label.style.unityFontStyleAndWeight = FontStyle.Bold;
+            if (width > 0f) label.style.width = width;
+            label.style.flexShrink = 0;
+            return label;
+        }
+
+        // ============================================================ строки списка
+
+        private VisualElement MakeRow()
+        {
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            row.style.paddingLeft = 8f;
+            row.style.paddingRight = 6f;
+            row.style.height = 30f;
+
+            var key = _kit.Text(string.Empty, NexusToken.TextNormal, 12);
+            key.style.width = KeyWidth;
+            key.style.flexShrink = 0;
+            key.style.unityFontStyleAndWeight = FontStyle.Bold;
+            key.style.whiteSpace = WhiteSpace.NoWrap;
+            key.style.overflow = Overflow.Hidden;
+            key.style.textOverflow = TextOverflow.Ellipsis;
+            row.Add(key);
+
+            var preview = _kit.Text(string.Empty, NexusToken.TextDim, 12);
+            preview.style.flexGrow = 1;
+            preview.style.flexShrink = 1;
+            preview.style.whiteSpace = WhiteSpace.NoWrap;
+            preview.style.overflow = Overflow.Hidden;
+            preview.style.textOverflow = TextOverflow.Ellipsis;
+            preview.enableRichText = false;
+            row.Add(preview);
+
+            var type = _kit.Text(string.Empty, NexusToken.TextFaint, 12);
+            type.style.width = TypeWidth;
+            type.style.flexShrink = 0;
+            type.style.unityFontStyleAndWeight = FontStyle.Bold;
+            type.style.unityTextAlign = TextAnchor.MiddleCenter;
+            row.Add(type);
+            return row;
+        }
+
+        private void BindRow(VisualElement element, int index)
+        {
+            if (index < 0 || index >= _view.Count) return;
+
+            var entry = _view[index];
+            var key = (Label)element[0];
+            var preview = (Label)element[1];
+            var type = (Label)element[2];
+
+            key.text = entry.Key;
+            preview.text = RowPreview(entry);
+
+            var mode = ModeOf(entry);
+            var live = HasLiveTokens(entry);
+            var args = ArgsOf(entry);
+            NexusToken color;
+            if (mode == Mode.Plural) { type.text = "N"; color = NexusToken.TagBlue; }
+            else if (mode == Mode.Simple) { type.text = "Aa"; color = NexusToken.TextFaint; }
+            else if (args.Count == 0 && live) { type.text = "live"; color = NexusToken.TagGreen; }
+            else { type.text = "{0}"; color = NexusToken.TagAmber; }
+            NexusClass.SetFg(type, color);
+
+            var missingPrimary = entry.Find(Primary) == null;
+            NexusClass.SetFg(key, missingPrimary ? NexusToken.Error : NexusToken.TextNormal);
+        }
+
+        private string RowPreview(LocEntry entry)
+        {
+            var language = Table.GetLanguage(Primary);
+            var args = ArgsOf(entry);
+
+            string text;
+            if (ModeOf(entry) == Mode.Plural)
+            {
+                text = string.Join(" · ", new[] { 1, 3, 5 }.Select(n => Render(entry, language, args, n)));
+            }
+            else
+            {
+                text = Render(entry, language, args, null);
+            }
+
+            return StripTags(text);
+        }
+
+        // ============================================================ модель ключа
+
+        private static readonly Regex ArgComment = new(@"^#\s*\{(\d+)\}:\s*(.*?)(?:\s*=\s*(.*))?$", RegexOptions.Compiled);
+        private static readonly Regex ArgUse = new(@"\{(\d+)(?:[:,][^}]*)?\}", RegexOptions.Compiled);
+        private static readonly Regex LiveToken = new(@"<!?[a-z]:[^<>]+>", RegexOptions.Compiled);
+        private static readonly Regex Tags = new(@"<[^<>]+>", RegexOptions.Compiled);
+
+        private sealed class ArgInfo
+        {
+            public string Description = string.Empty;
+            public string Sample = string.Empty;
+        }
+
+        /// <summary>Аргументы ключа: из комментариев «# {0}: описание = пример», дополненные по тексту.</summary>
+        private static List<ArgInfo> ArgsOf(LocEntry entry)
+        {
+            var args = new List<ArgInfo>();
+
+            foreach (var comment in entry.Comments)
+            {
+                var m = ArgComment.Match(comment.Trim());
+                if (!m.Success) continue;
+
+                var index = int.Parse(m.Groups[1].Value);
+                while (args.Count <= index) args.Add(new ArgInfo());
+                args[index].Description = m.Groups[2].Value.Trim();
+                args[index].Sample = m.Groups[3].Success ? m.Groups[3].Value.Trim() : string.Empty;
+            }
+
+            return args;
+        }
+
+        private static void WriteArgs(LocEntry entry, List<ArgInfo> args)
+        {
+            entry.Comments.RemoveAll(c => ArgComment.IsMatch(c.Trim()));
+            for (var i = 0; i < args.Count; i++)
+            {
+                var a = args[i];
+                var line = $"# {{{i}}}: {a.Description}";
+                if (!string.IsNullOrEmpty(a.Sample)) line += " = " + a.Sample;
+                entry.Comments.Add(line);
+            }
+        }
+
+        private static bool HasLiveTokens(LocEntry entry) => entry.Values.Any(v => v.Text != null && LiveToken.IsMatch(v.Text));
+
+        private static int MaxArgUsed(LocEntry entry)
+        {
+            var max = -1;
+            foreach (var value in entry.Values)
+            {
+                if (value.Text == null) continue;
+                foreach (Match m in ArgUse.Matches(value.Text)) max = Math.Max(max, int.Parse(m.Groups[1].Value));
+            }
+
+            return max;
+        }
+
+        private Mode ModeOf(LocEntry entry)
+        {
+            if (_modeOverride.TryGetValue(entry.Key, out var mode)) return mode;
+            if (entry.Values.Any(v => !string.IsNullOrEmpty(v.Form))) return Mode.Plural;
+            if (MaxArgUsed(entry) >= 0 || HasLiveTokens(entry) || ArgsOf(entry).Count > 0) return Mode.Args;
+            return Mode.Simple;
+        }
+
+        /// <summary>Текст как увидит игрок: форма по числу, примеры аргументов, примеры живых значений.</summary>
+        private string Render(LocEntry entry, LocLanguage language, List<ArgInfo> args, double? number)
+        {
+            if (language == null) return string.Empty;
+
+            string pattern;
+            if (number.HasValue)
+            {
+                var form = ShownForm(entry, language, number.Value);
+                pattern = entry.Find(language.Code, form)?.Text ?? entry.Find(language.Code)?.Text;
+            }
+            else
+            {
+                pattern = entry.Find(language.Code)?.Text;
+            }
+
+            if (pattern == null) return "—";
+
+            var text = ArgUse.Replace(pattern, m =>
+            {
+                var i = int.Parse(m.Groups[1].Value);
+                if (i == 0 && number.HasValue) return number.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                return i < args.Count && !string.IsNullOrEmpty(args[i].Sample) ? args[i].Sample : m.Value;
+            });
+
+            return LocValueCatalog.Preview(text);
+        }
+
+        /// <summary>Какая форма будет показана для числа (null — основное значение).</summary>
+        private static string ShownForm(LocEntry entry, LocLanguage language, double number)
+        {
+            var category = PluralRules.Select(PluralRules.RuleFor(language), number);
+            if (category == PluralCategory.Other) return null;
+
+            var form = LocSlots.FormOf(category);
+            return entry.Find(language.Code, form) != null ? form : null;
+        }
+
+        private static string StripTags(string text) => Tags.Replace(text ?? string.Empty, string.Empty).Replace('\n', ' ');
+
+        // ============================================================ конструктор
+
+        private void Select(string key)
+        {
+            if (_selected == key) return;
+            _selected = key;
+            _activeLanguage = Primary;
+            _activeForm = null;
+            _activeField = null;
+            RenderPanel();
+        }
+
+        private void RenderPanel()
+        {
+            if (_panel == null) return;
+            _panel.Clear();
+            _formMarks.Clear();
+
+            var entry = _selected != null ? Table.Get(_selected) : null;
+            if (entry == null)
+            {
+                var empty = new VisualElement();
+                empty.style.height = ListHeight;
+                empty.style.borderTopWidth = 1f; empty.style.borderBottomWidth = 1f;
+                empty.style.borderLeftWidth = 1f; empty.style.borderRightWidth = 1f;
+                empty.AddToClassList(NexusClass.Border(NexusToken.Border));
+                AppKit.SetRadius(empty, _kit.Metrics.RadiusL);
+                empty.style.alignItems = Align.Center;
+                empty.style.justifyContent = Justify.Center;
+                empty.Add(_kit.Faint("Выберите ключ слева — откроется конструктор строки"));
+                _panel.Add(empty);
+                return;
+            }
+
+            var card = Context.Ui.Card();
+            card.style.paddingLeft = 14f; card.style.paddingRight = 14f;
+            card.style.paddingTop = 12f; card.style.paddingBottom = 12f;
+
+            var scroll = new ScrollView(ScrollViewMode.Vertical);
+            scroll.style.maxHeight = ListHeight + 60f;
+            card.Add(scroll);
+            var body = scroll.contentContainer;
+            _panel.Add(card);
+
+            var mode = ModeOf(entry);
+            var args = ArgsOf(entry);
+
+            body.Add(PanelHeader(entry));
+            body.Add(ModeSwitch(entry, mode));
+
+            if (mode == Mode.Args) body.Add(ArgsEditor(entry, args));
+            if (mode != Mode.Simple) body.Add(InsertBar(entry, mode, args));
+
+            if (mode == Mode.Plural) body.Add(PluralEditor(entry));
+            else body.Add(FlatEditor(entry));
+
+            _checksHost = _kit.Row();
+            _checksHost.style.marginTop = 10f;
+            body.Add(_checksHost);
+
+            _previewHost = new VisualElement();
+            body.Add(_previewHost);
+
+            var code = _kit.Row();
+            code.style.marginTop = 10f;
+            _snippet = _kit.Code(string.Empty);
+            _snippet.style.marginRight = 8f;
+            code.Add(_snippet);
+            code.Add(_kit.Btn(NexusRole.Ghost, "Копировать", () =>
+            {
+                EditorGUIUtility.systemCopyBuffer = _snippet.text;
+                Context.SetStatus("Код скопирован.", StatusKind.Ok);
+            }, small: true));
+            body.Add(code);
+
+            UpdateLive();
+        }
+
+        private VisualElement PanelHeader(LocEntry entry)
+        {
+            var head = _kit.Row();
+            head.style.flexWrap = Wrap.NoWrap;
+            head.style.marginBottom = 10f;
+
+            var key = new TextField { value = entry.Key, isDelayed = true };
+            key.tooltip = "Переименовать ключ";
+            key.style.flexGrow = 1;
+            key.style.marginLeft = 0f;
+            key.RegisterValueChangedCallback(e => RenameKey(entry, key, e.previousValue, e.newValue));
+            head.Add(key);
+            head.Add(_kit.Gap(8f));
+
+            var uses = UsageCount(entry.Key);
+            var usage = _usage == null ? "проект не сканировали"
+                : uses > 0 ? $"используется в {uses} файл(ах)"
+                : LocKeyScanner.IsDynamic(entry.Key, LocSettings.Current) ? "собирается кодом"
+                : "нигде не используется";
+            var tag = _kit.Tag(uses > 0 ? NexusTagColor.Blue : NexusTagColor.Amber, usage);
+            if (uses > 0) tag.tooltip = string.Join("\n", _usage[entry.Key].Take(15));
+            head.Add(tag);
+            head.Add(_kit.Gap(6f));
+
+            head.Add(_kit.Btn(NexusRole.Alarm, "Удалить", () => DeleteKey(entry), small: true));
+            head.Add(_kit.Btn(NexusRole.Ghost, "✕", () =>
+            {
+                _selected = null;
+                _list.ClearSelection();
+                RenderPanel();
+            }, small: true));
+            return head;
+        }
+
+        private VisualElement ModeSwitch(LocEntry entry, Mode mode)
+        {
+            var root = new VisualElement();
+            root.style.marginBottom = 8f;
+
+            var names = new[] { "Простой текст", "С аргументами", "Зависит от числа" };
+            root.Add(Context.Ui.Segmented(names, (int)mode, i => SetMode(entry, (Mode)i)));
+
+            var hint = mode switch
+            {
+                Mode.Simple => $"Перевод без подстановок. В вёрстке пишется text=\"^{entry.Key}\" — страница переведёт сама.",
+                Mode.Args => "Код передаёт значения по порядку: первое встанет на место {0}, второе — {1}. Живые значения игры код не передаёт — они подставляются сами.",
+                _ => "Слово после числа меняется: 1 сценарий, 3 сценария, 5 сценариев. Заполните строку для каждой формы — какую показать, язык выберет сам по числу.",
+            };
+            var label = _kit.Hint(hint);
+            label.style.marginTop = 6f;
+            root.Add(label);
+            return root;
+        }
+
+        private void SetMode(LocEntry entry, Mode mode)
+        {
+            _modeOverride[entry.Key] = mode;
+
+            if (mode == Mode.Plural)
+            {
+                var args = ArgsOf(entry);
+                if (args.Count == 0)
+                {
+                    args.Add(new ArgInfo { Description = "число", Sample = "5" });
+                    WriteArgs(entry, args);
+                }
+
+                foreach (var language in Languages)
+                {
+                    var main = entry.Find(language.Code);
+                    if (main?.Text != null && !main.Text.Contains("{0")) main.Text = "{0} " + main.Text;
+                }
+            }
+
+            _owner.MarkDirty();
+            RenderPanel();
+            _list.RefreshItems();
+        }
+
+        // ---------- аргументы ----------
+
+        private VisualElement ArgsEditor(LocEntry entry, List<ArgInfo> args)
+        {
+            var root = new VisualElement();
+            root.style.marginBottom = 8f;
+
+            var title = _kit.Row();
+            title.Add(_kit.Title("Аргументы"));
+            title.Add(_kit.Gap(8f));
+            title.Add(_kit.Faint("что передаёт код, по порядку · описание и пример — комментарием в .loc"));
+            title.style.marginBottom = 6f;
+            root.Add(title);
+
+            for (var i = 0; i < args.Count; i++)
+            {
+                var index = i;
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginBottom = 4f;
+
+                var token = _kit.Tag(NexusTagColor.Amber, "{" + i + "}");
+                token.style.width = 40f;
+                row.Add(token);
+                row.Add(_kit.Gap(6f));
+
+                var desc = _kit.Input(args[i].Description, v =>
+                {
+                    var current = ArgsOf(entry);
+                    while (current.Count <= index) current.Add(new ArgInfo());
+                    current[index].Description = v ?? string.Empty;
+                    WriteArgs(entry, current);
+                    _owner.MarkDirty();
+                    UpdateLive();
+                });
+                desc.tooltip = "Что это за значение";
+                desc.style.flexGrow = 1;
+                row.Add(desc);
+                row.Add(_kit.Gap(6f));
+
+                var sample = _kit.Input(args[i].Sample, v =>
+                {
+                    var current = ArgsOf(entry);
+                    while (current.Count <= index) current.Add(new ArgInfo());
+                    current[index].Sample = v ?? string.Empty;
+                    WriteArgs(entry, current);
+                    _owner.MarkDirty();
+                    UpdateLive();
+                });
+                sample.tooltip = "Пример значения — для предпросмотра";
+                sample.style.width = 90f;
+                row.Add(sample);
+                row.Add(_kit.Gap(4f));
+
+                row.Add(_kit.Btn(NexusRole.Ghost, "✕", () =>
+                {
+                    var current = ArgsOf(entry);
+                    if (index < current.Count) current.RemoveAt(index);
+                    WriteArgs(entry, current);
+                    _owner.MarkDirty();
+                    RenderPanel();
+                }, small: true));
+                root.Add(row);
+            }
+
+            var add = _kit.Btn(NexusRole.Common, "+ Аргумент", () =>
+            {
+                var current = ArgsOf(entry);
+                current.Add(new ArgInfo());
+                WriteArgs(entry, current);
+                _owner.MarkDirty();
+                RenderPanel();
+            }, small: true);
+            add.style.alignSelf = Align.FlexStart;
+            root.Add(add);
+            return root;
+        }
+
+        // ---------- панель вставки ----------
+
+        private VisualElement InsertBar(LocEntry entry, Mode mode, List<ArgInfo> args)
+        {
+            var bar = _kit.Row();
+            bar.style.marginTop = 4f;
+            bar.style.marginBottom = 8f;
+            bar.style.paddingLeft = 6f; bar.style.paddingRight = 6f;
+            bar.style.paddingTop = 5f; bar.style.paddingBottom = 5f;
+            bar.AddToClassList(NexusClass.Bg(NexusToken.BgInset));
+            AppKit.SetRadius(bar, _kit.Metrics.RadiusM);
+
+            bar.Add(_kit.Faint("Вставить в поле с курсором:"));
+            bar.Add(_kit.Gap(6f));
+
+            var count = mode == Mode.Plural ? Math.Min(1, args.Count) : args.Count;
+            for (var i = 0; i < count; i++)
+            {
+                var token = "{" + i + "}";
+                var label = token + " " + (string.IsNullOrEmpty(args[i].Description) ? "аргумент" : args[i].Description);
+                bar.Add(InsertButton(NexusToken.TagAmber, NexusToken.TagAmberSoft, label, () => Insert(entry, token, null)));
+            }
+
+            if (LocValueCatalog.Catalogs.Count > 0)
+                bar.Add(InsertButton(NexusToken.TagGreen, NexusToken.TagGreenSoft, "● Живое значение…", () => OpenLivePopup(entry)));
+
+            bar.Add(InsertButton(NexusToken.TextNormal, NexusToken.BgRaised, "B жирный", () => Insert(entry, "<b>", "</b>")));
+            bar.Add(InsertButton(NexusToken.TextNormal, NexusToken.BgRaised, "◐ цвет…", () => OpenColorPopup(entry)));
+            bar.Add(InsertButton(NexusToken.TextNormal, NexusToken.BgRaised, "↵ перенос", () => Insert(entry, "\n", null)));
+            return bar;
+        }
+
+        private Button InsertButton(NexusToken fg, NexusToken bg, string text, Action onClick)
+        {
+            var b = new Button(onClick) { text = text };
+            b.RemoveFromClassList(Button.ussClassName);
+            b.AddToClassList(NexusClass.Fg(fg));
+            b.AddToClassList(NexusClass.Bg(bg));
+            b.style.borderTopWidth = 0f; b.style.borderBottomWidth = 0f;
+            b.style.borderLeftWidth = 0f; b.style.borderRightWidth = 0f;
+            AppKit.SetRadius(b, _kit.Metrics.RadiusS);
+            b.style.paddingLeft = 7f; b.style.paddingRight = 7f;
+            b.style.paddingTop = 3f; b.style.paddingBottom = 3f;
+            b.style.marginRight = 5f; b.style.marginTop = 2f; b.style.marginBottom = 2f;
+            b.style.fontSize = 11;
+            Context.Ui.Glow(b);
+            return b;
+        }
+
+        /// <summary>
+        /// Вставляет в последнее поле, где стоял курсор: в позицию курсора, а если выделен кусок —
+        /// оборачивает его (<paramref name="close"/> не пустой: жирный, цвет).
+        /// </summary>
+        private void Insert(LocEntry entry, string open, string close)
+        {
+            var field = _activeField;
+            if (field == null || field.panel == null)
+            {
+                Context.SetStatus("Сначала поставьте курсор в поле нужного языка.", StatusKind.Warning);
+                return;
+            }
+
+            var text = field.value ?? string.Empty;
+            var a = Mathf.Clamp(field.textSelection.cursorIndex, 0, text.Length);
+            var b = Mathf.Clamp(field.textSelection.selectIndex, 0, text.Length);
+            var start = Mathf.Min(a, b);
+            var end = Mathf.Max(a, b);
+
+            string result;
+            int caret;
+            if (close != null)
+            {
+                var inner = end > start ? text.Substring(start, end - start) : "текст";
+                result = text.Substring(0, start) + open + inner + close + text.Substring(end);
+                caret = start + open.Length + inner.Length + close.Length;
+            }
+            else
+            {
+                var pad = start > 0 && text[start - 1] != ' ' && open != "\n" ? " " : string.Empty;
+                result = text.Substring(0, start) + pad + open + text.Substring(end);
+                caret = start + pad.Length + open.Length;
+            }
+
+            field.value = result;   // колбэк поля сохранит значение и обновит проверки
+            field.Focus();
+            field.textSelection.cursorIndex = caret;
+            field.textSelection.selectIndex = caret;
+        }
+
+        // ---------- поля ----------
+
+        private VisualElement FlatEditor(LocEntry entry)
+        {
+            var root = new VisualElement();
+            foreach (var language in Languages)
+            {
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.alignItems = Align.FlexStart;
+                row.style.marginBottom = 6f;
+
+                var name = _kit.Text(language.Code + " · " + (language.Name ?? language.Code), NexusToken.TextNormal, 12);
+                name.style.width = 96f;
+                name.style.flexShrink = 0;
+                name.style.paddingTop = 4f;
+                name.style.unityFontStyleAndWeight = FontStyle.Bold;
+                row.Add(name);
+
+                var field = ValueField(entry, language, null);
+                field.style.flexGrow = 1;
+                row.Add(field);
+                root.Add(row);
+            }
+
+            return root;
+        }
+
+        private VisualElement PluralEditor(LocEntry entry)
+        {
+            var root = new VisualElement();
+
+            foreach (var language in Languages)
+            {
+                var forms = FormsOf(language);
+                var required = forms.Count(f => f != "many") + 1;
+
+                var title = _kit.Row();
+                title.style.marginTop = 6f;
+                title.style.marginBottom = 4f;
+                title.Add(_kit.Title(language.Name ?? language.Code));
+                title.Add(_kit.Gap(8f));
+                title.Add(_kit.Faint($"правило {PluralRules.RuleFor(language)} · {required} формы"));
+                root.Add(title);
+
+                foreach (var form in forms)
+                {
+                    var category = (PluralCategory)Array.IndexOf(LocSlots.Forms, form);
+                    var optional = form == "many";
+                    root.Add(FormRow(entry, language, form, FormLabels.TryGetValue(form, out var l) ? l : form,
+                                     NumbersFor(language, category) + (optional ? " · пусто — возьмутся «остальные»" : string.Empty)));
+                }
+
+                var hasFraction = PluralRules.Select(PluralRules.RuleFor(language), 1.5) == PluralCategory.Other;
+                var otherNumbers = NumbersFor(language, PluralCategory.Other);
+                root.Add(FormRow(entry, language, null, "остальные", otherNumbers + (hasFraction ? " · и запасное для пустых форм" : string.Empty)));
+            }
+
+            return root;
+        }
+
+        private VisualElement FormRow(LocEntry entry, LocLanguage language, string form, string label, string hint)
+        {
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            row.style.marginBottom = 4f;
+
+            var texts = new VisualElement();
+            texts.style.width = 170f;
+            texts.style.flexShrink = 0;
+            var name = _kit.Text(label, NexusToken.TextNormal, 12);
+            texts.Add(name);
+            var numbers = _kit.Faint(hint);
+            numbers.style.fontSize = 10;
+            texts.Add(numbers);
+            row.Add(texts);
+
+            _formMarks[LocSlots.Make(language.Code, form)] = name;
+
+            var field = ValueField(entry, language, form);
+            field.style.flexGrow = 1;
+            row.Add(field);
+            return row;
+        }
+
+        private TextField ValueField(LocEntry entry, LocLanguage language, string form)
+        {
+            var field = new TextField { multiline = form == null, value = entry.Find(language.Code, form)?.Text ?? string.Empty };
+            field.style.marginLeft = 0f;
+            field.style.whiteSpace = WhiteSpace.Normal;
+            if (form == "many") field.textEdition.placeholder = "как «остальные»";
+            Context.Ui.Glow(field);
+
+            field.RegisterCallback<FocusInEvent>(_ =>
+            {
+                _activeField = field;
+                _activeLanguage = language.Code;
+                _activeForm = form;
+            });
+
+            field.RegisterValueChangedCallback(e =>
+            {
+                Table.Set(entry.Key, language.Code, e.newValue, form);
+                _owner.MarkDirty();
+                UpdateLive();
+            });
+
+            if (_activeLanguage == language.Code && _activeForm == form) _activeField = field;
+            return field;
+        }
+
+        // ---------- проверки, предпросмотр, код ----------
+
+        private void UpdateLive()
+        {
+            var entry = _selected != null ? Table.Get(_selected) : null;
+            if (entry == null || _checksHost == null) return;
+
+            var mode = ModeOf(entry);
+            var args = ArgsOf(entry);
+
+            RenderChecks(entry, mode, args);
+            RenderPreview(entry, mode, args);
+            _snippet.text = Snippet(entry, mode, args);
+
+            var index = _view.IndexOf(entry);
+            if (index >= 0) _list.RefreshItem(index);
+            UpdateSummary();
+        }
+
+        private void RenderChecks(LocEntry entry, Mode mode, List<ArgInfo> args)
+        {
+            _checksHost.Clear();
+            var problems = 0;
+
+            void Problem(string text, string fixLabel, Action fix)
+            {
+                problems++;
+                var chip = _kit.Row();
+                chip.style.flexWrap = Wrap.NoWrap;
+                chip.AddToClassList(NexusClass.Bg(NexusToken.WarningSoft));
+                AppKit.SetRadius(chip, _kit.Metrics.RadiusM);
+                chip.style.paddingLeft = 8f; chip.style.paddingRight = 8f;
+                chip.style.paddingTop = 3f; chip.style.paddingBottom = 3f;
+                chip.style.marginRight = 6f; chip.style.marginBottom = 4f;
+                chip.Add(_kit.Text(text, NexusToken.Warning, 11));
+                if (fix != null)
+                {
+                    var link = _kit.Text(fixLabel, NexusToken.AccentText, 11);
+                    link.style.marginLeft = 6f;
+                    link.RegisterCallback<PointerDownEvent>(e =>
+                    {
+                        if (e.button != 0) return;
+                        fix();
+                        _owner.MarkDirty();
+                        RenderPanel();
+                    });
+                    chip.Add(link);
+                }
+
+                _checksHost.Add(chip);
+            }
+
+            if (mode == Mode.Args)
+            {
+                for (var i = 0; i < args.Count; i++)
+                {
+                    var index = i;
+                    foreach (var language in Languages)
+                    {
+                        var main = entry.Find(language.Code)?.Text ?? string.Empty;
+                        if (main.Contains("{" + i)) continue;
+                        var code = language.Code;
+                        Problem($"{code}: нет {{{i}}} «{(string.IsNullOrEmpty(args[i].Description) ? "аргумент" : args[i].Description)}»", "добавить в конец",
+                                () => Table.Set(entry.Key, code, (main + " {" + index + "}").Trim()));
+                    }
+                }
+
+                var max = MaxArgUsed(entry);
+                if (max >= args.Count)
+                    Problem($"{{{max}}} не описан", "добавить аргументы", () =>
+                    {
+                        var current = ArgsOf(entry);
+                        while (current.Count <= max) current.Add(new ArgInfo());
+                        WriteArgs(entry, current);
+                    });
+            }
+
+            if (mode == Mode.Plural)
+            {
+                foreach (var language in Languages)
+                {
+                    var code = language.Code;
+                    var main = entry.Find(code)?.Text;
+
+                    if (string.IsNullOrEmpty(main)) Problem($"{code}: пусто «остальные»", null, null);
+                    else if (!main.Contains("{0")) Problem($"{code}: в «остальные» нет числа {{0}}", "добавить в начало", () => Table.Set(entry.Key, code, "{0} " + main));
+
+                    foreach (var form in FormsOf(language))
+                    {
+                        if (form == "many") continue;
+                        var label = FormLabels.TryGetValue(form, out var l) ? l : form;
+                        var text = entry.Find(code, form)?.Text;
+                        var f = form;
+                        if (string.IsNullOrEmpty(text))
+                            Problem($"{code}: пусто «{label}»", main != null ? "скопировать из «остальные»" : null,
+                                    main != null ? () => Table.Set(entry.Key, code, main, f) : null);
+                        else if (!text.Contains("{0"))
+                            Problem($"{code}: в «{label}» нет числа {{0}}", "добавить в начало", () => Table.Set(entry.Key, code, "{0} " + text, f));
+                    }
+                }
+            }
+
+            foreach (var language in Languages)
+            {
+                var all = string.Join(" ", entry.Values.Where(v => v.Text != null && LocSlots.Same(v.Language, language.Code)).Select(v => v.Text));
+                var open = Regex.Matches(all, "<color=").Count;
+                var close = Regex.Matches(all, "</color>").Count;
+                if (open != close) Problem($"{language.Code}: тег цвета не закрыт", null, null);
+            }
+
+            if (problems == 0)
+            {
+                var ok = _kit.Status(StatusKind.Ok, "Всё сходится во всех языках");
+                ok.style.marginTop = 0f;
+                _checksHost.Add(ok);
+            }
+        }
+
+        private void RenderPreview(LocEntry entry, Mode mode, List<ArgInfo> args)
+        {
+            _previewHost.Clear();
+
+            var box = new VisualElement();
+            box.style.marginTop = 8f;
+            box.AddToClassList(NexusClass.Bg(NexusToken.BgInset));
+            AppKit.SetRadius(box, _kit.Metrics.RadiusM);
+            box.style.paddingLeft = 10f; box.style.paddingRight = 10f;
+            box.style.paddingTop = 8f; box.style.paddingBottom = 8f;
+            _previewHost.Add(box);
+
+            var head = _kit.Row();
+            head.style.marginBottom = 6f;
+            head.Add(_kit.Title("Как увидит игрок"));
+            box.Add(head);
+
+            if (mode == Mode.Plural)
+            {
+                head.Add(_kit.Gap(10f));
+                head.Add(_kit.Faint("число"));
+                head.Add(_kit.Gap(4f));
+                var number = _kit.Input(_previewNumber.ToString(System.Globalization.CultureInfo.InvariantCulture), v =>
+                {
+                    if (double.TryParse((v ?? string.Empty).Replace(',', '.'), System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out var n))
+                    {
+                        _previewNumber = n;
+                        UpdatePreviewOnly(entry);
+                    }
+                });
+                number.style.width = 56f;
+                head.Add(number);
+                head.Add(_kit.Gap(6f));
+
+                foreach (var quick in new[] { 0, 1, 2, 5, 11, 21, 22 })
+                {
+                    var n = quick;
+                    var b = InsertButton(NexusToken.TextNormal,
+                                         Math.Abs(_previewNumber - n) < 1e-9 ? NexusToken.AccentSoft : NexusToken.BgRaised,
+                                         n.ToString(), () =>
+                                         {
+                                             _previewNumber = n;
+                                             RenderPreview(entry, ModeOf(entry), ArgsOf(entry));
+                                         });
+                    head.Add(b);
+                }
+
+                var fraction = InsertButton(NexusToken.TextNormal,
+                                            Math.Abs(_previewNumber - 1.5) < 1e-9 ? NexusToken.AccentSoft : NexusToken.BgRaised,
+                                            "1.5", () =>
+                                            {
+                                                _previewNumber = 1.5;
+                                                RenderPreview(entry, ModeOf(entry), ArgsOf(entry));
+                                            });
+                head.Add(fraction);
+            }
+
+            var lines = new VisualElement { name = "preview-lines" };
+            box.Add(lines);
+            FillPreviewLines(lines, entry, mode, args);
+        }
+
+        private void UpdatePreviewOnly(LocEntry entry)
+        {
+            var lines = _previewHost.Q("preview-lines");
+            if (lines == null) return;
+            lines.Clear();
+            FillPreviewLines(lines, entry, ModeOf(entry), ArgsOf(entry));
+        }
+
+        private void FillPreviewLines(VisualElement lines, LocEntry entry, Mode mode, List<ArgInfo> args)
+        {
+            foreach (var mark in _formMarks.Values)
+            {
+                NexusClass.SetFg(mark, NexusToken.TextNormal);
+                mark.style.unityFontStyleAndWeight = FontStyle.Normal;
+            }
+
+            foreach (var language in Languages)
+            {
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.alignItems = Align.FlexStart;
+                row.style.marginBottom = 3f;
+
+                var code = _kit.Text(language.Code, NexusToken.TextFaint, 11);
+                code.style.width = 28f;
+                row.Add(code);
+
+                string formLabel;
+                string text;
+                if (mode == Mode.Plural)
+                {
+                    var form = ShownForm(entry, language, _previewNumber);
+                    formLabel = form == null ? "остальные" : FormLabels.TryGetValue(form, out var l) ? l : form;
+                    text = Render(entry, language, args, _previewNumber);
+
+                    if (_formMarks.TryGetValue(LocSlots.Make(language.Code, form), out var mark))
+                    {
+                        NexusClass.SetFg(mark, NexusToken.AccentText);
+                        mark.style.unityFontStyleAndWeight = FontStyle.Bold;
+                    }
+                }
+                else
+                {
+                    formLabel = mode == Mode.Simple ? string.Empty : "примеры";
+                    text = Render(entry, language, args, null);
+                }
+
+                var form2 = _kit.Text(formLabel, NexusToken.AccentText, 11);
+                form2.style.width = 96f;
+                form2.style.flexShrink = 0;
+                row.Add(form2);
+
+                var shown = _kit.Text(text, NexusToken.TextNormal, 12);
+                shown.style.unityFontStyleAndWeight = FontStyle.Bold;
+                shown.style.flexShrink = 1;
+                shown.enableRichText = true;
+                row.Add(shown);
+                lines.Add(row);
+            }
+        }
+
+        private static string Snippet(LocEntry entry, Mode mode, List<ArgInfo> args)
+        {
+            var l = "L." + entry.Key;
+            switch (mode)
+            {
+                case Mode.Simple:
+                    return $"text=\"^{entry.Key}\"";
+                case Mode.Plural:
+                    return $"Text.SetPlural(label, {l}, count);";
+                default:
+                    if (args.Count == 0) return $"text=\"^{entry.Key}\"  // значения подставит монитор";
+                    var names = string.Join(", ", args.Select((a, i) => "arg" + i));
+                    return $"Text.Set(label, {l}, {names});";
+            }
+        }
+
+        // ============================================================ поповеры
+
+        private void OpenLivePopup(LocEntry entry)
+        {
+            var values = new List<(ILocValueCatalog catalog, LocValueInfo value)>();
+            foreach (var catalog in LocValueCatalog.Catalogs)
+            foreach (var value in catalog.GetValues())
+                values.Add((catalog, value));
+
+            var window = ScriptableObject.CreateInstance<LocPopupWindow>();
+            window.Ui = Context.Ui;
+            window.titleContent = new GUIContent("Живое значение");
+            window.Build = root =>
+            {
+                root.AddToClassList(NexusClass.Bg(NexusToken.BgRaised));
+                root.style.paddingLeft = 14f; root.style.paddingRight = 14f;
+                root.style.paddingTop = 12f; root.style.paddingBottom = 12f;
+
+                root.Add(_kit.Title("Живое значение"));
+                root.Add(_kit.Hint("Значение из игры подставляется прямо в перевод — код ничего не передаёт."));
+
+                var selected = 0;
+                var live = true;
+                var format = string.Empty;
+                var filter = string.Empty;
+
+                var search = _kit.Input(string.Empty, null);
+                search.style.marginTop = 8f;
+                root.Add(search);
+
+                var list = new ScrollView();
+                list.style.height = 200f;
+                list.style.marginTop = 6f;
+                root.Add(list);
+
+                var options = new VisualElement();
+                root.Add(options);
+
+                var result = _kit.Row();
+                result.style.marginTop = 10f;
+                root.Add(result);
+
+                void Refresh()
+                {
+                    list.Clear();
+                    for (var i = 0; i < values.Count; i++)
+                    {
+                        var (catalog, value) = values[i];
+                        if (filter.Length > 0 && value.Id.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                        var index = i;
+                        var row = _kit.ListRow(() =>
+                        {
+                            selected = index;
+                            format = string.Empty;
+                            Refresh();
+                        }, index == selected);
+                        var kind = _kit.Tag(value.Numeric ? NexusTagColor.Blue : NexusTagColor.Green, value.Kind);
+                        kind.style.width = 64f;
+                        row.Add(kind);
+                        row.Add(_kit.Gap(8f));
+                        var id = _kit.Text(value.Id);
+                        id.style.flexGrow = 1;
+                        row.Add(id);
+                        row.Add(_kit.Faint(value.Sample));
+                        list.Add(row);
+                    }
+
+                    options.Clear();
+                    result.Clear();
+                    if (values.Count == 0)
+                    {
+                        options.Add(_kit.Faint("Каталог проекта пуст."));
+                        return;
+                    }
+
+                    var current = values[Mathf.Clamp(selected, 0, values.Count - 1)];
+                    options.Add(_kit.Check("Обновлять на лету, когда значение меняется", live, v =>
+                    {
+                        live = v;
+                        Refresh();
+                    }));
+
+                    var formats = current.catalog.FormatsFor(current.value);
+                    if (formats.Count > 1)
+                    {
+                        var labels = formats.Select(f => f.label).ToArray();
+                        var at = Math.Max(0, formats.ToList().FindIndex(f => f.format == format));
+                        var seg = Context.Ui.Segmented(labels, at, i =>
+                        {
+                            format = formats[i].format;
+                            Refresh();
+                        });
+                        options.Add(_kit.Labeled("Формат", seg, 70f));
+                    }
+
+                    var token = current.catalog.MakeToken(current.value, live, format);
+                    result.Add(_kit.Faint("Будет вставлено:"));
+                    result.Add(_kit.Gap(6f));
+                    result.Add(_kit.Code(token));
+                    result.Add(_kit.Spacer());
+                    result.Add(_kit.Btn(NexusRole.Common, "Отмена", () => window.Close(), small: true));
+                    result.Add(_kit.Btn(NexusRole.Primary, "Вставить", () =>
+                    {
+                        window.Close();
+                        Insert(entry, token, null);
+                    }, small: true));
+                }
+
+                search.RegisterValueChangedCallback(e =>
+                {
+                    filter = e.newValue ?? string.Empty;
+                    Refresh();
+                });
+
+                Refresh();
+            };
+
+            window.ShowUtility();
+            window.minSize = new Vector2(520f, 420f);
+            window.maxSize = new Vector2(720f, 640f);
+        }
+
+        private void OpenColorPopup(LocEntry entry)
+        {
+            var window = ScriptableObject.CreateInstance<LocPopupWindow>();
+            window.Ui = Context.Ui;
+            window.titleContent = new GUIContent("Цвет");
+            window.Build = root =>
+            {
+                root.AddToClassList(NexusClass.Bg(NexusToken.BgRaised));
+                root.style.paddingLeft = 14f; root.style.paddingRight = 14f;
+                root.style.paddingTop = 12f; root.style.paddingBottom = 12f;
+
+                root.Add(_kit.Title("Цвет"));
+                root.Add(_kit.Hint("Выделенный в поле кусок обернётся тегом цвета. Ничего не выделено — вставится заготовка «текст»."));
+
+                var row = _kit.Row();
+                row.style.marginTop = 10f;
+                foreach (var token in new[] { NexusToken.Ok, NexusToken.Accent, NexusToken.Error, NexusToken.Warning, NexusToken.TagViolet, NexusToken.TagBlue })
+                {
+                    var color = _kit.Tok(token);
+                    var hex = "#" + ColorUtility.ToHtmlStringRGB(color);
+                    var swatch = new Button(() =>
+                    {
+                        window.Close();
+                        Insert(entry, $"<color={hex}>", "</color>");
+                    });
+                    swatch.RemoveFromClassList(Button.ussClassName);
+                    swatch.tooltip = hex;
+                    swatch.style.width = 34f; swatch.style.height = 34f;
+                    swatch.style.marginRight = 8f;
+                    swatch.AddToClassList(NexusClass.Bg(token));   // hex — для тега разметки, вид — классом
+                    AppKit.SetRadius(swatch, _kit.Metrics.RadiusM);
+                    Context.Ui.Glow(swatch);
+                    row.Add(swatch);
+                }
+
+                root.Add(row);
+            };
+
+            window.ShowUtility();
+            window.minSize = new Vector2(360f, 160f);
+            window.maxSize = new Vector2(480f, 220f);
+        }
+
+        // ============================================================ действия
+
+        private void AddKey(TextField input)
+        {
+            var key = (_newKey ?? string.Empty).Trim().TrimStart('^').ToUpperInvariant().Replace(' ', '_');
+            if (!LocSlots.IsValidKey(key) || Table.Contains(key))
+            {
+                Context.SetStatus(Table.Contains(key) ? $"Ключ {key} уже есть." : $"Ключ «{key}» не подходит: латиница, цифры, _ . -", StatusKind.Error);
+                return;
+            }
+
+            Table.GetOrAdd(key);
+            _newKey = string.Empty;
+            input.SetValueWithoutNotify(string.Empty);
+            _owner.MarkDirty();
+            CollectUnknown();
+            ApplyFilter();
+            Reveal(key);
+            Context.SetStatus($"Ключ ^{key} добавлен. В вёрстке — «^{key}», в коде — L.{key}.", StatusKind.Ok);
+        }
+
+        private void RenameKey(LocEntry entry, TextField field, string previous, string next)
+        {
+            if (previous == next) return;
+
+            next = (next ?? string.Empty).Trim().TrimStart('^').ToUpperInvariant();
+            var old = entry.Key;
+            if (!Table.Rename(old, next))
+            {
+                field.SetValueWithoutNotify(old);
+                Context.SetStatus($"Переименовать в «{next}» нельзя: ключ занят или недопустим.", StatusKind.Error);
+                return;
+            }
+
+            if (_modeOverride.Remove(old, out var mode)) _modeOverride[next] = mode;
+            _selected = next;
+            _owner.MarkDirty();
+
+            var used = UsageCount(old);
+            Context.SetStatus(used > 0
+                    ? $"Ключ ^{old} → ^{next}. Он используется в {used} файл(ах) — замените там тоже, иначе там будет «???»."
+                    : $"Ключ ^{old} → ^{next}.",
+                used > 0 ? StatusKind.Warning : StatusKind.Ok);
+
+            CollectUnknown();
+            ApplyFilter();
+            Reveal(next);
+            RenderPanel();
+        }
+
+        private void DeleteKey(LocEntry entry)
+        {
+            var used = UsageCount(entry.Key);
+            var message = used > 0
+                ? $"Ключ ^{entry.Key} используется в {used} файл(ах). После удаления там будет «???». Удалить?"
+                : $"Удалить ключ ^{entry.Key}?";
+
+            if (!EditorUtility.DisplayDialog("Удалить ключ", message, "Удалить", "Отмена")) return;
+
+            Table.Remove(entry.Key);
+            _modeOverride.Remove(entry.Key);
+            _selected = null;
+            _owner.MarkDirty();
+            CollectUnknown();
+            ApplyFilter();
+            RenderPanel();
+        }
+
+        /// <summary>Выбрать ключ снаружи (справка «Открыть пример»).</summary>
+        public void Reveal(string key)
+        {
+            if (Table == null || !Table.Contains(key)) return;
+
+            if (!_view.Exists(e => e.Key == key))
+            {
+                _search = string.Empty;
+                _group = AllGroups;
+                _onlyMissing = false;
+                _onlyUnused = false;
+                ApplyFilter();
+            }
+
+            var index = _view.FindIndex(e => e.Key == key);
+            _selected = null;
+            Select(key);
+            if (_list == null || index < 0) return;
+
+            _list.SetSelectionWithoutNotify(new[] { index });
+            _list.ScrollToItem(index);
+        }
+
+        /// <summary>Ключ для открытия при следующей сборке вида (справка переключает подвкладку).</summary>
+        public void Preselect(string key)
+        {
+            _selected = key;
+            _search = string.Empty;
+            _group = AllGroups;
+            _onlyMissing = false;
+            _onlyUnused = false;
+        }
+
+        // ============================================================ фильтр и сводка
+
+        private void ApplyFilter()
+        {
+            _view.Clear();
+
+            foreach (var entry in Table.Entries.OrderBy(e => e.Key, StringComparer.Ordinal))
+            {
+                if (_group != AllGroups && GroupOf(entry.Key) != _group) continue;
+                if (_onlyMissing && !HasMissing(entry)) continue;
+                if (_onlyUnused && (_usage == null || IsUsed(entry.Key))) continue;
+                if (!Matches(entry)) continue;
+
+                _view.Add(entry);
+            }
+
+            if (_list != null)
+            {
+                _list.itemsSource = _view;
+                _list.Rebuild();
+
+                var index = _selected != null ? _view.FindIndex(e => e.Key == _selected) : -1;
+                if (index >= 0) _list.SetSelectionWithoutNotify(new[] { index });
+            }
+
+            UpdateSummary();
+        }
+
+        private bool HasMissing(LocEntry entry)
+        {
+            foreach (var language in Languages)
+                if (entry.Find(language.Code) == null) return true;
+            return false;
+        }
+
+        private int MissingCount(string language)
+        {
+            var count = 0;
+            foreach (var entry in Table.Entries)
+                if (entry.Find(language) == null) count++;
+            return count;
+        }
+
+        private bool Matches(LocEntry entry)
+        {
+            if (string.IsNullOrWhiteSpace(_search)) return true;
+
+            var query = _search.Trim().TrimStart('^');
+            if (entry.Key.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+
+            foreach (var value in entry.Values)
+                if (!string.IsNullOrEmpty(value.Text) && value.Text.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+
+            return false;
+        }
+
+        public void UpdateSummary()
+        {
+            if (_save != null) _save.text = _owner.Dirty ? "Сохранить ●" : "Сохранить";
+            if (_summary == null || Table == null) return;
+
+            var parts = new List<string> { $"Ключей: {Table.Count}", $"показано: {_view.Count}" };
+
+            foreach (var language in Languages)
+            {
+                var missing = MissingCount(language.Code);
+                if (missing > 0) parts.Add($"пусто {language.Code}: {missing}");
+            }
+
+            if (_usage != null)
+            {
+                var unused = Table.Entries.Count(e => !IsUsed(e.Key));
+                if (unused > 0) parts.Add($"без использования: {unused}");
+                if (_unknown.Count > 0) parts.Add($"нет в таблице: {_unknown.Count}");
+            }
+
+            if (_owner.Dirty) parts.Add("есть несохранённые правки");
+            _summary.text = string.Join(" · ", parts);
+        }
+
+        /// <summary>Группа ключа — всё до первого «_»: MENU_PLAY → MENU.</summary>
+        private static string GroupOf(string key)
+        {
+            var underscore = key.IndexOf('_');
+            return underscore > 0 ? key.Substring(0, underscore) : key;
+        }
+    }
+
+    /// <summary>Маленькое окно-поповер конструктора (живое значение, цвет) в стиле хаба.</summary>
+    internal sealed class LocPopupWindow : EditorWindow
+    {
+        public Action<VisualElement> Build;
+        public IPageUi Ui;
+
+        private void CreateGUI()
+        {
+            var root = rootVisualElement;
+            Ui?.ApplyTheme(root);
+            Build?.Invoke(root);
+        }
+
+        private void OnLostFocus() => Close();
+    }
+}

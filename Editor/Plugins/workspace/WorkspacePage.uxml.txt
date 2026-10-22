@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements">
-    <!-- Только структура и раскладка. Все цвета и hover/press выставляются в C#
-         через Context.Theme.Get(token); USS отвечает за геометрию, не за палитру. -->
+    <!-- Структура. Вид — USS страницы на переменных палитры Nexus;
+         кнопки тулбара получают роли хаба в C# (Context.Ui.Paint).
+         В XML-комментарии нельзя писать двойной дефис: UXML не импортируется. -->
     <ui:VisualElement name="ws-root" class="ws-root">
 
         <ui:VisualElement name="ws-toolbar" class="ws-toolbar">

@@ -1,0 +1,885 @@
+// ============================================================
+//  LocalizationTab.cs — вкладка «Локализация»: таблица ключей, языки и окончания, патчи, настройки.
+//
+//  Локализация — часть app-core 4.4 (Exerussus.AppCore.Localization). Таблица — один файл .loc
+//  (LocalizationSettings → Base Table, обычно Assets/App/Localization/base.loc). Правки копятся
+//  в памяти и пишутся кнопкой «Сохранить»; запись идёт через LocEditor — он же перегенерирует
+//  константы L и, если идёт игра, перечитывает таблицу.
+//
+//  «Патчи» — слои, которые проект и моды добавляют в рантайме (Loc.AddLayer). Их видно только
+//  в Play Mode: порядок слоёв, перекрытые значения и история любого ключа — кто поставил,
+//  кто заменил, что отклонено и почему. Вне игры можно проверить файл патча против базы.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor.Localization;
+using Exerussus.AppCore.Localization;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class LocalizationTab : IAppTab
+    {
+        private const string SubtabKey = "loc.subtab";
+        private static readonly string[] Subtabs = { "Таблица", "Языки и окончания", "Патчи", "Настройки", "Справка" };
+
+        private readonly AppKit _kit;
+        private readonly LocTableView _tableView;
+
+        private VisualElement _root;
+        private VisualElement _body;
+        private int _subtab;
+        private bool _renderedEnabled;
+
+        // общая с таблицей модель базового файла
+        internal LocTable Table;
+        internal string TablePath;
+        internal bool Dirty;
+        internal List<LocError> ParseErrors = new();
+
+        // проверка патча вне игры
+        private string _patchPath = string.Empty;
+        private string _historyKey = string.Empty;
+        private string _historyLanguage = string.Empty;
+
+        private Action<PlayModeStateChange> _playMode;
+
+        public string Title => "Локализация";
+
+        public LocalizationTab(AppKit kit)
+        {
+            _kit = kit;
+            _tableView = new LocTableView(kit, this);
+        }
+
+        private IPageContext Context => _kit.Context;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            _subtab = Mathf.Clamp(SessionState.GetInt(Context.GetSessionKey(SubtabKey), 0), 0, Subtabs.Length - 1);
+            return _root;
+        }
+
+        public void Show()
+        {
+            if (Table == null) Load();
+
+            _playMode ??= _ => Render();
+            EditorApplication.playModeStateChanged -= _playMode;
+            EditorApplication.playModeStateChanged += _playMode;
+            Render();
+        }
+
+        public void Hide()
+        {
+            if (_playMode != null) EditorApplication.playModeStateChanged -= _playMode;
+        }
+
+        public void Refresh()
+        {
+            if (Dirty && !EditorUtility.DisplayDialog("Локализация", "Перечитать таблицу с диска? Несохранённые правки пропадут.", "Перечитать", "Отмена"))
+                return;
+
+            Load();
+            _tableView.Rescan();
+            Render();
+        }
+
+        public bool CanClose()
+        {
+            if (!Dirty) return true;
+
+            var choice = EditorUtility.DisplayDialogComplex("Локализация", "В таблице есть несохранённые правки.", "Сохранить", "Отмена", "Не сохранять");
+            if (choice == 1) return false;
+            if (choice == 0) Save();
+            return true;
+        }
+
+        public void Dispose() => Hide();
+
+        // ============================================================ данные
+
+        internal void Load()
+        {
+            Table = null;
+            TablePath = LocEditor.BaseTablePath;
+            Dirty = false;
+            ParseErrors.Clear();
+
+            var parsed = LocEditor.ReadBaseTable();
+            if (parsed == null) return;
+
+            Table = parsed.Table;
+            ParseErrors.AddRange(parsed.Errors);
+        }
+
+        internal void MarkDirty()
+        {
+            Dirty = true;
+            _tableView.UpdateSummary();
+        }
+
+        internal void Save()
+        {
+            if (Table == null) return;
+
+            if (ParseErrors.Count > 0 &&
+                !EditorUtility.DisplayDialog("Локализация", $"Файл читался с ошибками ({ParseErrors.Count}): строки с ошибками при сохранении пропадут. Сохранить?", "Сохранить", "Отмена"))
+                return;
+
+            LocEditor.WriteBaseTable(Table);
+            Dirty = false;
+            ParseErrors.Clear();
+            Context.SetStatus($"Сохранено: {TablePath}" + (EditorApplication.isPlaying ? " · игра перечитала таблицу" : string.Empty), StatusKind.Ok);
+            _tableView.UpdateSummary();
+        }
+
+        // ============================================================ рендер
+
+        internal void Render()
+        {
+            if (_root == null) return;
+            _root.Clear();
+
+            var settings = LocSettings.Current;
+            _renderedEnabled = settings != null && settings.Enabled;
+            if (settings == null)
+            {
+                var card = _kit.Card("Локализация", "Ключи «^KEY» в вёрстке и коде, таблица .loc, патчи от модов.");
+                card.Add(_kit.Status(StatusKind.Warning, $"Нет ассета настроек: {LocSettings.AssetPath}"));
+                var create = _kit.Btn(NexusRole.Primary, "Создать", () =>
+                {
+                    LocEditor.EnsureSettings(true);
+                    Load();
+                    Render();
+                });
+                create.style.alignSelf = Align.FlexStart;
+                create.style.marginTop = 8f;
+                card.Add(create);
+                _root.Add(card);
+                return;
+            }
+
+            if (!settings.Enabled)
+            {
+                var card = _kit.Card("Локализация выключена",
+                                     "Пока галочка снята, AppCore не грузит таблицу, не обходит вёрстку и не принимает патчи: «^KEY» показывается как есть.");
+                var enable = _kit.Btn(NexusRole.Primary, "Включить", () =>
+                {
+                    var so = new SerializedObject(settings);
+                    so.FindProperty("enabled").boolValue = true;
+                    so.ApplyModifiedProperties();
+                    AssetDatabase.SaveAssetIfDirty(settings);
+                    LocEditor.EnsureBaseTable(settings);
+                    LocEditor.GenerateKeys();
+                    Load();
+                    Render();
+                });
+                enable.style.alignSelf = Align.FlexStart;
+                enable.style.marginTop = 8f;
+                card.Add(enable);
+                _root.Add(card);
+                _root.Add(SettingsCard(settings));
+                return;
+            }
+
+            var bar = _kit.Row();
+            bar.style.marginBottom = 10f;
+            bar.Add(Context.Ui.Segmented(Subtabs, _subtab, i =>
+            {
+                _subtab = i;
+                SessionState.SetInt(Context.GetSessionKey(SubtabKey), i);
+                RenderBody();
+            }));
+            bar.Add(_kit.Spacer());
+            bar.Add(PlayLanguageSwitch());
+            _root.Add(bar);
+
+            _body = new VisualElement();
+            _root.Add(_body);
+            RenderBody();
+        }
+
+        private void RenderBody()
+        {
+            if (_body == null) return;
+            _body.Clear();
+
+            var settings = LocSettings.Current;
+
+            if ((_subtab == 0 || _subtab == 1) && Table == null)
+            {
+                var card = _kit.Card("Базовая таблица", "Один файл .loc со всеми ключами проекта.");
+                card.Add(_kit.Status(StatusKind.Warning, "Таблица не назначена в настройках."));
+                var create = _kit.Btn(NexusRole.Primary, $"Создать {AppCorePaths.BaseLocTablePath}", () =>
+                {
+                    LocEditor.EnsureBaseTable(settings);
+                    LocEditor.GenerateKeys();
+                    Load();
+                    Render();
+                });
+                create.style.alignSelf = Align.FlexStart;
+                create.style.marginTop = 8f;
+                card.Add(create);
+                _body.Add(card);
+                return;
+            }
+
+            switch (_subtab)
+            {
+                case 0: _body.Add(_tableView.Build()); break;
+                case 1: _body.Add(LanguagesView()); break;
+                case 2: _body.Add(PatchesView()); break;
+                case 4: _body.Add(HelpView()); break;
+                default:
+                    _body.Add(SettingsCard(settings));
+                    _body.Add(ToolsCard());
+                    break;
+            }
+        }
+
+        /// <summary>Переключатель языка запущенной игры — только в Play Mode.</summary>
+        private VisualElement PlayLanguageSwitch()
+        {
+            var host = _kit.Row();
+            if (!EditorApplication.isPlaying || !Loc.Enabled || Loc.Languages.Count == 0) return host;
+
+            var codes = new string[Loc.Languages.Count];
+            for (var i = 0; i < codes.Length; i++) codes[i] = Loc.Languages[i].Code;
+
+            host.Add(_kit.Faint("Язык игры"));
+            host.Add(_kit.Gap(6f));
+            var labels = Array.ConvertAll(codes, c => c.ToUpperInvariant());
+            host.Add(Context.Ui.Segmented(labels, Math.Max(0, Array.IndexOf(codes, Loc.Language)), i => Loc.SetLanguage(codes[i])));
+            return host;
+        }
+
+        // ============================================================ языки и окончания
+
+        private VisualElement LanguagesView()
+        {
+            var root = new VisualElement();
+
+            var card = _kit.Card("Языки",
+                                 "Первый язык — основной (если в настройках не задан другой): из него берётся непереведённое. " +
+                                 "Окончания — правило выбора формы по числу; фолбэк — откуда брать строку, которой нет на этом языке.",
+                                 SaveButton());
+
+            var rules = new List<string> { "(по коду)" };
+            rules.AddRange(PluralRules.Names);
+
+            for (var i = 0; i < Table.Languages.Count; i++)
+            {
+                var language = Table.Languages[i];
+                var index = i;
+
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginTop = 4f;
+                row.style.marginBottom = 4f;
+
+                var code = _kit.Mono(language.Code + (i == 0 ? " · основной" : string.Empty));
+                code.style.width = 110f;
+                row.Add(code);
+
+                var name = _kit.Input(language.Name, v => { language.Name = v; MarkDirty(); });
+                name.tooltip = "Название на самом языке — для переключателя";
+                name.style.width = 140f;
+                row.Add(name);
+                row.Add(_kit.Gap(8f));
+
+                var ruleIndex = string.IsNullOrEmpty(language.Plural) ? 0 : Math.Max(0, rules.IndexOf(language.Plural));
+                var rule = _kit.Dropdown(null, rules, ruleIndex, k => { language.Plural = k == 0 ? null : rules[k]; MarkDirty(); RenderBody(); });
+                rule.tooltip = "Правило окончаний";
+                rule.style.width = 120f;
+                row.Add(rule);
+                row.Add(_kit.Gap(8f));
+
+                var fallbacks = new List<string> { "(основной)" };
+                foreach (var other in Table.Languages)
+                    if (other != language) fallbacks.Add(other.Code);
+                var fallbackIndex = string.IsNullOrEmpty(language.Fallback) ? 0 : Math.Max(0, fallbacks.IndexOf(language.Fallback));
+                var fallback = _kit.Dropdown(null, fallbacks, fallbackIndex, k => { language.Fallback = k == 0 ? null : fallbacks[k]; MarkDirty(); });
+                fallback.tooltip = "Фолбэк";
+                fallback.style.width = 120f;
+                row.Add(fallback);
+                row.Add(_kit.Gap(8f));
+
+                var forms = LocTableView.FormsOf(language);
+                row.Add(_kit.Faint(forms.Count == 0 ? "без форм" : "формы: " + string.Join(", ", forms) + ", other"));
+                row.Add(_kit.Spacer());
+
+                if (i > 0) row.Add(_kit.Btn(NexusRole.Ghost, "↑", () => { Table.MoveLanguage(language.Code, index - 1); MarkDirty(); RenderBody(); }, small: true));
+                if (i > 0)
+                    row.Add(_kit.Btn(NexusRole.Alarm, "✕", () =>
+                    {
+                        if (!EditorUtility.DisplayDialog("Убрать язык", $"Убрать язык {language} вместе со всеми переводами?", "Убрать", "Отмена")) return;
+                        Table.RemoveLanguage(language.Code);
+                        MarkDirty();
+                        RenderBody();
+                    }, small: true));
+
+                card.Add(row);
+            }
+
+            card.Add(_kit.Divider());
+
+            var newCode = string.Empty;
+            var newName = string.Empty;
+            var add = _kit.Row();
+            var codeField = _kit.Input(string.Empty, v => newCode = v);
+            codeField.tooltip = "Код языка: de, fr, pt-BR";
+            codeField.style.width = 90f;
+            add.Add(codeField);
+            add.Add(_kit.Gap(6f));
+            var nameField = _kit.Input(string.Empty, v => newName = v);
+            nameField.tooltip = "Название на самом языке: Deutsch";
+            nameField.style.width = 160f;
+            add.Add(nameField);
+            add.Add(_kit.Gap(6f));
+            add.Add(_kit.Btn(NexusRole.Success, "+ Язык", () =>
+            {
+                var code = (newCode ?? string.Empty).Trim();
+                if (!LocSlots.IsValidLanguage(code) || Table.GetLanguage(code) != null)
+                {
+                    Context.SetStatus($"Код «{code}» не подходит: латиница, цифры, «-», и языка ещё не должно быть.", StatusKind.Error);
+                    return;
+                }
+
+                Table.AddLanguage(code, string.IsNullOrWhiteSpace(newName) ? null : newName.Trim());
+                MarkDirty();
+                RenderBody();
+                Context.SetStatus($"Язык {code} добавлен — переводы пока пустые.", StatusKind.Ok);
+            }));
+            card.Add(add);
+            root.Add(card);
+
+            root.Add(PluralPreviewCard());
+            return root;
+        }
+
+        private VisualElement PluralPreviewCard()
+        {
+            var card = _kit.Card("Проверка окончаний", "Какую форму выберет каждый язык для числа.");
+            var output = new VisualElement();
+
+            void Update(string text)
+            {
+                output.Clear();
+                if (!double.TryParse((text ?? string.Empty).Replace(',', '.'), System.Globalization.NumberStyles.Float,
+                                     System.Globalization.CultureInfo.InvariantCulture, out var n)) return;
+
+                foreach (var language in Table.Languages)
+                {
+                    var category = PluralRules.Select(PluralRules.RuleFor(language), n);
+                    output.Add(_kit.Mono($"{language.Code}: {category.ToString().ToLowerInvariant()}"));
+                }
+            }
+
+            var input = _kit.Input("21", Update);
+            input.style.width = 100f;
+            card.Add(input);
+            card.Add(output);
+            Update("21");
+            return card;
+        }
+
+        internal Button SaveButton() => _kit.Btn(NexusRole.Primary, Dirty ? "Сохранить ●" : "Сохранить", () =>
+        {
+            Save();
+            RenderBody();
+        }, small: true);
+
+        // ============================================================ патчи
+
+        private VisualElement PatchesView()
+        {
+            var root = new VisualElement();
+
+            if (!EditorApplication.isPlaying)
+            {
+                var info = _kit.Card("Слои в игре",
+                                     "Патчи добавляются в рантайме (Loc.AddLayer, AddLayerFromFile): порядок задаёт загрузчик модов проекта, " +
+                                     "поздний слой главнее. Список слоёв, перекрытия и история ключей видны в Play Mode.");
+                info.Add(_kit.Status(StatusKind.Info, "Запустите игру, чтобы увидеть слои."));
+                root.Add(info);
+                root.Add(PatchCheckCard());
+                return root;
+            }
+
+            var layers = _kit.Card("Слои", "В порядке применения: позже — главнее.", _kit.Btn(NexusRole.Common, "Перечитать", () =>
+            {
+                Loc.Reload();
+                RenderBody();
+            }, small: true));
+
+            var list = Loc.Layers;
+            for (var i = 0; i < list.Count; i++)
+            {
+                var layer = list[i];
+                var row = _kit.ListRow();
+                row.Add(_kit.Mono($"{i + 1}."));
+                row.Add(_kit.Gap(6f));
+                row.Add(_kit.Text(layer.Id));
+                row.Add(_kit.Gap(8f));
+                row.Add(_kit.Faint($"{layer.Source} · ключей {layer.Keys}"));
+                if (layer.Rejected > 0)
+                {
+                    row.Add(_kit.Gap(8f));
+                    row.Add(_kit.Badge(StatusKind.Warning, $"отклонено {layer.Rejected}"));
+                }
+
+                row.Add(_kit.Spacer());
+                if (!string.IsNullOrEmpty(layer.Path)) row.Add(_kit.Faint(layer.Path));
+                layers.Add(row);
+            }
+
+            root.Add(layers);
+
+            var overrides = Loc.Overrides();
+            var overrideCard = _kit.Card($"Перекрытые значения: {overrides.Count}", "Значение писали несколько слоёв; показано значение последнего.");
+            for (var i = 0; i < overrides.Count && i < 200; i++)
+            {
+                var item = overrides[i];
+                var row = _kit.ListRow(() => ShowHistory(item.Key, null));
+                row.Add(_kit.Text($"{item.Key} [{item.Slot}]"));
+                row.Add(_kit.Spacer());
+                row.Add(_kit.Faint(string.Join(" → ", item.Layers)));
+                overrideCard.Add(row);
+            }
+
+            if (overrides.Count > 200) overrideCard.Add(_kit.Faint($"… и ещё {overrides.Count - 200}"));
+            root.Add(overrideCard);
+
+            root.Add(HistoryCard());
+            return root;
+        }
+
+        private VisualElement _historyOutput;
+
+        private VisualElement HistoryCard()
+        {
+            var card = _kit.Card("История ключа",
+                                 Loc.TraceActive
+                                     ? "Кто поставил, заменил, удалил значение, что отклонено и почему, и откуда в итоге берётся показанное."
+                                     : "Трассировка выключена (Настройки → Trace) — виден только итог.");
+
+            var row = _kit.Row();
+            var key = _kit.Input(_historyKey, v => _historyKey = v);
+            key.tooltip = "Ключ, с ^ или без";
+            key.style.width = 240f;
+            row.Add(key);
+            row.Add(_kit.Gap(6f));
+            var language = _kit.Input(_historyLanguage, v => _historyLanguage = v);
+            language.tooltip = "Язык; пусто — все";
+            language.style.width = 70f;
+            row.Add(language);
+            row.Add(_kit.Gap(6f));
+            row.Add(_kit.Btn(NexusRole.Info, "Показать", () => ShowHistory(_historyKey, _historyLanguage), small: true));
+            card.Add(row);
+
+            _historyOutput = new VisualElement();
+            _historyOutput.style.marginTop = 8f;
+            card.Add(_historyOutput);
+
+            if (!string.IsNullOrEmpty(_historyKey)) ShowHistory(_historyKey, _historyLanguage);
+            return card;
+        }
+
+        private void ShowHistory(string key, string language)
+        {
+            _historyKey = Loc.KeyOf((key ?? string.Empty).Trim());
+            _historyLanguage = string.IsNullOrWhiteSpace(language) ? string.Empty : language.Trim();
+            if (_historyOutput == null) return;
+
+            _historyOutput.Clear();
+            var steps = Loc.History(_historyKey, _historyLanguage.Length > 0 ? _historyLanguage : null);
+            if (steps.Count == 0)
+            {
+                _historyOutput.Add(_kit.Faint(Loc.Has(_historyKey) ? "Шагов нет." : $"Ключа «{_historyKey}» нет."));
+                return;
+            }
+
+            foreach (var step in steps)
+            {
+                var kind = step.Kind switch
+                {
+                    LocStepKind.Rejected => NexusToken.Warning,
+                    LocStepKind.Missing => NexusToken.Error,
+                    LocStepKind.Remove => NexusToken.Warning,
+                    _ => NexusToken.TextNormal,
+                };
+                _historyOutput.Add(_kit.Mono(step.ToString(), kind));
+            }
+        }
+
+        /// <summary>Проверка файла патча против базы — без игры.</summary>
+        private VisualElement PatchCheckCard()
+        {
+            var card = _kit.Card("Проверить файл патча", "Ошибки формата и что патч изменит в базовой таблице.");
+            var row = _kit.Row();
+            var path = _kit.Input(_patchPath, v => _patchPath = v);
+            path.tooltip = "Путь к .loc (от корня проекта или абсолютный)";
+            path.style.flexGrow = 1;
+            row.Add(path);
+            row.Add(_kit.Gap(6f));
+            row.Add(_kit.Btn(NexusRole.Common, "Выбрать…", () =>
+            {
+                var picked = EditorUtility.OpenFilePanel("Файл патча", Directory.GetCurrentDirectory(), "loc");
+                if (string.IsNullOrEmpty(picked)) return;
+                _patchPath = picked;
+                RenderBody();
+            }, small: true));
+            card.Add(row);
+
+            if (string.IsNullOrWhiteSpace(_patchPath)) return card;
+
+            if (!File.Exists(_patchPath))
+            {
+                card.Add(_kit.Status(StatusKind.Error, "Файла нет."));
+                return card;
+            }
+
+            var parsed = LocFormat.Parse(File.ReadAllText(_patchPath));
+            if (!parsed.Ok)
+            {
+                card.Add(_kit.Status(StatusKind.Error, $"Ошибок: {parsed.Errors.Count}", parsed.ErrorText(Path.GetFileName(_patchPath), 30)));
+                return card;
+            }
+
+            int added = 0, replaced = 0, removed = 0, same = 0;
+            var lines = new List<string>();
+            foreach (var entry in parsed.Table.Entries)
+            {
+                var baseEntry = Table?.Get(entry.Key);
+                if (entry.RemoveKey)
+                {
+                    removed++;
+                    lines.Add($"− {entry.Key} (весь ключ)");
+                    continue;
+                }
+
+                foreach (var value in entry.Values)
+                {
+                    var before = baseEntry?.Find(value.Language, value.Form)?.Text;
+                    if (value.IsRemove) { removed++; lines.Add($"− {entry.Key} [{value.Slot}]"); }
+                    else if (before == null) { added++; lines.Add($"+ {entry.Key} [{value.Slot}] «{value.Text}»"); }
+                    else if (before == value.Text) same++;
+                    else { replaced++; lines.Add($"~ {entry.Key} [{value.Slot}] «{before}» → «{value.Text}»"); }
+                }
+            }
+
+            card.Add(_kit.Status(StatusKind.Ok, $"Новых: {added} · замен: {replaced} · удалений: {removed} · без изменений: {same}",
+                                 removed > 0 ? "Удаления от мода по умолчанию отклоняются (Настройки → Mod Removals)." : null));
+            for (var i = 0; i < lines.Count && i < 150; i++) card.Add(_kit.Mono(lines[i], NexusToken.TextDim));
+            if (lines.Count > 150) card.Add(_kit.Faint($"… и ещё {lines.Count - 150}"));
+            return card;
+        }
+
+
+        // ============================================================ справка
+
+        private string _helpSection = "recipes";
+
+        private sealed class HelpCard
+        {
+            public string Title, When, Steps, Code, Key;
+        }
+
+        private sealed class HelpSection
+        {
+            public string Id, Name, Intro;
+            public HelpCard[] Cards = Array.Empty<HelpCard>();
+        }
+
+        private static readonly HelpSection[] HelpSections =
+        {
+            new()
+            {
+                Id = "recipes", Name = "Рецепты",
+                Intro = "Выберите задачу — внутри шаги и готовый код. «Открыть пример» переключит на таблицу с похожим ключом.",
+                Cards = new[]
+                {
+                    new HelpCard
+                    {
+                        Title = "Счётчик со словом: «3 сценария»",
+                        When = "Когда: слово после числа меняется (сценарий / сценария / сценариев).",
+                        Steps = "1. В таблице выберите ключ → «Зависит от числа».\n2. Заполните строку для каждой формы — подсказки покажут, для каких чисел каждая.\n3. Проверьте числами 1, 2, 5, 11, 21 внизу конструктора.",
+                        Code = "_chip.Text = Loc.Plural(L.SCENARIO_COUNT, count);\n// живая надпись, сменится с языком:\nText.SetPlural(label, L.SCENARIO_COUNT, count);",
+                        Key = "SCENARIO_COUNT",
+                    },
+                    new HelpCard
+                    {
+                        Title = "Строка с подстановкой: «Запись 3 из 5»",
+                        When = "Когда: числа или имена приходят из кода.",
+                        Steps = "1. Режим «С аргументами» → «+ Аргумент» на каждое значение, подпишите, что это, и дайте пример.\n2. Кнопками «{0} …» вставьте аргументы в текст каждого языка — в позицию курсора.\n3. Порядок аргументов в коде = {0}, {1}…",
+                        Code = "Text.Set(label, L.MSG_SEND_PROGRESS, recorded, total);",
+                        Key = "MSG_SEND_PROGRESS",
+                    },
+                    new HelpCard
+                    {
+                        Title = "Значение из игры прямо в тексте",
+                        When = "Когда: текст монитора показывает данные хранилища — имя корабля, энергию, время.",
+                        Steps = "1. Режим «С аргументами» (аргументов может не быть).\n2. «● Живое значение…» → выберите из списка, отметьте «обновлять на лету», формат для чисел.\n3. Код не нужен — монитор подставит и обновит сам.",
+                        Code = "СИСТЕМЫ КОРАБЛЯ <!s:current_starship_id>",
+                        Key = "CORE_HEADER_SUBTITLE",
+                    },
+                    new HelpCard
+                    {
+                        Title = "Выделить цветом или жирным",
+                        When = "Когда: часть строки должна гореть цветом тона.",
+                        Steps = "1. Выделите кусок в поле.\n2. «◐ цвет…» → цвет палитры, или «B жирный».\n3. В предпросмотре видно, как это будет выглядеть.",
+                        Code = "ТРЕБУЮТ ВНИМАНИЯ: <color=#E86A7E>{0}</color>",
+                        Key = "CORE_STATUS_ATTENTION",
+                    },
+                },
+            },
+            new()
+            {
+                Id = "markup", Name = "Текст в вёрстке",
+                Intro = "Постоянная надпись задаётся ключом прямо в uxml — страница, попап, фрагмент, скрин и монитор переведут её сами и пересоберут при смене языка.",
+                Cards = new[]
+                {
+                    new HelpCard
+                    {
+                        Title = "Ключ в uxml", When = "Надпись не меняется кодом.",
+                        Steps = "Пишите ключ целиком в атрибут text. Если текст ставит код — в uxml заглушка «—», не ключ: иначе код и перевод будут спорить.",
+                        Code = "<ui:Label text=\"^MENU_PLAY\" />\n<ui:Button text=\"^MENU_PLAY\" />", Key = "MENU_PLAY",
+                    },
+                },
+            },
+            new()
+            {
+                Id = "code", Name = "Ключ в коде",
+                Intro = "Константы L.* генерируются сами при сохранении таблицы — опечатка в ключе ловится компилятором.",
+                Cards = new[]
+                {
+                    new HelpCard
+                    {
+                        Title = "Одноразово или живая надпись",
+                        When = "Loc.* отдаёт строку на момент вызова. Text.* в контроллере и мониторе запоминает шаблон — строка сменится вместе с языком, а повторный вызов с тем же ключом ничего не стоит.",
+                        Steps = "Строки, которые код собирает сам (карточки, списки), пересоберите в OnLanguageChanged().",
+                        Code = "var s = Loc.Get(L.MENU_PLAY);\nText.Set(label, L.AO_ACCURACY, accuracy);\nprotected override void OnLanguageChanged() => BuildCards();",
+                    },
+                },
+            },
+            new()
+            {
+                Id = "langs", Name = "Новый язык",
+                Intro = "«Языки и окончания» → код и название на самом языке → «+ Язык». Правило окончаний подберётся по коду, его можно сменить. В таблице у ключей появится поле языка; непереведённое подсвечено и видно в фильтре «С пропусками».",
+            },
+            new()
+            {
+                Id = "mods", Name = "Патчи и моды",
+                Intro = "Моды добавляют свои .loc слоями поверх базы: дополняют и заменяют строки, удалять по умолчанию не могут. Кто что поменял — «Патчи» в Play Mode или loc.history KEY в консоли.",
+                Cards = new[]
+                {
+                    new HelpCard
+                    {
+                        Title = "Загрузчик модов", When = "Порядок добавления = порядок применения: позже — главнее. Id слоя задаёт загрузчик, он обязан быть уникальным.",
+                        Steps = "Оборачивайте пачку в Loc.Batch(), чтобы таблица пересобралась один раз.",
+                        Code = "using (Loc.Batch())\n    foreach (var mod in mods)\n        Loc.AddLayerFromFile(\"mod.\" + mod.Id, mod.LocPath, LocSource.Mod, mod);",
+                    },
+                },
+            },
+            new()
+            {
+                Id = "format", Name = "Формат .loc",
+                Intro = "Руками править не обязательно — всё делается в таблице. Но формат читаемый, его удобно смотреть в диффах.",
+                Cards = new[]
+                {
+                    new HelpCard
+                    {
+                        Title = "Пример", When = "Ключ с начала строки, значения с отступом, формы через точку.",
+                        Steps = "# — комментарий (описания аргументов — «# {0}: описание = пример»), ~ — удалить (только в патче), отступ глубже — продолжение строки.",
+                        Code = "@language ru Русский\n@language en English\n\n# {0}: сколько сценариев = 21\nSCENARIO_COUNT\n    ru.one: {0} СЦЕНАРИЙ\n    ru.few: {0} СЦЕНАРИЯ\n    ru: {0} СЦЕНАРИЕВ\n    en.one: {0} SCENARIO\n    en: {0} SCENARIOS",
+                    },
+                },
+            },
+            new()
+            {
+                Id = "debug", Name = "Отладка",
+                Intro = "Консоль AppDeck (`): loc.lang — язык и список; loc.where KEY — значение и слой; loc.history KEY — кто что менял; loc.missing — непереведённое; loc.layers — слои; loc.reload — перечитать.",
+            },
+        };
+
+        private VisualElement HelpView()
+        {
+            var root = _kit.Row();
+            root.style.flexWrap = Wrap.NoWrap;
+            root.style.alignItems = Align.FlexStart;
+
+            var nav = new VisualElement();
+            nav.style.width = 200f;
+            nav.style.flexShrink = 0;
+            nav.style.marginRight = 14f;
+            root.Add(nav);
+
+            foreach (var section in HelpSections)
+            {
+                var id = section.Id;
+                var row = _kit.ListRow(() =>
+                {
+                    _helpSection = id;
+                    RenderBody();
+                }, id == _helpSection);
+                row.Add(_kit.Text(section.Name));
+                nav.Add(row);
+            }
+
+            var current = Array.Find(HelpSections, s => s.Id == _helpSection) ?? HelpSections[0];
+
+            var content = new VisualElement();
+            content.style.flexGrow = 1;
+            content.style.flexShrink = 1;
+            content.style.maxWidth = 820f;
+            root.Add(content);
+
+            var title = _kit.Title(current.Name);
+            title.style.fontSize = 15;
+            NexusClass.SetFg(title, NexusToken.AccentText);
+            title.style.marginBottom = 6f;
+            content.Add(title);
+
+            var intro = _kit.Text(current.Intro, NexusToken.TextDim, 12);
+            intro.style.marginBottom = 12f;
+            content.Add(intro);
+
+            foreach (var card in current.Cards)
+            {
+                var box = _kit.Card(card.Title, card.When);
+                var steps = _kit.Text(card.Steps, NexusToken.TextNormal, 12);
+                steps.style.marginBottom = 8f;
+                box.Add(steps);
+
+                var code = _kit.Code(card.Code);
+                code.style.marginBottom = 8f;
+                box.Add(code);
+
+                var buttons = _kit.Row();
+                buttons.Add(_kit.Btn(NexusRole.Ghost, "Копировать", () =>
+                {
+                    EditorGUIUtility.systemCopyBuffer = card.Code;
+                    Context.SetStatus("Скопировано.", StatusKind.Ok);
+                }, small: true));
+
+                if (!string.IsNullOrEmpty(card.Key) && Table != null && Table.Contains(card.Key))
+                {
+                    var key = card.Key;
+                    buttons.Add(_kit.Btn(NexusRole.Primary, "Открыть " + key, () =>
+                    {
+                        _tableView.Preselect(key);
+                        _subtab = 0;
+                        SessionState.SetInt(Context.GetSessionKey(SubtabKey), 0);
+                        Render();
+                    }, small: true));
+                }
+
+                box.Add(buttons);
+                content.Add(box);
+            }
+
+            return root;
+        }
+
+        // ============================================================ настройки
+
+        private VisualElement SettingsCard(LocSettings settings)
+        {
+            var card = _kit.Card("Настройки", LocSettings.AssetPath);
+            var inspector = new InspectorElement(settings);
+            card.Add(inspector);
+            inspector.TrackSerializedObjectValue(new SerializedObject(settings), _ =>
+            {
+                AssetDatabase.SaveAssetIfDirty(settings);
+                // Включили/выключили — вкладка перестраивается.
+                if (settings.Enabled != _renderedEnabled) EditorApplication.delayCall += Render;
+            });
+
+            return card;
+        }
+
+        private VisualElement ToolsCard()
+        {
+            var card = _kit.Card("Инструменты");
+
+            var row = _kit.Row();
+            row.Add(_kit.Btn(NexusRole.Common, "Сгенерировать L", () =>
+            {
+                var written = LocEditor.GenerateKeys();
+                Context.SetStatus(written ? $"Константы записаны: {AppCorePaths.LocKeysPath}" : "Константы уже актуальны.", StatusKind.Ok);
+            }, small: true));
+            row.Add(_kit.Btn(NexusRole.Info, "Проверить ключи проекта", () =>
+            {
+                if (Table == null) return;
+                var report = LocKeyScanner.Check(Table, LocSettings.Current);
+                if (report.Unknown.Count == 0)
+                    Context.SetStatus($"Все ключи проекта есть в таблице. Без использования: {report.Unused.Count}.", StatusKind.Ok);
+                else
+                {
+                    Context.SetStatus($"Нет в таблице: {report.Unknown.Count} — подробности в консоли.", StatusKind.Warning);
+                    Debug.LogWarning("[Loc] Ключи, которых нет в таблице:\n" + report.Describe(200));
+                }
+            }, small: true));
+            row.Add(_kit.Btn(NexusRole.Common, "Импорт из JSON…", ImportJson, small: true));
+            card.Add(row);
+            card.Add(_kit.Hint("Импорт JSON — старый позиционный формат { languages: [{code, name}], entries: [{key, values: [...]}] }: " +
+                               "ключи и языки добавляются в базовую таблицу, существующие значения заменяются."));
+            return card;
+        }
+
+        [Serializable] private sealed class JsonLanguage { public string code; public string name; }
+        [Serializable] private sealed class JsonEntry { public string key; public List<string> values; }
+        [Serializable] private sealed class JsonTable { public List<JsonLanguage> languages; public List<JsonEntry> entries; }
+
+        private void ImportJson()
+        {
+            if (Table == null) return;
+
+            var path = EditorUtility.OpenFilePanel("JSON локализации", Application.dataPath, "json");
+            if (string.IsNullOrEmpty(path)) return;
+
+            JsonTable data;
+            try
+            {
+                data = JsonUtility.FromJson<JsonTable>(File.ReadAllText(path));
+            }
+            catch (Exception e)
+            {
+                Context.SetStatus($"JSON не читается: {e.Message}", StatusKind.Error);
+                return;
+            }
+
+            if (data?.languages == null || data.entries == null)
+            {
+                Context.SetStatus("В JSON нет languages/entries.", StatusKind.Error);
+                return;
+            }
+
+            foreach (var language in data.languages)
+                if (LocSlots.IsValidLanguage(language.code)) Table.AddLanguage(language.code, language.name);
+
+            var keys = 0;
+            foreach (var entry in data.entries)
+            {
+                if (entry == null || !LocSlots.IsValidKey(entry.key) || entry.values == null) continue;
+                keys++;
+                for (var i = 0; i < entry.values.Count && i < data.languages.Count; i++)
+                    if (!string.IsNullOrEmpty(entry.values[i])) Table.Set(entry.key, data.languages[i].code, entry.values[i]);
+            }
+
+            MarkDirty();
+            Context.SetStatus($"Импортировано ключей: {keys}. Проверьте и сохраните.", StatusKind.Ok);
+            _tableView.Rescan();
+            RenderBody();
+        }
+    }
+}

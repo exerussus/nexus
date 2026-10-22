@@ -274,7 +274,7 @@ namespace Exerussus.Nexus.Pages.App
                     row.Conflict = conflict;
                     if (conflict) errors++;
                     if (row.Container != null)
-                        row.Container.style.backgroundColor = conflict ? _kit.Tok(NexusToken.ErrorSoft) : new Color(0, 0, 0, 0);
+                        row.Container.EnableInClassList(NexusClass.Bg(NexusToken.ErrorSoft), conflict);
                 }
             }
 
@@ -284,7 +284,7 @@ namespace Exerussus.Nexus.Pages.App
                 _summary.text = errors > 0
                     ? $"Проблем: {errors} — пустой или повторяющийся id, совпадающий или недопустимый класс."
                     : $"{_regs[0].Rows.Count} стр. · {_regs[1].Rows.Count} поп. · {_regs[2].Rows.Count} фрагм." + (_dirty ? " · есть неприменённые правки" : "");
-                _summary.style.color = _kit.Tok(errors > 0 ? NexusToken.Error : NexusToken.TextDim);
+                NexusClass.SetFg(_summary, errors > 0 ? NexusToken.Error : NexusToken.TextDim);
             }
 
             return errors;

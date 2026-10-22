@@ -6,27 +6,23 @@ using UnityEngine.UIElements;
 namespace Exerussus.Nexus.Theme
 {
     /// <summary>
-    /// Состояния взаимодействия (наведение/нажатие) для движкового UI. Тема у нас
-    /// резолвится в C#, USS-переменных нет — поэтому hover/pressed делаем на
-    /// pointer-событиях, меняя фон по токенам. Так смена палитры меняет и эти
-    /// состояния, оставаясь единым источником цвета.
+    /// Помощники стиля движкового UI. С 0.4 состояния компонентов описаны в USS
+    /// (NexusComponents.uss); <see cref="MakePressable"/> остаётся для своих виджетов страниц,
+    /// которые красятся из C#.
     /// </summary>
     public static class NexusStyles
     {
-        /// <summary>Кнопка с фоном по теме и состояниями normal/hover/pressed.</summary>
+        /// <summary>
+        /// Обычная кнопка хаба (роль Common, малый размер). Вид и состояния — из USS
+        /// (<see cref="NexusTheme.ApplyTo"/> на корне окна).
+        /// </summary>
         public static Button Button(string text, Action onClick)
         {
             var b = new Button(onClick) { text = text };
-            b.style.color = NexusTheme.Get(NexusToken.TextNormal);
-            b.style.paddingLeft = 8f;  b.style.paddingRight = 8f;
-            b.style.paddingTop = 2f;   b.style.paddingBottom = 2f;
-            b.style.marginLeft = 2f;   b.style.marginRight = 2f;
-            SetBorder(b, NexusTheme.Get(NexusToken.Border), 1f, 3f);
-
-            MakePressable(b,
-                baseColor: () => NexusTheme.Get(NexusToken.BgRaised),
-                hover:     NexusTheme.Get(NexusToken.Hover),
-                pressed:   NexusTheme.Get(NexusToken.Pressed));
+            b.RemoveFromClassList(UnityEngine.UIElements.Button.ussClassName);
+            b.AddToClassList("nx-btn");
+            b.AddToClassList("nx-btn--sm");
+            b.AddToClassList("nx-btn--common");
             return b;
         }
 

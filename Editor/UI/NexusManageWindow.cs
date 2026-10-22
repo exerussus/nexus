@@ -53,6 +53,7 @@ namespace Exerussus.Nexus.UI
             var root = rootVisualElement;
             root.style.flexDirection = FlexDirection.Column;
             root.style.backgroundColor = BgHard;
+            NexusTheme.ApplyTo(root);
 
             var header = new VisualElement();
             header.style.flexDirection = FlexDirection.Row;
@@ -67,12 +68,14 @@ namespace Exerussus.Nexus.UI
             header.Add(title);
 
             header.Add(new Label("Palette") { style = { color = TextDim, marginRight = 6f } });
+            // Сегменты, а не выпадающий список: меню PopupField рисует редактор в своей светлой теме.
             var palettes = NexusPalettes.Names.ToList();
-            var picker = new PopupField<string>(palettes, NexusTheme.Active.Name);
-            picker.RegisterValueChangedCallback(e =>
+            var picker = new NexusUi().Segmented(palettes.ToArray(), System.Math.Max(0, palettes.IndexOf(NexusTheme.Active.Name)), i =>
             {
-                NexusTheme.Active = NexusPalettes.Get(e.newValue);   // событие перекрасит окна
-                NexusThemeStore.ActiveName = e.newValue;             // запомнить личный выбор
+                // Сначала запомнить выбор: смена палитры шлёт событие, и окно Nexus при пересборке
+                // читает сохранённое имя — запиши его позже, окно откатило бы палитру на прежнюю.
+                NexusThemeStore.ActiveName = palettes[i];
+                NexusTheme.Active = NexusPalettes.Get(palettes[i]);
             });
             header.Add(picker);
 

@@ -1,79 +1,132 @@
-/* ECS Worlds — только раскладка и метрики. Цвета красит C# через
-   Context.Theme.Get(token), чтобы смена палитры Nexus доставала и сюда.
+/* ECS Worlds — раскладка и свои элементы страницы. Цвета — только переменные палитры Nexus
+   (var(--nx-…)) и компоненты хаба (nx-*): в C# цветов нет, смена палитры перекрашивает всё.
    min-height:0 на flex-детях обязателен — иначе внутренний скролл не сжимается. */
 
 .ecs-root { flex-grow: 1; flex-direction: column; min-height: 0; }
 .ecs-content { flex-grow: 1; flex-direction: column; min-height: 0; }
 
+/* ---------- тулбар ---------- */
+
 .ecs-toolbar {
     flex-direction: row;
     align-items: center;
     flex-wrap: wrap;
-    padding: 6px 8px;
-    border-bottom-width: 1px;
+    min-height: 30px;
+    padding: 0 8px;
     flex-shrink: 0;
+    background-color: var(--nx-bg-soft);
+    border-bottom-width: 1px;
+    border-bottom-color: var(--nx-divider);
 }
+.ecs-toolbar > .nx-tabs { align-self: stretch; }
 .ecs-spacer { flex-grow: 1; }
+.ecs-toolinfo { font-size: 11px; margin-right: 8px; }
+
+/* ---------- три панели ---------- */
 
 .ecs-body { flex-grow: 1; flex-direction: row; min-height: 0; }
 
-.ecs-pane { flex-direction: column; padding: 8px; min-height: 0; overflow: hidden; }
-.ecs-world-pane { width: 210px; min-width: 170px; border-right-width: 1px; }
-.ecs-entity-pane { flex-grow: 1; flex-basis: 0; border-right-width: 1px; }
+.ecs-pane { flex-direction: column; padding: 10px; min-height: 0; overflow: hidden; }
+.ecs-world-pane {
+    width: 220px;
+    min-width: 170px;
+    background-color: var(--nx-bg-soft);
+    border-right-width: 1px;
+    border-right-color: var(--nx-divider);
+}
+.ecs-entity-pane {
+    flex-grow: 1;
+    flex-basis: 0;
+    border-right-width: 1px;
+    border-right-color: var(--nx-divider);
+}
 .ecs-inspector-pane { flex-grow: 1.15; flex-basis: 0; }
 
-.ecs-pane-title { font-size: 10px; margin-bottom: 6px; letter-spacing: 1px; flex-shrink: 0; }
+.ecs-pane-title { margin-bottom: 8px; flex-shrink: 0; }
+.ecs-group { margin: 8px 0 4px 2px; }
 
-.ecs-row {
-    flex-direction: row;
-    justify-content: space-between;
-    align-items: center;
-    padding: 5px 7px;
-    border-radius: 5px;
-    margin-bottom: 2px;
+/* ---------- строки (миры, архетипы) на nx-row ---------- */
+
+.ecs-row { justify-content: space-between; margin-bottom: 2px; flex-shrink: 0; }
+.ecs-row-name { font-size: 12px; color: var(--nx-text-normal); }
+.ecs-row-sub { font-size: 11px; color: var(--nx-text-dim); }
+.nx-row--on .ecs-row-name { color: var(--nx-accent-text); -unity-font-style: bold; }
+.ecs-arch { white-space: normal; flex-shrink: 1; }
+
+.ecs-count {
     flex-shrink: 0;
+    margin-left: 6px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    font-size: 11px;
+    -unity-font-style: bold;
+    background-color: var(--nx-accent-soft);
+    color: var(--nx-accent-text);
 }
-.ecs-row-sub { font-size: 11px; }
+
+.ecs-stats { margin-top: 8px; flex-shrink: 0; }
+
+/* ---------- запрос: фишки, поля ---------- */
+
+.ecs-viewtabs { align-self: flex-start; margin-bottom: 8px; flex-shrink: 0; }
+.ecs-back { align-self: flex-start; margin-bottom: 6px; }
 
 .ecs-chips {
     flex-direction: row;
     flex-wrap: wrap;
     align-items: center;
-    padding: 5px;
-    border-radius: 6px;
-    border-width: 1px;
+    min-height: 28px;
+    padding: 4px;
     margin-bottom: 6px;
     flex-shrink: 0;
 }
 .ecs-chip {
     flex-direction: row;
     align-items: center;
-    padding: 1px 7px;
+    padding: 1px 4px 1px 7px;
+    margin: 2px 4px 2px 0;
+    border-width: 1px;
     border-radius: 9px;
-    margin: 2px 3px 2px 0;
     font-size: 11px;
 }
+.ecs-chip > Label { padding: 0; margin: 0; }
+.ecs-chip--inc { background-color: var(--nx-accent-soft); border-color: var(--nx-accent-pressed); color: var(--nx-accent-text); }
+.ecs-chip--exc { background-color: var(--nx-error-soft); border-color: var(--nx-error); color: var(--nx-error); }
+.ecs-chip-x { margin-left: 4px; padding: 0 3px; opacity: 0.6; }
+.ecs-chip-x:hover { opacity: 1; }
 
-.ecs-viewtabs { flex-direction: row; margin-bottom: 8px; flex-shrink: 0; }
+.ecs-inline { flex-direction: row; align-items: center; }
+.ecs-match { margin-left: 6px; }
+.ecs-dim { margin-right: 6px; }
 
-.ecs-entity-list { flex-grow: 1; min-height: 0; }
+/* ---------- список сущностей ---------- */
 
-.ecs-card { padding: 10px; border-radius: 8px; border-width: 1px; margin-bottom: 8px; flex-shrink: 0; }
+.ecs-entity-list {
+    flex-grow: 1;
+    min-height: 0;
+    background-color: var(--nx-bg-inset);
+    border-width: 1px;
+    border-color: var(--nx-divider);
+    border-radius: var(--nx-r-m);
+}
+.ecs-entity { padding-left: 8px; font-size: 12px; -unity-text-align: middle-left; color: var(--nx-text-normal); }
+
+/* ---------- инспектор ---------- */
+
+.ecs-insp-head { margin-bottom: 8px; flex-shrink: 0; }
+.ecs-card { flex-shrink: 0; }
 .ecs-card-head { flex-direction: row; justify-content: space-between; align-items: center; }
-.ecs-card-body { font-size: 12px; margin-top: 6px; margin-left: 2px; white-space: normal; }
-
-.ecs-mono { font-size: 12px; }
-
-.ecs-bar { height: 4px; border-radius: 2px; margin: 4px 0 2px 0; }
-.ecs-bar-fill { height: 4px; border-radius: 2px; }
-
-.ecs-empty { padding: 14px 4px; white-space: normal; font-size: 12px; -unity-text-align: upper-left; }
+.ecs-type { font-size: 12px; -unity-font-style: bold; color: var(--nx-accent-text); }
+.ecs-card-body { margin-top: 6px; }
 
 .ecs-scroll { flex-grow: 1; min-height: 0; }
 
-.ecs-settings { flex-grow: 1; min-height: 0; padding: 10px; }
-.ecs-settings-title { font-size: 13px; margin-bottom: 8px; }
-.ecs-settings-desc { font-size: 11px; white-space: normal; margin-bottom: 8px; }
-.ecs-presets { flex-direction: row; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
-.ecs-inline { flex-direction: row; align-items: center; }
-.ecs-code { font-size: 12px; white-space: normal; padding: 8px; border-radius: 6px; margin-top: 4px; }
+/* ---------- настройки ---------- */
+
+.ecs-settings { flex-grow: 1; min-height: 0; padding: 12px; }
+.ecs-settings-card { max-width: 720px; }
+.ecs-settings-desc { margin: 4px 0 8px 0; }
+.ecs-status { font-size: 11px; }
+.ecs-presets { align-self: flex-start; margin-bottom: 8px; }
+.ecs-now { margin-top: 6px; }
+.ecs-code { margin-top: 4px; }

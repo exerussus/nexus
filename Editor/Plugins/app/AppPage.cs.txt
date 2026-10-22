@@ -69,6 +69,7 @@ namespace Exerussus.Nexus.Pages.App
             _tabs.Add(new NavClassesTab(_kit));
             _tabs.Add(new ExternalTab(_kit));
             _tabs.Add(new TextTab(_kit));
+            _tabs.Add(new LocalizationTab(_kit));
             _tabs.Add(new DeckTab(_kit));
             _tabs.Add(new BuildTab(_kit));
         }
@@ -77,7 +78,6 @@ namespace Exerussus.Nexus.Pages.App
         {
             _root = new VisualElement();
             _root.style.flexGrow = 1;
-            _root.style.backgroundColor = _kit.Tok(NexusToken.BgHard);
             _root.style.paddingLeft = 20f; _root.style.paddingRight = 20f;
             _root.style.paddingTop = 16f;
 
@@ -86,8 +86,10 @@ namespace Exerussus.Nexus.Pages.App
             header.style.flexWrap = Wrap.NoWrap;
             header.style.marginBottom = 10f;
 
-            var title = _kit.Text("App", NexusToken.TextNormal, 16);
-            title.style.unityFontStyleAndWeight = FontStyle.Bold;
+            // Фон не красим: под страницей сетка окна Nexus.
+            var title = _kit.Title("App");
+            title.style.fontSize = 16;
+            NexusClass.SetFg(title, NexusToken.AccentText);
             title.style.marginRight = 12f;
             header.Add(title);
             header.Add(_kit.Mono("com.exerussus.app-core 4.x", NexusToken.TextFaint));

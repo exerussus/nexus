@@ -13,17 +13,39 @@ namespace Exerussus.Nexus.Theme
     public sealed class NexusPalette
     {
         public string Name { get; }
+
+        /// <summary>Скругления и характер заголовков.</summary>
+        public NexusMetrics Metrics { get; }
+
+        /// <summary>Имя файла USS-переменных палитры (Editor/Theme/Uss/&lt;UssName&gt;.uss).</summary>
+        public string UssName { get; }
+
         private readonly Dictionary<NexusToken, Color> _map;
         private readonly Dictionary<NexusRole, NexusRoleColors> _roles;
 
         public NexusPalette(string name,
                             Dictionary<NexusToken, Color> map,
                             Dictionary<NexusRole, NexusRoleColors> roles)
+            : this(name, map, roles, new NexusMetrics(3f, 3f, 5f, false, false), null) { }
+
+        public NexusPalette(string name,
+                            Dictionary<NexusToken, Color> map,
+                            Dictionary<NexusRole, NexusRoleColors> roles,
+                            NexusMetrics metrics,
+                            string ussName)
         {
-            Name   = name;
-            _map   = map   ?? new Dictionary<NexusToken, Color>();
-            _roles = roles ?? new Dictionary<NexusRole, NexusRoleColors>();
+            Name    = name;
+            Metrics = metrics;
+            UssName = ussName;
+            _map    = map   ?? new Dictionary<NexusToken, Color>();
+            _roles  = roles ?? new Dictionary<NexusRole, NexusRoleColors>();
         }
+
+        /// <summary>Все токены палитры (для генерации USS и стенда).</summary>
+        public IReadOnlyDictionary<NexusToken, Color> Tokens => _map;
+
+        /// <summary>Все роли палитры.</summary>
+        public IReadOnlyDictionary<NexusRole, NexusRoleColors> Roles => _roles;
 
         /// <summary>Цвет токена; пропуск виден как маджента (а не молча чёрный).</summary>
         public Color Get(NexusToken token)
@@ -35,7 +57,78 @@ namespace Exerussus.Nexus.Theme
 
         // ---- встроенные палитры ----
 
-        /// <summary>Дефолтная мягкая тёмная палитра.</summary>
+        /// <summary>
+        /// Палитра по умолчанию (0.4): sci-fi — сине-чёрные поверхности, приглушённый бирюзовый
+        /// неон, свечение активного, HUD-уголки карточек, фоновая сетка, моноширинные заголовки.
+        /// </summary>
+        public static NexusPalette Neon()
+        {
+            var text   = Hex("#D2DCE6");
+            var dim    = Hex("#8495A6");
+            var onCyan = Hex("#031418");
+
+            var map = new Dictionary<NexusToken, Color>
+            {
+                { NexusToken.BgHard,     Hex("#0A0E14") },
+                { NexusToken.BgSoft,     Hex("#0F151E") },
+                { NexusToken.BgRaised,   Hex("#151D29") },
+                { NexusToken.TextNormal, text },
+                { NexusToken.TextDim,    dim },
+                { NexusToken.Border,     Hex("#1F2C3B") },
+                { NexusToken.Accent,     Hex("#4CC3D9") },
+                { NexusToken.Selection,  Hex("#10262E") },
+                { NexusToken.Hover,      Hex("#122030") },
+                { NexusToken.Pressed,    Hex("#18293C") },
+                { NexusToken.Ok,         Hex("#5ED6A0") },
+                { NexusToken.Warning,    Hex("#E8BE6A") },
+                { NexusToken.Error,      Hex("#E86A7E") },
+                { NexusToken.Muted,      Hex("#4C5D70") },
+                { NexusToken.Orphan,     Hex("#D9925A") },
+
+                { NexusToken.SurfaceHover,  Hex("#122030") },
+                { NexusToken.Divider,       Hex("#172230") },
+                { NexusToken.AccentHover,   Hex("#6AD3E6") },
+                { NexusToken.AccentPressed, Hex("#2E8DA1") },
+                { NexusToken.AccentSoft,    Hex("#10262E") },
+                { NexusToken.OnAccent,      onCyan },
+                { NexusToken.OkSoft,        Hex("#0E2620") },
+                { NexusToken.WarningSoft,   Hex("#29220F") },
+                { NexusToken.ErrorSoft,     Hex("#2A141A") },
+                { NexusToken.TextFaint,     Hex("#4C5D70") },
+                { NexusToken.Focus,         Hex("#4CC3D9") },
+
+                { NexusToken.BgInset,       Hex("#06090D") },
+                { NexusToken.AccentText,    Hex("#8AD4E3") },
+                { NexusToken.Code,          Hex("#B3E3C6") },
+                { NexusToken.TagAmber,      Hex("#E8BE6A") },
+                { NexusToken.TagAmberSoft,  Hex("#29220F") },
+                { NexusToken.TagGreen,      Hex("#5ED6A0") },
+                { NexusToken.TagGreenSoft,  Hex("#0E2620") },
+                { NexusToken.TagBlue,       Hex("#7FAEE6") },
+                { NexusToken.TagBlueSoft,   Hex("#0F1F38") },
+                { NexusToken.TagViolet,     Hex("#C99BE8") },
+                { NexusToken.TagVioletSoft, Hex("#251A30") },
+                { NexusToken.Glow,          new Color(0.298f, 0.765f, 0.851f, 0.22f) },
+                { NexusToken.Bracket,       Hex("#4CC3D9") },
+                { NexusToken.Grid,          new Color(0.298f, 0.765f, 0.851f, 0.018f) },
+            };
+
+            var roles = new Dictionary<NexusRole, NexusRoleColors>
+            {
+                { NexusRole.Primary, Explicit(Hex("#3AA8BF"), onCyan, Hex("#4CC3D9"), Hex("#2E8DA1"), Hex("#3AA8BF")) },
+                { NexusRole.Common,  Explicit(Hex("#132131"), text, Hex("#1A2D42"), Hex("#18293C"), Hex("#1F2C3B")) },
+                { NexusRole.Alarm,   Solid(Hex("#C9506A"), Color.white) },
+                { NexusRole.Success, Solid(Hex("#2FA37A"), Color.white) },
+                { NexusRole.Warning, Solid(Hex("#DDB25E"), Hex("#1B1B1B")) },
+                { NexusRole.Info,    Solid(Hex("#4F86D6"), Color.white) },
+                { NexusRole.Muted,   Explicit(Hex("#132131"), dim, Hex("#1A2D42"), Hex("#18293C"), Hex("#1F2C3B")) },
+                { NexusRole.Ghost,   NeonGhost(Hex("#8AD4E3"), Hex("#1F2C3B"), Hex("#10262E")) },
+            };
+
+            return new NexusPalette("Neon", map, roles, new NexusMetrics(2f, 3f, 4f, true, true), "Neon");
+        }
+
+        /// <summary>Мягкая тёмная палитра (была дефолтной до 0.4).</summary>
         public static NexusPalette SoftDark()
         {
             var white = new Color(0.96f, 0.97f, 0.99f);
@@ -85,7 +178,22 @@ namespace Exerussus.Nexus.Theme
                 { NexusRole.Ghost,   Ghost(new Color(0.45f, 0.65f, 0.95f)) },
             };
 
-            return new NexusPalette("Soft Dark", map, roles);
+            // 0.4: спокойная палитра без неона — мягкое свечение фокуса, без уголков и сетки.
+            map[NexusToken.BgInset]       = Hex("#222227");
+            map[NexusToken.AccentText]    = Hex("#8DB8F5");
+            map[NexusToken.Code]          = Hex("#B9D99A");
+            map[NexusToken.TagAmber]      = Hex("#E3BE6B");
+            map[NexusToken.TagAmberSoft]  = Hex("#3A3325");
+            map[NexusToken.TagGreen]      = Hex("#7CC99B");
+            map[NexusToken.TagGreenSoft]  = Hex("#26362D");
+            map[NexusToken.TagBlue]       = Hex("#8DB8F5");
+            map[NexusToken.TagBlueSoft]   = Hex("#283447");
+            map[NexusToken.TagViolet]     = Hex("#BBA6EC");
+            map[NexusToken.TagVioletSoft] = Hex("#322C45");
+            map[NexusToken.Glow]          = new Color(0.40f, 0.62f, 0.92f, 0.14f);
+            map[NexusToken.Bracket]       = Color.clear;
+            map[NexusToken.Grid]          = Color.clear;
+            return new NexusPalette("Soft Dark", map, roles, new NexusMetrics(4f, 6f, 8f, false, false), "SoftDark");
         }
 
         /// <summary>Холодная тёмная альтернатива (демонстрирует подмену палитры).</summary>
@@ -138,10 +246,53 @@ namespace Exerussus.Nexus.Theme
                 { NexusRole.Ghost,   Ghost(new Color(0.40f, 0.78f, 0.72f)) },
             };
 
-            return new NexusPalette("Graphite", map, roles);
+            // 0.4: строгий графит с бирюзой — моноширинные заголовки без капслока, тонкая сетка, без уголков.
+            map[NexusToken.BgInset]       = Hex("#16181B");
+            map[NexusToken.AccentText]    = Hex("#7FD6CC");
+            map[NexusToken.Code]          = Hex("#A8D8B9");
+            map[NexusToken.TagAmber]      = Hex("#D9B061");
+            map[NexusToken.TagAmberSoft]  = Hex("#30291B");
+            map[NexusToken.TagGreen]      = Hex("#6CC7A0");
+            map[NexusToken.TagGreenSoft]  = Hex("#1E3129");
+            map[NexusToken.TagBlue]       = Hex("#7FB5D9");
+            map[NexusToken.TagBlueSoft]   = Hex("#1D2C38");
+            map[NexusToken.TagViolet]     = Hex("#B49BD6");
+            map[NexusToken.TagVioletSoft] = Hex("#2A2536");
+            map[NexusToken.Glow]          = new Color(0.36f, 0.74f, 0.70f, 0.16f);
+            map[NexusToken.Bracket]       = Color.clear;
+            map[NexusToken.Grid]          = new Color(1f, 1f, 1f, 0.014f);
+            return new NexusPalette("Graphite", map, roles, new NexusMetrics(2f, 4f, 6f, true, false), "Graphite");
+        }
+
+        /// <summary>«#RRGGBB» или «#RRGGBBAA» → Color. Палитры пишутся так, как их рисует дизайн.</summary>
+        public static Color Hex(string hex)
+        {
+            return ColorUtility.TryParseHtmlString(hex, out var c) ? c : Color.magenta;
         }
 
         // ---- построение наборов ролей (состояния заданы явно, но выводятся из базы) ----
+
+        private static NexusRoleColors Explicit(Color bg, Color fg, Color hover, Color pressed, Color border) => new NexusRoleColors
+        {
+            Bg       = bg,
+            Fg       = fg,
+            Hover    = hover,
+            Pressed  = pressed,
+            Disabled = Desaturate(bg, 0.6f),
+            Border   = border,
+            Soft     = new Color(bg.r, bg.g, bg.b, 0.16f),
+        };
+
+        private static NexusRoleColors NeonGhost(Color fg, Color border, Color hover) => new NexusRoleColors
+        {
+            Bg       = new Color(0f, 0f, 0f, 0f),
+            Fg       = fg,
+            Hover    = hover,
+            Pressed  = new Color(hover.r * 1.3f, hover.g * 1.3f, hover.b * 1.3f, 1f),
+            Disabled = new Color(fg.r, fg.g, fg.b, 0.3f),
+            Border   = border,
+            Soft     = hover,
+        };
 
         private static NexusRoleColors Solid(Color bg, Color fg) => new NexusRoleColors
         {

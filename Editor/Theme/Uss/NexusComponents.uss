@@ -1,0 +1,649 @@
+/* Компоненты Nexus. Значения — переменные палитры (--nx-*, файлы Neon.uss, SoftDark.uss…),
+   состояния — псевдоклассы, без колбэков. Классы вешает NexusUi; страницы могут вешать их сами.
+   Инлайн-стили страницы сильнее USS — так старые страницы продолжают краситься по-своему. */
+
+.nx-root {
+    background-color: var(--nx-bg-hard);
+    color: var(--nx-text-normal);
+}
+
+/* ---------- кнопки ---------- */
+
+.nx-btn {
+    margin: 0 2px;
+    padding: 3px 11px;
+    min-height: 22px;
+    border-width: 1px;
+    border-radius: var(--nx-r-m);
+    -unity-font-style: bold;
+    font-size: 12px;
+    transition-property: background-color, border-color, color;
+    transition-duration: 0.08s;
+}
+
+.nx-btn--sm {
+    padding: 1px 8px;
+    min-height: 18px;
+    font-size: 11px;
+}
+
+.nx-btn:disabled {
+    opacity: 0.45;
+}
+
+.nx-btn--primary {
+    background-color: var(--nx-role-primary-bg);
+    color: var(--nx-role-primary-fg);
+    border-color: var(--nx-role-primary-border);
+}
+
+.nx-btn--primary:hover {
+    background-color: var(--nx-role-primary-hover);
+}
+
+.nx-btn--primary:active {
+    background-color: var(--nx-role-primary-pressed);
+}
+
+.nx-btn--common {
+    background-color: var(--nx-role-common-bg);
+    color: var(--nx-role-common-fg);
+    border-color: var(--nx-role-common-border);
+}
+
+.nx-btn--common:hover {
+    background-color: var(--nx-role-common-hover);
+}
+
+.nx-btn--common:active {
+    background-color: var(--nx-role-common-pressed);
+}
+
+.nx-btn--alarm {
+    background-color: var(--nx-role-alarm-bg);
+    color: var(--nx-role-alarm-fg);
+    border-color: var(--nx-role-alarm-border);
+}
+
+.nx-btn--alarm:hover {
+    background-color: var(--nx-role-alarm-hover);
+}
+
+.nx-btn--alarm:active {
+    background-color: var(--nx-role-alarm-pressed);
+}
+
+.nx-btn--success {
+    background-color: var(--nx-role-success-bg);
+    color: var(--nx-role-success-fg);
+    border-color: var(--nx-role-success-border);
+}
+
+.nx-btn--success:hover {
+    background-color: var(--nx-role-success-hover);
+}
+
+.nx-btn--success:active {
+    background-color: var(--nx-role-success-pressed);
+}
+
+.nx-btn--warning {
+    background-color: var(--nx-role-warning-bg);
+    color: var(--nx-role-warning-fg);
+    border-color: var(--nx-role-warning-border);
+}
+
+.nx-btn--warning:hover {
+    background-color: var(--nx-role-warning-hover);
+}
+
+.nx-btn--warning:active {
+    background-color: var(--nx-role-warning-pressed);
+}
+
+.nx-btn--info {
+    background-color: var(--nx-role-info-bg);
+    color: var(--nx-role-info-fg);
+    border-color: var(--nx-role-info-border);
+}
+
+.nx-btn--info:hover {
+    background-color: var(--nx-role-info-hover);
+}
+
+.nx-btn--info:active {
+    background-color: var(--nx-role-info-pressed);
+}
+
+.nx-btn--muted {
+    background-color: var(--nx-role-muted-bg);
+    color: var(--nx-role-muted-fg);
+    border-color: var(--nx-role-muted-border);
+}
+
+.nx-btn--muted:hover {
+    background-color: var(--nx-role-muted-hover);
+}
+
+.nx-btn--muted:active {
+    background-color: var(--nx-role-muted-pressed);
+}
+
+.nx-btn--ghost {
+    background-color: var(--nx-role-ghost-bg);
+    color: var(--nx-role-ghost-fg);
+    border-color: var(--nx-role-ghost-border);
+}
+
+.nx-btn--ghost:hover {
+    background-color: var(--nx-role-ghost-hover);
+}
+
+.nx-btn--ghost:active {
+    background-color: var(--nx-role-ghost-pressed);
+}
+
+.nx-btn--ghost:hover {
+    border-color: var(--nx-accent);
+}
+
+/* ---------- бейджи, плашки, метки ---------- */
+
+.nx-badge {
+    padding: 1px 7px;
+    border-width: 1px;
+    border-radius: 9px;
+    font-size: 10px;
+    -unity-text-align: middle-center;
+}
+
+.nx-badge--primary {
+    background-color: var(--nx-role-primary-bg);
+    color: var(--nx-role-primary-fg);
+    border-color: var(--nx-role-primary-border);
+}
+
+.nx-badge--common {
+    background-color: var(--nx-role-common-bg);
+    color: var(--nx-role-common-fg);
+    border-color: var(--nx-role-common-border);
+}
+
+.nx-badge--alarm {
+    background-color: var(--nx-role-alarm-bg);
+    color: var(--nx-role-alarm-fg);
+    border-color: var(--nx-role-alarm-border);
+}
+
+.nx-badge--success {
+    background-color: var(--nx-role-success-bg);
+    color: var(--nx-role-success-fg);
+    border-color: var(--nx-role-success-border);
+}
+
+.nx-badge--warning {
+    background-color: var(--nx-role-warning-bg);
+    color: var(--nx-role-warning-fg);
+    border-color: var(--nx-role-warning-border);
+}
+
+.nx-badge--info {
+    background-color: var(--nx-role-info-bg);
+    color: var(--nx-role-info-fg);
+    border-color: var(--nx-role-info-border);
+}
+
+.nx-badge--muted {
+    background-color: var(--nx-role-muted-bg);
+    color: var(--nx-role-muted-fg);
+    border-color: var(--nx-role-muted-border);
+}
+
+.nx-badge--ghost {
+    background-color: var(--nx-role-ghost-bg);
+    color: var(--nx-role-ghost-fg);
+    border-color: var(--nx-role-ghost-border);
+}
+
+.nx-pill--ok {
+    background-color: var(--nx-ok-soft);
+    color: var(--nx-ok);
+    border-color: var(--nx-ok);
+}
+
+.nx-pill--warning {
+    background-color: var(--nx-warning-soft);
+    color: var(--nx-warning);
+    border-color: var(--nx-warning);
+}
+
+.nx-pill--error {
+    background-color: var(--nx-error-soft);
+    color: var(--nx-error);
+    border-color: var(--nx-error);
+}
+
+.nx-pill--info {
+    background-color: var(--nx-accent-soft);
+    color: var(--nx-accent);
+    border-color: var(--nx-accent);
+}
+
+.nx-pill {
+    padding: 1px 7px;
+    border-width: 1px;
+    border-radius: 9px;
+    font-size: 10px;
+    -unity-text-align: middle-center;
+}
+
+.nx-tag {
+    padding: 1px 6px;
+    border-radius: var(--nx-r-s);
+    font-size: 11px;
+    -unity-text-align: middle-center;
+}
+
+.nx-tag--amber {
+    background-color: var(--nx-tag-amber-soft);
+    color: var(--nx-tag-amber);
+}
+
+.nx-tag--green {
+    background-color: var(--nx-tag-green-soft);
+    color: var(--nx-tag-green);
+}
+
+.nx-tag--blue {
+    background-color: var(--nx-tag-blue-soft);
+    color: var(--nx-tag-blue);
+}
+
+.nx-tag--violet {
+    background-color: var(--nx-tag-violet-soft);
+    color: var(--nx-tag-violet);
+}
+
+.nx-code {
+    padding: 3px 6px;
+    background-color: var(--nx-bg-inset);
+    color: var(--nx-code);
+    border-radius: var(--nx-r-s);
+    font-size: 11px;
+    white-space: normal;
+}
+
+/* ---------- поверхности ---------- */
+
+.nx-card {
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background-color: var(--nx-bg-soft);
+    border-width: 1px;
+    border-color: var(--nx-divider);
+    border-radius: var(--nx-r-l);
+}
+
+.nx-card:hover {
+    border-color: var(--nx-border);
+}
+
+.nx-bracket {
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    border-color: var(--nx-bracket);
+}
+
+.nx-bracket--tl {
+    left: -1px;
+    top: -1px;
+    border-left-width: 2px;
+    border-top-width: 2px;
+    border-top-left-radius: var(--nx-r-l);
+}
+
+.nx-bracket--br {
+    right: -1px;
+    bottom: -1px;
+    border-right-width: 2px;
+    border-bottom-width: 2px;
+    border-bottom-right-radius: var(--nx-r-l);
+}
+
+.nx-divider {
+    height: 1px;
+    flex-shrink: 0;
+    margin: 4px 0;
+    background-color: var(--nx-divider);
+}
+
+.nx-title {
+    font-size: 12px;
+    -unity-font-style: bold;
+    color: var(--nx-text-normal);
+    letter-spacing: var(--nx-title-spacing);
+}
+
+/* ---------- поля ---------- */
+
+.nx-root .unity-base-text-field__input,
+.nx-root .unity-base-popup-field__input {
+    background-color: var(--nx-bg-inset);
+    color: var(--nx-text-normal);
+    border-color: var(--nx-border);
+    border-radius: var(--nx-r-m);
+}
+
+.nx-root .unity-base-text-field:focus > .unity-base-text-field__input {
+    border-color: var(--nx-focus);
+}
+
+.nx-root .unity-base-field__label {
+    color: var(--nx-text-dim);
+}
+
+.nx-root .unity-toggle__text {
+    color: var(--nx-text-normal);
+}
+
+/* ---------- вкладки и сегменты ---------- */
+
+.nx-tabs {
+    flex-direction: row;
+    flex-shrink: 0;
+    border-bottom-width: 1px;
+    border-bottom-color: var(--nx-divider);
+}
+
+.nx-tab {
+    padding: 7px 2px 8px 2px;
+    margin-right: 18px;
+    margin-bottom: -1px;
+    border-bottom-width: 2px;
+    border-bottom-color: rgba(0, 0, 0, 0);
+    color: var(--nx-text-dim);
+    font-size: 12px;
+}
+
+.nx-tab:hover {
+    color: var(--nx-text-normal);
+}
+
+.nx-tab--on,
+.nx-tab--on:hover {
+    color: var(--nx-accent-text);
+    border-bottom-color: var(--nx-accent);
+    -unity-font-style: bold;
+}
+
+.nx-seg {
+    flex-direction: row;
+    flex-shrink: 0;
+    align-self: flex-start;
+    padding: 3px;
+    background-color: var(--nx-bg-hard);
+    border-width: 1px;
+    border-color: var(--nx-divider);
+    border-radius: var(--nx-r-l);
+}
+
+.nx-seg__item {
+    padding: 4px 12px;
+    border-width: 1px;
+    border-color: rgba(0, 0, 0, 0);
+    border-radius: var(--nx-r-m);
+    color: var(--nx-text-dim);
+    font-size: 11px;
+    -unity-text-align: middle-center;
+}
+
+.nx-seg__item:hover {
+    color: var(--nx-text-normal);
+}
+
+.nx-seg__item--on,
+.nx-seg__item--on:hover {
+    background-color: var(--nx-bg-raised);
+    border-color: var(--nx-divider);
+    color: var(--nx-text-normal);
+    -unity-font-style: bold;
+}
+
+/* ---------- списки ---------- */
+
+.nx-row {
+    flex-direction: row;
+    align-items: center;
+    min-height: 26px;
+    padding: 4px 8px;
+    border-width: 1px;
+    border-color: rgba(0, 0, 0, 0);
+    border-radius: var(--nx-r-m);
+}
+
+.nx-row:hover {
+    background-color: var(--nx-hover);
+}
+
+.nx-row--on,
+.nx-row--on:hover {
+    background-color: var(--nx-accent-soft);
+    border-color: var(--nx-accent);
+}
+
+/* ---------- окно ---------- */
+
+.nx-toolbar {
+    flex-direction: row;
+    align-items: center;
+    height: 32px;
+    padding: 0 8px;
+    background-color: var(--nx-bg-soft);
+    border-bottom-width: 1px;
+    border-bottom-color: var(--nx-divider);
+}
+
+.nx-toolbar__title {
+    -unity-font-style: bold;
+    color: var(--nx-accent-text);
+    letter-spacing: var(--nx-title-spacing);
+}
+
+.nx-toolbar__dot {
+    width: 7px;
+    height: 7px;
+    margin-left: 10px;
+    border-radius: 4px;
+    background-color: var(--nx-ok);
+}
+
+.nx-sidebar {
+    width: 210px;
+    flex-shrink: 0;
+    background-color: var(--nx-bg-soft);
+    border-right-width: 1px;
+    border-right-color: var(--nx-divider);
+}
+
+.nx-sidebar > .unity-scroll-view__content-viewport > .unity-scroll-view__content-container {
+    padding: 8px 6px;
+}
+
+.nx-side {
+    flex-direction: row;
+    align-items: center;
+    height: 26px;
+    padding-left: 8px;
+    padding-right: 6px;
+    margin-bottom: 1px;
+    border-left-width: 2px;
+    border-left-color: rgba(0, 0, 0, 0);
+    border-radius: var(--nx-r-m);
+    color: var(--nx-text-dim);
+}
+
+.nx-side:hover {
+    background-color: var(--nx-hover);
+    color: var(--nx-text-normal);
+}
+
+.nx-side--on,
+.nx-side--on:hover {
+    background-color: var(--nx-accent-soft);
+    border-left-color: var(--nx-accent);
+    color: var(--nx-text-normal);
+    -unity-font-style: bold;
+}
+
+.nx-side__icon {
+    width: 14px;
+    height: 14px;
+    margin-right: 8px;
+    flex-shrink: 0;
+}
+
+.nx-side__mark {
+    width: 6px;
+    height: 6px;
+    margin-left: 4px;
+    margin-right: 12px;
+    flex-shrink: 0;
+    border-radius: 1px;
+    background-color: var(--nx-border);
+}
+
+.nx-side:hover > .nx-side__mark {
+    background-color: var(--nx-text-faint);
+}
+
+.nx-side--on > .nx-side__mark,
+.nx-side--on:hover > .nx-side__mark {
+    background-color: var(--nx-accent);
+}
+
+.nx-section {
+    margin: 10px 0 4px 10px;
+    font-size: 10px;
+    -unity-font-style: bold;
+    color: var(--nx-text-faint);
+    letter-spacing: 1px;
+}
+
+.nx-content {
+    flex-grow: 1;
+    padding: 14px 16px 0 16px;
+}
+
+.nx-section-fold {
+    margin: 0;
+}
+
+.nx-section-fold > .unity-foldout__toggle {
+    margin: 12px 0 4px 2px;
+}
+
+.nx-section-fold > .unity-foldout__toggle .unity-toggle__text {
+    font-size: 10px;
+    -unity-font-style: bold;
+    color: var(--nx-text-faint);
+    letter-spacing: 1px;
+}
+
+.nx-section-fold > .unity-foldout__toggle:hover .unity-toggle__text {
+    color: var(--nx-text-dim);
+}
+
+.nx-section-fold > .unity-foldout__toggle .unity-foldout__checkmark {
+    -unity-background-image-tint-color: var(--nx-text-faint);
+}
+
+.nx-section-fold > .unity-foldout__content {
+    margin-left: 0;
+}
+
+/* ---------- текст и мелочи для страниц ---------- */
+
+.nx-text {
+    font-size: 12px;
+    white-space: normal;
+    color: var(--nx-text-normal);
+}
+
+.nx-hint {
+    font-size: 11px;
+    white-space: normal;
+    color: var(--nx-text-dim);
+}
+
+/* Подпись секции/панели: мелкий разреженный капслок. */
+.nx-label {
+    font-size: 10px;
+    letter-spacing: 1px;
+    -unity-font-style: bold;
+    color: var(--nx-text-faint);
+}
+
+.nx-empty {
+    padding: 14px 4px;
+    font-size: 12px;
+    white-space: normal;
+    -unity-text-align: upper-left;
+    color: var(--nx-text-dim);
+}
+
+/* Строка «ключ — значение». */
+.nx-kv {
+    flex-direction: row;
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+.nx-kv > Label {
+    padding: 0;
+    margin: 0;
+}
+
+.nx-kv__key {
+    color: var(--nx-text-dim);
+}
+
+.nx-kv__value {
+    color: var(--nx-text-normal);
+}
+
+/* Полоса заполнения: ширину заполнения задаёт страница (style.width в %). */
+.nx-bar {
+    height: 4px;
+    margin: 4px 0 2px 0;
+    border-radius: 2px;
+    background-color: var(--nx-divider);
+}
+
+.nx-bar__fill {
+    height: 4px;
+    border-radius: 2px;
+    background-color: var(--nx-accent);
+}
+
+/* Утопленная поверхность (поле, сниппет, область списка). */
+.nx-inset {
+    background-color: var(--nx-bg-inset);
+    border-width: 1px;
+    border-color: var(--nx-divider);
+    border-radius: var(--nx-r-m);
+}
+
+/* Списки Unity (ListView/TreeView) — выбор и наведение цветами палитры, а не синим редактора. */
+.nx-root .unity-collection-view__item:hover {
+    background-color: var(--nx-hover);
+}
+
+.nx-root .unity-collection-view__item--selected,
+.nx-root .unity-collection-view__item--selected:hover {
+    background-color: var(--nx-accent-soft);
+}
+
+.nx-root .unity-collection-view__item--selected Label {
+    color: var(--nx-accent-text);
+}

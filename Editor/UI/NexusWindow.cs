@@ -111,20 +111,23 @@ namespace Exerussus.Nexus.UI
                 _host = new PageHost(_bus, NexusTheme.PageTheme, _ui);
 
                 root.style.flexDirection = FlexDirection.Column;
-                root.style.backgroundColor = BgHard;
+                NexusTheme.ApplyTo(root);
 
                 root.Add(BuildToolbar());
 
                 var body = new VisualElement { style = { flexDirection = FlexDirection.Row, flexGrow = 1f } };
                 root.Add(body);
 
-                _sidebar = new VisualElement();
-                _sidebar.style.width = 190f;
-                _sidebar.style.backgroundColor = BgSoft;
-                _sidebar.style.paddingTop = 4f;
+                // Сайдбар прокручивается целиком: разделы не растягиваются и не оставляют дыр.
+                _sidebar = new ScrollView(ScrollViewMode.Vertical);
+                _sidebar.AddToClassList("nx-sidebar");
+                // Палитра с моноширинными заголовками (Neon) — сайдбар тем же шрифтом, что и заголовки.
+                if (NexusTheme.Metrics.MonoTitles) NexusUi.ApplyMono(_sidebar);
                 body.Add(_sidebar);
 
-                _content = new VisualElement { style = { flexGrow = 1f, paddingLeft = 12f, paddingTop = 12f } };
+                _content = new VisualElement();
+                _content.AddToClassList("nx-content");
+                NexusGrid.Apply(_content);
                 body.Add(_content);
 
                 RebuildSidebar();
@@ -135,14 +138,16 @@ namespace Exerussus.Nexus.UI
         private VisualElement BuildToolbar()
         {
             var bar = new VisualElement();
-            bar.style.flexDirection = FlexDirection.Row;
-            bar.style.alignItems = Align.Center;
-            bar.style.height = 28f;
-            bar.style.paddingLeft = 8f;
-            bar.style.paddingRight = 8f;
-            bar.style.backgroundColor = BgSoft;
+            bar.AddToClassList("nx-toolbar");
 
-            bar.Add(new Label("Nexus") { style = { unityFontStyleAndWeight = FontStyle.Bold } });
+            var title = new Label(NexusTheme.Metrics.UpperTitles ? "NEXUS" : "Nexus");
+            title.AddToClassList("nx-toolbar__title");
+            if (NexusTheme.Metrics.MonoTitles) NexusUi.ApplyMono(title);
+            bar.Add(title);
+
+            var dot = new VisualElement();
+            dot.AddToClassList("nx-toolbar__dot");
+            bar.Add(dot);
 
             // статус: одна строка с многоточием; клик — окно сообщений с полным текстом
             _status = new Label(string.Empty);
@@ -190,7 +195,7 @@ namespace Exerussus.Nexus.UI
             _sidebar.Clear();
             _byId.Clear();
 
-            _sidebar.Add(SidebarItem(HealthId, "◆ Nexus Health"));
+            _sidebar.Add(SidebarItem(HealthId, "Nexus Health"));
 
             var infra = new List<DiscoveredPlugin>();
             var game  = new List<DiscoveredPlugin>();
@@ -235,20 +240,13 @@ namespace Exerussus.Nexus.UI
         {
             if (items.Count == 0) return null;
 
-            var fold = new Foldout { text = title };
+            var fold = new Foldout { text = NexusTheme.Metrics.UpperTitles ? title.ToUpperInvariant() : title };
+            fold.AddToClassList("nx-section-fold");
             var key = "Exerussus.Nexus.fold." + title;
             fold.value = SessionState.GetBool(key, true);
-            fold.style.flexGrow = fold.value ? 1f : 0f;
-            fold.style.minHeight = 0f;
-            fold.RegisterValueChangedCallback(evt =>
-            {
-                SessionState.SetBool(key, evt.newValue);
-                fold.style.flexGrow = evt.newValue ? 1f : 0f;
-            });
+            fold.RegisterValueChangedCallback(evt => SessionState.SetBool(key, evt.newValue));
 
-            var scroll = new ScrollView(ScrollViewMode.Vertical) { style = { flexGrow = 1f, minHeight = 0f } };
-            foreach (var p in items) scroll.Add(SidebarItem(p.Id, p.DisplayName));
-            fold.Add(scroll);
+            foreach (var p in items) fold.Add(SidebarItem(p.Id, p.DisplayName));
             return fold;
         }
 
@@ -256,28 +254,27 @@ namespace Exerussus.Nexus.UI
         {
             var item = new VisualElement { name = "item-" + id };
             item.AddToClassList("nexus-item");
-            item.style.flexDirection = FlexDirection.Row;
-            item.style.alignItems = Align.Center;
-            item.style.height = 24f;
-            item.style.paddingLeft = 10f;
+            item.AddToClassList("nx-side");
 
-            var icon = PluginMedia.LoadIcon(id);   // page_logo.png, если есть
+            // Своя иконка (page_logo.png) — картинкой; без неё — маленькая метка в цвет темы,
+            // а не серый квадрат-заглушка.
+            var icon = PluginMedia.LoadOwnIcon(id);
             if (icon != null)
             {
                 var img = new Image { image = icon, scaleMode = ScaleMode.ScaleToFit };
-                img.style.width = 16f;
-                img.style.height = 16f;
-                img.style.marginRight = 6f;
+                img.AddToClassList("nx-side__icon");
                 item.Add(img);
+            }
+            else
+            {
+                var mark = new VisualElement();
+                mark.AddToClassList("nx-side__mark");
+                item.Add(mark);
             }
 
             item.Add(new Label(title) { style = { unityTextAlign = TextAnchor.MiddleLeft } });
 
             item.RegisterCallback<MouseDownEvent>(_ => Select(id));
-            NexusStyles.MakePressable(item,
-                () => item.name == "item-" + _selectedId ? SelBg : Color.clear,
-                NexusTheme.Get(NexusToken.Hover),
-                NexusTheme.Get(NexusToken.Pressed));
             return item;
         }
 
@@ -400,8 +397,7 @@ namespace Exerussus.Nexus.UI
             _sidebar.Query<VisualElement>(null, "nexus-item").ForEach(item =>
             {
                 if (item.name == null || !item.name.StartsWith("item-")) return;
-                item.style.backgroundColor =
-                    item.name == "item-" + _selectedId ? SelBg : new StyleColor(Color.clear);
+                item.EnableInClassList("nx-side--on", item.name == "item-" + _selectedId);
             });
         }
 
@@ -430,10 +426,8 @@ namespace Exerussus.Nexus.UI
             {
                 _journal.SetEnabled(last != null);
                 var alarm = NexusStatusLog.HasUnseenError;
-                var c = alarm ? ErrCol : NexusTheme.Get(NexusToken.Border);
-                _journal.style.color = alarm ? ErrCol : NexusTheme.Get(NexusToken.TextNormal);
-                _journal.style.borderTopColor = c;  _journal.style.borderBottomColor = c;
-                _journal.style.borderLeftColor = c; _journal.style.borderRightColor = c;
+                _journal.EnableInClassList("nx-btn--common", !alarm);
+                _journal.EnableInClassList("nx-btn--alarm", alarm);
                 _journal.text = alarm ? "Сообщения ●" : "Сообщения";
             }
         }

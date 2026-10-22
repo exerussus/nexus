@@ -13,5 +13,8 @@ namespace Exerussus.Nexus.Abstractions
         /// <summary>Полный набор цветов роли (для собственных виджетов страницы).
         /// Готовые кнопки/бейджи проще брать через <see cref="IPageUi"/>.</summary>
         NexusRoleColors GetRole(NexusRole role);
+
+        /// <summary>Скругления и характер заголовков активной палитры.</summary>
+        NexusMetrics Metrics { get; }
     }
 }

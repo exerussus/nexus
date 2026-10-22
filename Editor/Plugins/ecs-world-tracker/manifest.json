@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "e4f7c2a1-9b3d-4c6e-8a12-7d5f0b9e1c34",
   "id": "ecs-world-tracker",
-  "version": "1.0",
+  "version": "1.1",
   "typeName": "Exerussus.Nexus.Pages.EcsWorldTracker.EcsWorldTrackerPage",
   "kind": "servicing",
   "display": {

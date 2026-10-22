@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "0a1f7c4e9b2d4f6a8c3e5d7b1a9f0e22",
   "id": "app",
-  "version": "3.1",
+  "version": "3.2",
   "typeName": "Exerussus.Nexus.Pages.App.AppPage",
   "kind": "servicing",
   "display": {
@@ -60,6 +60,14 @@
     {
       "from": "TextTab.cs.txt",
       "to": "TextTab.cs"
+    },
+    {
+      "from": "LocalizationTab.cs.txt",
+      "to": "LocalizationTab.cs"
+    },
+    {
+      "from": "LocTableView.cs.txt",
+      "to": "LocTableView.cs"
     },
     {
       "from": "DeckTab.cs.txt",

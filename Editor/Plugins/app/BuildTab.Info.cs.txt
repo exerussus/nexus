@@ -165,15 +165,14 @@ namespace Exerussus.Nexus.Pages.App
             box.style.width = 30f;
             box.style.height = 20f;
             box.style.marginRight = 6f;
-            box.style.backgroundColor = _kit.Tok(selected ? NexusToken.AccentSoft : NexusToken.BgHard);
-            AppKit.SetBorder(box, _kit.Tok(selected ? NexusToken.Accent : NexusToken.Divider), 1f, 4f);
+            AppKit.Surface(box, selected ? NexusToken.AccentSoft : NexusToken.BgInset, selected ? NexusToken.Accent : NexusToken.Divider, 4f);
             box.tooltip = corner switch { 0 => "Слева сверху", 1 => "Справа сверху", 2 => "Слева снизу", _ => "Справа снизу" };
 
             var dot = new VisualElement();
             dot.style.position = Position.Absolute;
             dot.style.width = 5f;
             dot.style.height = 5f;
-            dot.style.backgroundColor = _kit.Tok(selected ? NexusToken.Accent : NexusToken.TextFaint);
+            dot.AddToClassList(NexusClass.Bg(selected ? NexusToken.Accent : NexusToken.TextFaint));
             AppKit.SetRadius(dot, 1f);
             if (corner is 0 or 2) dot.style.left = 4f; else dot.style.right = 4f;
             if (corner is 0 or 1) dot.style.top = 4f; else dot.style.bottom = 4f;
@@ -191,8 +190,7 @@ namespace Exerussus.Nexus.Pages.App
 
             var frame = new VisualElement();
             frame.style.height = 235f;
-            frame.style.backgroundColor = _kit.Tok(NexusToken.BgHard);
-            AppKit.SetBorder(frame, _kit.Tok(NexusToken.Divider), 1f, 6f);
+            AppKit.Surface(frame, NexusToken.BgInset, NexusToken.Divider, 6f);
             frame.style.overflow = Overflow.Hidden;
 
             // Чёрные поля обрезки по бокам и полоса кадра — как в широком окне.
@@ -200,7 +198,7 @@ namespace Exerussus.Nexus.Pages.App
             band.style.position = Position.Absolute;
             band.style.left = 34f; band.style.right = 34f;
             band.style.top = 0f; band.style.bottom = 0f;
-            band.style.backgroundColor = _kit.Tok(NexusToken.BgRaised);
+            band.AddToClassList(NexusClass.Bg(NexusToken.BgRaised));
             band.style.justifyContent = Justify.Center;
             band.style.alignItems = Align.Center;
             band.Add(_kit.Faint("[ЭКРАН ИГРЫ]"));

@@ -263,12 +263,12 @@ namespace Exerussus.Nexus.Pages.App
                     var expanded = BuildTokens.Expand(template, PlayerSettings.productName, PlayerSettings.bundleVersion,
                         "1a2b3c4", "<профиль>", EditorUserBuildSettings.activeBuildTarget.ToString(), DateTime.Now);
                     preview.text = $"Будет: {Or(s.bucket, "<бакет>")}/{ResolvePrefix(template, expanded)}/  ·  {BuildTokens.Help}";
-                    preview.style.color = kit.Tok(NexusToken.TextFaint);
+                    NexusClass.SetFg(preview, NexusToken.TextFaint);
                 }
                 catch (Exception ex)
                 {
                     preview.text = ex.Message;
-                    preview.style.color = kit.Tok(NexusToken.Error);
+                    NexusClass.SetFg(preview, NexusToken.Error);
                 }
             }
             VisualElement rootRow = null;
@@ -309,7 +309,7 @@ namespace Exerussus.Nexus.Pages.App
                 keyStatus.text = k.Source == KeySource.None
                     ? (s.skipWithoutKeys ? "Ключей нет — шаг будет пропущен." : "Ключей нет — шаг упадёт.")
                     : "Ключи: " + k.Describe();
-                keyStatus.style.color = kit.Tok(k.Source == KeySource.None ? NexusToken.Warning : NexusToken.Ok);
+                NexusClass.SetFg(keyStatus, k.Source == KeySource.None ? NexusToken.Warning : NexusToken.Ok);
             }
 
             root.Add(Field(kit, "Набор ключей", s.keySet, v => { s.keySet = v; changed(); UpdateKeys(); }));

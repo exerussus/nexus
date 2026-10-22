@@ -1,0 +1,162 @@
+/* Сгенерировано из NexusToken — не править руками. Exerussus/Nexus/Dev/Regenerate theme USS.
+   Классы-токены: nx-fg--<token> (текст), nx-bg--<token> (фон), nx-bd--<token> (рамка). */
+
+.nx-fg--bg-hard { color: var(--nx-bg-hard); }
+.nx-bg--bg-hard { background-color: var(--nx-bg-hard); }
+.nx-bd--bg-hard { border-color: var(--nx-bg-hard); }
+
+.nx-fg--bg-soft { color: var(--nx-bg-soft); }
+.nx-bg--bg-soft { background-color: var(--nx-bg-soft); }
+.nx-bd--bg-soft { border-color: var(--nx-bg-soft); }
+
+.nx-fg--bg-raised { color: var(--nx-bg-raised); }
+.nx-bg--bg-raised { background-color: var(--nx-bg-raised); }
+.nx-bd--bg-raised { border-color: var(--nx-bg-raised); }
+
+.nx-fg--text-normal { color: var(--nx-text-normal); }
+.nx-bg--text-normal { background-color: var(--nx-text-normal); }
+.nx-bd--text-normal { border-color: var(--nx-text-normal); }
+
+.nx-fg--text-dim { color: var(--nx-text-dim); }
+.nx-bg--text-dim { background-color: var(--nx-text-dim); }
+.nx-bd--text-dim { border-color: var(--nx-text-dim); }
+
+.nx-fg--border { color: var(--nx-border); }
+.nx-bg--border { background-color: var(--nx-border); }
+.nx-bd--border { border-color: var(--nx-border); }
+
+.nx-fg--accent { color: var(--nx-accent); }
+.nx-bg--accent { background-color: var(--nx-accent); }
+.nx-bd--accent { border-color: var(--nx-accent); }
+
+.nx-fg--selection { color: var(--nx-selection); }
+.nx-bg--selection { background-color: var(--nx-selection); }
+.nx-bd--selection { border-color: var(--nx-selection); }
+
+.nx-fg--hover { color: var(--nx-hover); }
+.nx-bg--hover { background-color: var(--nx-hover); }
+.nx-bd--hover { border-color: var(--nx-hover); }
+
+.nx-fg--pressed { color: var(--nx-pressed); }
+.nx-bg--pressed { background-color: var(--nx-pressed); }
+.nx-bd--pressed { border-color: var(--nx-pressed); }
+
+.nx-fg--ok { color: var(--nx-ok); }
+.nx-bg--ok { background-color: var(--nx-ok); }
+.nx-bd--ok { border-color: var(--nx-ok); }
+
+.nx-fg--warning { color: var(--nx-warning); }
+.nx-bg--warning { background-color: var(--nx-warning); }
+.nx-bd--warning { border-color: var(--nx-warning); }
+
+.nx-fg--error { color: var(--nx-error); }
+.nx-bg--error { background-color: var(--nx-error); }
+.nx-bd--error { border-color: var(--nx-error); }
+
+.nx-fg--muted { color: var(--nx-muted); }
+.nx-bg--muted { background-color: var(--nx-muted); }
+.nx-bd--muted { border-color: var(--nx-muted); }
+
+.nx-fg--orphan { color: var(--nx-orphan); }
+.nx-bg--orphan { background-color: var(--nx-orphan); }
+.nx-bd--orphan { border-color: var(--nx-orphan); }
+
+.nx-fg--surface-hover { color: var(--nx-surface-hover); }
+.nx-bg--surface-hover { background-color: var(--nx-surface-hover); }
+.nx-bd--surface-hover { border-color: var(--nx-surface-hover); }
+
+.nx-fg--divider { color: var(--nx-divider); }
+.nx-bg--divider { background-color: var(--nx-divider); }
+.nx-bd--divider { border-color: var(--nx-divider); }
+
+.nx-fg--accent-hover { color: var(--nx-accent-hover); }
+.nx-bg--accent-hover { background-color: var(--nx-accent-hover); }
+.nx-bd--accent-hover { border-color: var(--nx-accent-hover); }
+
+.nx-fg--accent-pressed { color: var(--nx-accent-pressed); }
+.nx-bg--accent-pressed { background-color: var(--nx-accent-pressed); }
+.nx-bd--accent-pressed { border-color: var(--nx-accent-pressed); }
+
+.nx-fg--accent-soft { color: var(--nx-accent-soft); }
+.nx-bg--accent-soft { background-color: var(--nx-accent-soft); }
+.nx-bd--accent-soft { border-color: var(--nx-accent-soft); }
+
+.nx-fg--on-accent { color: var(--nx-on-accent); }
+.nx-bg--on-accent { background-color: var(--nx-on-accent); }
+.nx-bd--on-accent { border-color: var(--nx-on-accent); }
+
+.nx-fg--ok-soft { color: var(--nx-ok-soft); }
+.nx-bg--ok-soft { background-color: var(--nx-ok-soft); }
+.nx-bd--ok-soft { border-color: var(--nx-ok-soft); }
+
+.nx-fg--warning-soft { color: var(--nx-warning-soft); }
+.nx-bg--warning-soft { background-color: var(--nx-warning-soft); }
+.nx-bd--warning-soft { border-color: var(--nx-warning-soft); }
+
+.nx-fg--error-soft { color: var(--nx-error-soft); }
+.nx-bg--error-soft { background-color: var(--nx-error-soft); }
+.nx-bd--error-soft { border-color: var(--nx-error-soft); }
+
+.nx-fg--text-faint { color: var(--nx-text-faint); }
+.nx-bg--text-faint { background-color: var(--nx-text-faint); }
+.nx-bd--text-faint { border-color: var(--nx-text-faint); }
+
+.nx-fg--focus { color: var(--nx-focus); }
+.nx-bg--focus { background-color: var(--nx-focus); }
+.nx-bd--focus { border-color: var(--nx-focus); }
+
+.nx-fg--bg-inset { color: var(--nx-bg-inset); }
+.nx-bg--bg-inset { background-color: var(--nx-bg-inset); }
+.nx-bd--bg-inset { border-color: var(--nx-bg-inset); }
+
+.nx-fg--accent-text { color: var(--nx-accent-text); }
+.nx-bg--accent-text { background-color: var(--nx-accent-text); }
+.nx-bd--accent-text { border-color: var(--nx-accent-text); }
+
+.nx-fg--code { color: var(--nx-code); }
+.nx-bg--code { background-color: var(--nx-code); }
+.nx-bd--code { border-color: var(--nx-code); }
+
+.nx-fg--tag-amber { color: var(--nx-tag-amber); }
+.nx-bg--tag-amber { background-color: var(--nx-tag-amber); }
+.nx-bd--tag-amber { border-color: var(--nx-tag-amber); }
+
+.nx-fg--tag-amber-soft { color: var(--nx-tag-amber-soft); }
+.nx-bg--tag-amber-soft { background-color: var(--nx-tag-amber-soft); }
+.nx-bd--tag-amber-soft { border-color: var(--nx-tag-amber-soft); }
+
+.nx-fg--tag-green { color: var(--nx-tag-green); }
+.nx-bg--tag-green { background-color: var(--nx-tag-green); }
+.nx-bd--tag-green { border-color: var(--nx-tag-green); }
+
+.nx-fg--tag-green-soft { color: var(--nx-tag-green-soft); }
+.nx-bg--tag-green-soft { background-color: var(--nx-tag-green-soft); }
+.nx-bd--tag-green-soft { border-color: var(--nx-tag-green-soft); }
+
+.nx-fg--tag-blue { color: var(--nx-tag-blue); }
+.nx-bg--tag-blue { background-color: var(--nx-tag-blue); }
+.nx-bd--tag-blue { border-color: var(--nx-tag-blue); }
+
+.nx-fg--tag-blue-soft { color: var(--nx-tag-blue-soft); }
+.nx-bg--tag-blue-soft { background-color: var(--nx-tag-blue-soft); }
+.nx-bd--tag-blue-soft { border-color: var(--nx-tag-blue-soft); }
+
+.nx-fg--tag-violet { color: var(--nx-tag-violet); }
+.nx-bg--tag-violet { background-color: var(--nx-tag-violet); }
+.nx-bd--tag-violet { border-color: var(--nx-tag-violet); }
+
+.nx-fg--tag-violet-soft { color: var(--nx-tag-violet-soft); }
+.nx-bg--tag-violet-soft { background-color: var(--nx-tag-violet-soft); }
+.nx-bd--tag-violet-soft { border-color: var(--nx-tag-violet-soft); }
+
+.nx-fg--glow { color: var(--nx-glow); }
+.nx-bg--glow { background-color: var(--nx-glow); }
+.nx-bd--glow { border-color: var(--nx-glow); }
+
+.nx-fg--bracket { color: var(--nx-bracket); }
+.nx-bg--bracket { background-color: var(--nx-bracket); }
+.nx-bd--bracket { border-color: var(--nx-bracket); }
+
+.nx-fg--grid { color: var(--nx-grid); }
+.nx-bg--grid { background-color: var(--nx-grid); }
+.nx-bd--grid { border-color: var(--nx-grid); }

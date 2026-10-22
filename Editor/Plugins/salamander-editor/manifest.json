@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "b7e4c2f1-9a53-4d68-8e0b-6f1d2c9a4e75",
   "id": "salamander-editor",
-  "version": "2.0",
+  "version": "2.1",
   "typeName": "Exerussus.Nexus.Pages.SalamanderEditor.SalamanderEditorPage",
   "kind": "servicing",
   "display": { "name": "Salamander", "category": "Game", "order": 30, "icon": null },

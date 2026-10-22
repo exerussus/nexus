@@ -1,10 +1,12 @@
 // ============================================================
 //  AppKit.cs — визуальный набор страницы App.
 //
-//  Мягко, но с видимыми контурами: карточки на BgSoft с рамкой Divider и скруглением 8,
-//  поля ввода утоплены (BgHard), статусы — мягкая заливка + точка цвета статуса + обычный
-//  текст. Accent — только для активного и интерактивного. Все цвета — токены темы Nexus,
-//  литералов нет (контракт темы: палитра меняется — страница следует за ней).
+//  С Nexus 0.4 набор стоит на компонентах хаба (Context.Ui): карточки, кнопки, поля, строки
+//  списка и заголовки получают классы nx-* — вид, состояния, скругления, свечение и
+//  HUD-уголки задаёт палитра (по умолчанию Neon). Свои элементы страницы (текст, статусы,
+//  точки, рамки) красятся классами-токенами хаба (NexusClass: nx-fg/bg/bd--<token>) —
+//  цветов в коде нет. Tok() остаётся для мест, где нужен сам цвет (предпросмотр с прозрачностью,
+//  образцы цветов для разметки).
 // ============================================================
 
 using System;
@@ -19,8 +21,6 @@ namespace Exerussus.Nexus.Pages.App
     {
         public readonly IPageContext Context;
 
-        private static readonly Color Clear = new(0f, 0f, 0f, 0f);
-
         public AppKit(IPageContext context) => Context = context;
 
         public Color Tok(NexusToken token) => Context.Theme.Get(token);
@@ -30,9 +30,7 @@ namespace Exerussus.Nexus.Pages.App
         /// <summary>Карточка: заголовок, пояснение, справа — необязательные действия.</summary>
         public VisualElement Card(string title, string hint = null, VisualElement headerRight = null)
         {
-            var card = new VisualElement();
-            card.style.backgroundColor = Tok(NexusToken.BgSoft);
-            SetBorder(card, Tok(NexusToken.Divider), 1f, 8f);
+            var card = Context.Ui.Card();
             card.style.paddingLeft = 14f; card.style.paddingRight = 14f;
             card.style.paddingTop = 12f;  card.style.paddingBottom = 12f;
             card.style.marginBottom = 12f;
@@ -81,42 +79,23 @@ namespace Exerussus.Nexus.Pages.App
 
         public VisualElement Divider(float margin = 8f)
         {
-            var line = new VisualElement();
-            line.style.height = 1f;
-            line.style.flexShrink = 0;
-            line.style.backgroundColor = Tok(NexusToken.Divider);
+            var line = Context.Ui.Divider();
             line.style.marginTop = margin;
             line.style.marginBottom = margin;
             return line;
         }
 
         /// <summary>Строка списка: ховер поверхностью, скругление 6.</summary>
-        public VisualElement ListRow(Action onClick = null)
+        public VisualElement ListRow(Action onClick = null, bool selected = false)
         {
-            var row = Row();
-            row.style.paddingLeft = 8f; row.style.paddingRight = 8f;
-            row.style.paddingTop = 5f;  row.style.paddingBottom = 5f;
-            row.style.minHeight = 26f;
-            SetRadius(row, 6f);
-
-            var hover = Tok(NexusToken.BgRaised);
-            row.RegisterCallback<PointerEnterEvent>(_ => row.style.backgroundColor = hover);
-            row.RegisterCallback<PointerLeaveEvent>(_ => row.style.backgroundColor = Clear);
-
-            if (onClick != null)
-                row.RegisterCallback<PointerDownEvent>(e => { if (e.button == 0) onClick(); });
-
+            var row = Context.Ui.ListRow(onClick, selected);
+            row.style.flexWrap = Wrap.Wrap;
             return row;
         }
 
         // ============================================================ текст
 
-        public Label Title(string text)
-        {
-            var l = Text(text, NexusToken.TextNormal, 13);
-            l.style.unityFontStyleAndWeight = FontStyle.Bold;
-            return l;
-        }
+        public Label Title(string text) => Context.Ui.Title(text);
 
         public Label Hint(string text)
         {
@@ -130,7 +109,8 @@ namespace Exerussus.Nexus.Pages.App
         public Label Text(string text, NexusToken token = NexusToken.TextNormal, int size = 12)
         {
             var l = new Label(text);
-            l.style.color = Tok(token);
+            l.AddToClassList("nx-text");
+            l.AddToClassList(NexusClass.Fg(token));
             l.style.fontSize = size;
             l.style.whiteSpace = WhiteSpace.Normal;
             l.style.marginLeft = 0f; l.style.marginRight = 0f;
@@ -155,8 +135,8 @@ namespace Exerussus.Nexus.Pages.App
             };
 
             var box = new VisualElement();
-            box.style.backgroundColor = Tok(soft);
-            SetRadius(box, 6f);
+            box.AddToClassList(NexusClass.Bg(soft));
+            SetRadius(box, Metrics.RadiusM);
             box.style.paddingLeft = 10f; box.style.paddingRight = 10f;
             box.style.paddingTop = 6f;   box.style.paddingBottom = 6f;
             box.style.marginTop = 4f;    box.style.marginBottom = 4f;
@@ -197,7 +177,7 @@ namespace Exerussus.Nexus.Pages.App
             dot.style.height = 7f;
             dot.style.flexShrink = 0;
             dot.style.marginRight = 8f;
-            dot.style.backgroundColor = Tok(token);
+            dot.AddToClassList(NexusClass.Bg(token));
             SetRadius(dot, 4f);
             return dot;
         }
@@ -207,12 +187,7 @@ namespace Exerussus.Nexus.Pages.App
         public Button Btn(NexusRole role, string text, Action onClick, bool small = false)
         {
             var b = Context.Ui.Button(role, text, onClick);
-            SetRadius(b, 6f);
-            b.style.height = small ? 22f : 26f;
-            b.style.paddingLeft = small ? 9f : 13f;
-            b.style.paddingRight = small ? 9f : 13f;
-            b.style.fontSize = small ? 11 : 12;
-            b.style.unityFontStyleAndWeight = FontStyle.Bold;
+            if (small) b.AddToClassList("nx-btn--sm");
             b.style.marginLeft = 0f;
             b.style.marginRight = 6f;
             return b;
@@ -223,9 +198,17 @@ namespace Exerussus.Nexus.Pages.App
             var f = Context.Ui.Input(value, onChanged);
             f.style.marginLeft = 0f; f.style.marginRight = 0f;
             f.style.minHeight = 24f;
-            PaintFieldInput(f);
             return f;
         }
+
+        /// <summary>Строка кода на утопленном фоне.</summary>
+        public Label Code(string text) => Context.Ui.Code(text);
+
+        /// <summary>Метка-плашка (аргумент, живое значение, форма…).</summary>
+        public Label Tag(NexusTagColor color, string text) => Context.Ui.Tag(color, text);
+
+        /// <summary>Скругления палитры.</summary>
+        public NexusMetrics Metrics => Context.Theme.Metrics;
 
         public Toggle Check(string label, bool value, Action<bool> onChanged)
         {
@@ -248,7 +231,6 @@ namespace Exerussus.Nexus.Pages.App
                 if (i >= 0) onChanged?.Invoke(i);
             });
             PaintLabels(dd);
-            PaintFieldInput(dd);
             return dd;
         }
 
@@ -297,48 +279,35 @@ namespace Exerussus.Nexus.Pages.App
 
         // ============================================================ покраска стандартных полей
 
-        public void PaintLabels(VisualElement root)
-        {
-            var dim = Tok(NexusToken.TextDim);
-            var normal = Tok(NexusToken.TextNormal);
-            root.Query<Label>(className: "unity-base-field__label").ForEach(l => l.style.color = dim);
-            root.Query<Label>(className: "unity-toggle__text").ForEach(l => l.style.color = normal);
-        }
+        /// <summary>Подписи стандартных полей. С Nexus 0.4 их красит USS темы (.nx-root …__label,
+        /// …toggle__text) — метод оставлен для вызовов страниц и ничего не делает.</summary>
+        public void PaintLabels(VisualElement root) { }
 
+        /// <summary>
+        /// Поля внутри <paramref name="root"/> — в стиле хаба. С Nexus 0.4 поля красит USS темы
+        /// (.nx-root …__input), так что здесь только свечение фокуса.
+        /// </summary>
         public void PaintFieldInput(VisualElement root)
         {
-            var bg = Tok(NexusToken.BgHard);
-            var border = Tok(NexusToken.Divider);
-            var focus = Tok(NexusToken.Focus);
-            var text = Tok(NexusToken.TextNormal);
-
-            void Paint(VisualElement input)
-            {
-                input.style.backgroundColor = bg;
-                input.style.color = text;
-                SetBorder(input, border, 1f, 6f);
-                input.RegisterCallback<FocusInEvent>(_ => SetBorderColor(input, focus));
-                input.RegisterCallback<FocusOutEvent>(_ => SetBorderColor(input, border));
-            }
-
-            root.Query<VisualElement>(className: "unity-base-text-field__input").ForEach(Paint);
-            root.Query<VisualElement>(className: "unity-base-popup-field__input").ForEach(Paint);
+            root.Query<VisualElement>(className: "unity-base-text-field").ForEach(Context.Ui.Glow);
         }
 
         // ============================================================ утилиты
 
-        public static void SetBorder(VisualElement e, Color c, float width, float radius)
+        /// <summary>Рамка токеном палитры (класс nx-bd--<token>), толщина и скругление — здесь.</summary>
+        public static void SetBorder(VisualElement e, NexusToken token, float width, float radius)
         {
             e.style.borderTopWidth = width;    e.style.borderRightWidth = width;
             e.style.borderBottomWidth = width; e.style.borderLeftWidth = width;
-            SetBorderColor(e, c);
+            NexusClass.SetBorder(e, token);
             SetRadius(e, radius);
         }
 
-        public static void SetBorderColor(VisualElement e, Color c)
+        /// <summary>Поверхность «фон + рамка» токенами: утопленная плашка, чип, рамка предпросмотра.</summary>
+        public static void Surface(VisualElement e, NexusToken bg, NexusToken border, float radius)
         {
-            e.style.borderTopColor = c;    e.style.borderRightColor = c;
-            e.style.borderBottomColor = c; e.style.borderLeftColor = c;
+            NexusClass.SetBg(e, bg);
+            SetBorder(e, border, 1f, radius);
         }
 
         public static void SetRadius(VisualElement e, float r)

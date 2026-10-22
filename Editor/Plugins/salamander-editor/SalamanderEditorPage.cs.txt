@@ -151,14 +151,15 @@ namespace Exerussus.Nexus.Pages.SalamanderEditor
         private Button ToolbarButton(string text, string hint, Action onClick)
         {
             var b = Context.Ui.Button(NexusRole.Common, text, onClick);
+            b.AddToClassList("nx-btn--sm");   // компактная кнопка хаба — в ряд с кнопками IDE
             b.tooltip = hint;
-            b.style.height = 22;
-            b.style.marginLeft = 2;
-            b.style.marginRight = 2;
             return b;
         }
 
-        // Оболочка IDE — токенами палитры Nexus (кодовая область — своя палитра в USS пакета).
+        // Оболочка IDE — токенами палитры Nexus. IDE живёт в пакете Salamander и принимает цвета
+        // структурой (USS хаба до неё не дотягивается), поэтому здесь — единственное место, где
+        // страница берёт цвета в коде. Окно Nexus пересобирает страницы при смене палитры, так что
+        // оболочка следует за ней. Кодовая область — своя палитра в USS пакета.
         private IdeChromeColors ChromeFromTheme()
         {
             var t = Context.Theme;
@@ -172,8 +173,8 @@ namespace Exerussus.Nexus.Pages.SalamanderEditor
                 TextDim = t.Get(NexusToken.TextDim),
                 Accent = t.Get(NexusToken.Accent),
                 AccentText = t.Get(NexusToken.OnAccent),
-                Selection = t.Get(NexusToken.Selection),
-                Hover = t.Get(NexusToken.SurfaceHover),
+                Selection = t.Get(NexusToken.AccentSoft),
+                Hover = t.Get(NexusToken.Hover),
                 Error = t.Get(NexusToken.Error),
                 Warning = t.Get(NexusToken.Warning),
                 Ok = t.Get(NexusToken.Ok),

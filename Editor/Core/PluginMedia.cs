@@ -35,6 +35,14 @@ namespace Exerussus.Nexus.Core
             return AssetDatabase.LoadAssetAtPath<Texture2D>(DefaultIconAssetPath);   // дефолт или null
         }
 
+        /// <summary>Собственная иконка плагина (page_logo.png) без подстановки дефолтной. null — своей нет.</summary>
+        public static Texture2D LoadOwnIcon(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.StartsWith("::")) return null;
+            var iconAsset = NexusPaths.ToAssetPath(Path.Combine(PluginRoots.SourceDir(id), IconFile));
+            return iconAsset != null ? AssetDatabase.LoadAssetAtPath<Texture2D>(iconAsset) : null;
+        }
+
         public static bool HasReadme(string id) => ReadmePath(id) != null;
 
         /// <summary>Текст README плагина или null, если его нет.</summary>

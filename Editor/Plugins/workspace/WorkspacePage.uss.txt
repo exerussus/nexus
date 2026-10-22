@@ -1,6 +1,6 @@
-/* Только геометрия и раскладка. Цвета (background-color/border-color/color) и состояния
-   hover/press НЕ задаются здесь — их выставляет страница в C# через Context.Theme.Get(token).
-   Здесь остаются flex, размеры, отступы, радиусы, ширины рамок, позиции, шрифты, выравнивание. */
+/* Рабочая область. Цвета — только переменные палитры Nexus (var(--nx-…)), состояния —
+   псевдоклассы и классы-состояния (--pinned, --missing, --flash); в C# цветов нет.
+   Кнопки тулбара — компоненты хаба (nx-btn), поле поиска — общий стиль полей Nexus. */
 
 .ws-root {
     flex-grow: 1;
@@ -13,28 +13,36 @@
     flex-direction: row;
     align-items: center;
     flex-wrap: wrap;
-    padding: 6px 8px;
+    min-height: 32px;
+    padding: 3px 8px;
+    background-color: var(--nx-bg-soft);
     border-bottom-width: 1px;
+    border-bottom-color: var(--nx-divider);
 }
 
 .ws-btn {
-    height: 22px;
     margin: 2px 3px;
-    padding: 0 10px;
-    border-width: 1px;
-    border-radius: 4px;
-    -unity-text-align: middle-center;
+}
+
+.ws-btn--danger:hover {
+    color: var(--nx-error);
+    border-color: var(--nx-error);
+    background-color: var(--nx-error-soft);
 }
 
 .ws-tool-label {
     margin: 0 4px 0 8px;
-    font-size: 11px;
+    font-size: 10px;
+    letter-spacing: 1px;
+    -unity-font-style: bold;
+    color: var(--nx-text-faint);
 }
 
 .ws-tool-sep {
     width: 1px;
     height: 16px;
     margin: 0 6px;
+    background-color: var(--nx-divider);
 }
 
 .ws-flex-spacer {
@@ -42,13 +50,11 @@
 }
 
 .ws-search {
-    width: 150px;
+    width: 160px;
     margin: 2px 3px;
 }
 
 .ws-search .unity-base-text-field__input {
-    border-width: 1px;
-    border-radius: 4px;
     padding: 0 6px;
 }
 
@@ -65,41 +71,52 @@
 
 .ws-groups {
     flex-direction: column;
-    padding: 6px;
+    padding: 10px;
 }
 
 /* ---------- Группа ---------- */
 
 .ws-group {
-    margin-bottom: 8px;
+    margin-bottom: 10px;
     border-width: 1px;
-    border-radius: 6px;
+    border-color: var(--nx-divider);
+    border-radius: var(--nx-r-l);
+    background-color: var(--nx-bg-soft);
     overflow: hidden;
 }
 
 .ws-group-header {
     flex-direction: row;
     align-items: center;
-    height: 26px;
+    height: 28px;
     padding: 0 8px;
+    background-color: var(--nx-bg-raised);
     border-bottom-width: 1px;
+    border-bottom-color: var(--nx-divider);
+}
+
+.ws-group-header:hover {
+    background-color: var(--nx-hover);
 }
 
 .ws-group-chevron {
     width: 14px;
     font-size: 11px;
     -unity-text-align: middle-center;
+    color: var(--nx-accent);
 }
 
 .ws-group-title {
     margin-left: 4px;
-    font-size: 12px;
-    -unity-font-style: bold;
 }
 
 .ws-group-count {
     margin-left: 8px;
+    padding: 0 6px;
+    border-radius: 7px;
     font-size: 10px;
+    background-color: var(--nx-accent-soft);
+    color: var(--nx-accent-text);
 }
 
 .ws-group-rename {
@@ -111,9 +128,18 @@
     width: 20px;
     height: 18px;
     padding: 0;
+    margin: 0;
     border-width: 0;
+    border-radius: var(--nx-r-s);
     font-size: 14px;
     -unity-text-align: middle-center;
+    background-color: rgba(0, 0, 0, 0);
+    color: var(--nx-text-dim);
+}
+
+.ws-group-del:hover {
+    color: var(--nx-error);
+    background-color: var(--nx-error-soft);
 }
 
 .ws-group-body {
@@ -127,6 +153,7 @@
     padding: 12px;
     font-size: 11px;
     -unity-font-style: italic;
+    color: var(--nx-text-faint);
 }
 
 /* ---------- Карточка ---------- */
@@ -137,14 +164,45 @@
     margin: 4px;
     padding: 6px 4px 4px 4px;
     border-width: 1px;
-    border-radius: 6px;
+    border-radius: var(--nx-r-m);
+    border-color: var(--nx-divider);
+    background-color: var(--nx-bg-raised);
     align-items: center;
     justify-content: flex-start;
     overflow: hidden;
+    transition-property: background-color, border-color;
+    transition-duration: 0.08s;
+}
+
+.ws-card:hover {
+    background-color: var(--nx-hover);
+    border-color: var(--nx-accent);
+}
+
+.ws-card--pinned {
+    border-color: var(--nx-accent-pressed);
+}
+
+.ws-card--missing {
+    opacity: 0.85;
+    border-color: var(--nx-error);
+}
+
+.ws-card--missing:hover {
+    border-color: var(--nx-error);
 }
 
 .ws-card--bundle {
+    background-color: var(--nx-bg-inset);
+    border-color: var(--nx-border);
     border-left-width: 3px;
+    border-left-color: var(--nx-accent);
+}
+
+.ws-card--flash,
+.ws-card--flash:hover {
+    background-color: var(--nx-selection);
+    border-color: var(--nx-accent);
 }
 
 .ws-card-icon {
@@ -161,6 +219,7 @@
     white-space: normal;
     overflow: hidden;
     text-overflow: ellipsis;
+    color: var(--nx-text-normal);
 }
 
 .ws-card-sub {
@@ -170,6 +229,15 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    color: var(--nx-text-dim);
+}
+
+.ws-card-sub--error {
+    color: var(--nx-error);
+}
+
+.ws-card-sub--warn {
+    color: var(--nx-warning);
 }
 
 .ws-card-rename {
@@ -181,6 +249,7 @@
     top: 2px;
     left: 4px;
     font-size: 9px;
+    color: var(--nx-text-faint);
 }
 
 .ws-card-pin {
@@ -188,6 +257,7 @@
     top: 2px;
     right: 4px;
     font-size: 10px;
+    color: var(--nx-accent);
 }
 
 .ws-card-count {
@@ -201,4 +271,6 @@
     font-size: 9px;
     -unity-text-align: middle-center;
     -unity-font-style: bold;
+    background-color: var(--nx-accent);
+    color: var(--nx-on-accent);
 }

@@ -45,5 +45,28 @@ namespace Exerussus.Nexus.Abstractions
         /// активная приподнята. Визуально отличается от <see cref="Tabs"/>, чтобы уровни не путались.
         /// </summary>
         VisualElement Segmented(string[] labels, int selected, Action<int> onSelected);
+
+        // ---- 0.4 ----
+
+        /// <summary>Заголовок карточки/раздела в стиле палитры (у Neon — моноширинный капслок).</summary>
+        Label Title(string text);
+
+        /// <summary>Строка кода/сниппета на утопленном фоне.</summary>
+        Label Code(string text);
+
+        /// <summary>Метка-плашка цвета <paramref name="color"/> (аргумент, живое значение, форма…).</summary>
+        Label Tag(NexusTagColor color, string text);
+
+        /// <summary>Строка списка: ховер поверхностью; клик — <paramref name="onClick"/>. <c>selected</c> — подсветка выбора.</summary>
+        VisualElement ListRow(Action onClick, bool selected = false);
+
+        /// <summary>Свечение элемента при наведении и фокусе (если палитра светится).</summary>
+        void Glow(VisualElement element);
+
+        /// <summary>Стили хаба на корне своего окна (поповеры, утилитные окна страницы).</summary>
+        void ApplyTheme(VisualElement root);
+
+        /// <summary>HUD-уголки на углах элемента (если у палитры они есть). Элемент становится position: relative-контейнером.</summary>
+        void Brackets(VisualElement element);
     }
 }

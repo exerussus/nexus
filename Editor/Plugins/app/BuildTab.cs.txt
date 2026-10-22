@@ -389,8 +389,7 @@ namespace Exerussus.Nexus.Pages.App
             foreach (var n in names)
             {
                 var chip = _kit.Text(n, NexusToken.TextNormal, 11);
-                chip.style.backgroundColor = _kit.Tok(NexusToken.BgHard);
-                AppKit.SetBorder(chip, _kit.Tok(NexusToken.Divider), 1f, 5f);
+                AppKit.Surface(chip, NexusToken.BgInset, NexusToken.Divider, 5f);
                 chip.style.paddingLeft = 8f; chip.style.paddingRight = 8f;
                 chip.style.paddingTop = 3f;  chip.style.paddingBottom = 3f;
                 chip.style.marginRight = 6f; chip.style.marginBottom = 4f;

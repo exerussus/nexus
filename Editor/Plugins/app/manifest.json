@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "0a1f7c4e9b2d4f6a8c3e5d7b1a9f0e22",
   "id": "app",
-  "version": "3.2",
+  "version": "3.3",
   "typeName": "Exerussus.Nexus.Pages.App.AppPage",
   "kind": "servicing",
   "display": {
@@ -116,6 +116,10 @@
     {
       "from": "PlayFlowUploadStep.cs.txt",
       "to": "PlayFlowUploadStep.cs"
+    },
+    {
+      "from": "SoundsTab.cs.txt",
+      "to": "SoundsTab.cs"
     }
   ]
 }

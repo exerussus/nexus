@@ -1,0 +1,1301 @@
+// ============================================================
+//  SoundsTab.cs — вкладка «Звуки»: каталог звуков приложения (AppCore Audio, app-core 4.6+).
+//
+//  Схема — как у редактора частей: слева дерево ключей (UI.Effects.Click), справа карточка ключа.
+//  Ключ собирается из уровней (каждый уровень — папка клипов в Assets/AppSounds), режим
+//  Молчит / Дефолт / Свои, громкость, высота, кулдаун, клипы с поправкой громкости, описание.
+//  Все правки — черновик; Apply переносит папки и клипы, пишет каталог и перегенерирует AppSounds.cs
+//  (SoundEdit из Exerussus.AppCore.Audio.Editor). Reset — к последнему Apply.
+//
+//  Вкладка собирается только с app-core 4.6+ (define APPCORE_AUDIO из versionDefines сборки).
+// ============================================================
+
+#if APPCORE_AUDIO
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using Exerussus.AppCore.Audio;
+using Exerussus.AppCore.Audio.Editor;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.Audio;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class SoundsTab : IAppTab
+    {
+        private const string SettingsMenu = "Exerussus/App/Sounds/Настройки";
+        private const float TreeWidth = 300f;
+
+        private static readonly string[] ViewTitles = { "Каталог", "Настройки", "Обмен" };
+        private static readonly string[] FilterTitles = { "Все", "Пустые", "С клипами", "Замечания" };
+        private static readonly string[] EventModes = { "Молчит", "Дефолт", "Свои" };
+        private static readonly string[] DefaultModes = { "Молчит", "Свои" };
+
+        private readonly AppKit _kit;
+        private readonly SoundPreview _preview = new();
+
+        private VisualElement _root;
+        private VisualElement _body;
+        private Label _stats;
+
+        private SoundSettings _settings;
+        private SerializedObject _so;
+        private IVisualElementScheduledItem _save;
+        private IVisualElementScheduledItem _poll;
+
+        private int _view;
+        private int _filter;
+        private string _query = string.Empty;
+        private string _domain;
+        private readonly HashSet<string> _collapsed = new(StringComparer.Ordinal);
+
+        private string _selected;
+        private SoundDraft _draft;
+        private bool _dirty;
+        private int _selectedClip;
+        private Dictionary<string, List<SoundCatalog.Issue>> _issues = new(StringComparer.Ordinal);
+
+        // обмен со звуковиком
+        private SoundExchange.Pack _pack;
+        private List<SoundExchange.KeyDiff> _diffs;
+
+        // элементы карточки, которые обновляются без перестройки
+        private VisualElement _tree;
+        private Label _keyTitle;
+        private Label _keyPath;
+        private Label _keyConst;
+        private VisualElement _dirtyTag;
+        private Label _keyError;
+        private Label _applyStatus;
+        private Button _applyButton;
+        private VisualElement _progressFill;
+        private Label _previewInfo;
+
+        public string Title => "Звуки";
+
+        public SoundsTab(AppKit kit) => _kit = kit;
+
+        private IPageContext Context => _kit.Context;
+
+        // ============================================================ IAppTab
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            _view = SessionState.GetInt(Context.GetSessionKey("sounds.view"), 0);
+            _filter = SessionState.GetInt(Context.GetSessionKey("sounds.filter"), 0);
+            _selected = SessionState.GetString(Context.GetSessionKey("sounds.key"), null);
+            foreach (string c in SessionState.GetString(Context.GetSessionKey("sounds.collapsed"), string.Empty).Split('|'))
+                if (c.Length > 0) _collapsed.Add(c);
+            return _root;
+        }
+
+        public void Show()
+        {
+            Load();
+            Render();
+        }
+
+        public void Hide()
+        {
+            Flush();
+            _preview.Stop();
+            _poll?.Pause();
+        }
+
+        public void Refresh()
+        {
+            if (_dirty && !ConfirmDiscard()) return;
+            Show();
+        }
+
+        public bool CanClose() => !_dirty || ConfirmDiscard();
+
+        public void Dispose()
+        {
+            Flush();
+            _preview.Dispose();
+            _so?.Dispose();
+            _so = null;
+        }
+
+        // ============================================================ данные
+
+        private void Load()
+        {
+            _settings = SoundCatalog.Load();
+            _so?.Dispose();
+            _so = _settings != null ? new SerializedObject(_settings) : null;
+            _issues = GroupIssues(_settings != null ? SoundCatalog.Validate(_settings.Entries) : new List<SoundCatalog.Issue>());
+
+            if (_draft == null || !_dirty) SelectKey(_selected, false);
+        }
+
+        private static Dictionary<string, List<SoundCatalog.Issue>> GroupIssues(List<SoundCatalog.Issue> list)
+        {
+            var map = new Dictionary<string, List<SoundCatalog.Issue>>(StringComparer.Ordinal);
+            foreach (SoundCatalog.Issue i in list)
+            {
+                string key = i.Key ?? string.Empty;
+                if (!map.TryGetValue(key, out var l)) map[key] = l = new List<SoundCatalog.Issue>();
+                l.Add(i);
+            }
+            return map;
+        }
+
+        private SoundEntry[] Entries => _settings != null ? _settings.Entries : Array.Empty<SoundEntry>();
+
+        private void SelectKey(string key, bool render = true)
+        {
+            int index = SoundEdit.IndexOf(Entries, key);
+            _selected = index >= 0 ? key : null;
+            _draft = index >= 0 ? SoundDraft.From(Entries[index]) : null;
+            _dirty = false;
+            _selectedClip = 0;
+            SessionState.SetString(Context.GetSessionKey("sounds.key"), _selected ?? string.Empty);
+            if (render) Render();
+        }
+
+        private bool TrySwitch(Action action)
+        {
+            if (_dirty && !ConfirmDiscard()) return false;
+            action();
+            return true;
+        }
+
+        /// <summary>Неприменённые правки: применить / отбросить / остаться. true — можно уходить.</summary>
+        private bool ConfirmDiscard()
+        {
+            int choice = EditorUtility.DisplayDialogComplex("Звуки",
+                $"У звука {_draft?.Entry.key} есть неприменённые правки.", "Применить", "Остаться", "Отбросить");
+            if (choice == 1) return false;
+            if (choice == 0) return ApplyDraft();
+            _dirty = false;
+            return true;
+        }
+
+        // ============================================================ рендер
+
+        private void Render()
+        {
+            if (_root == null) return;
+            _root.Clear();
+
+            if (_settings == null)
+            {
+                var card = _kit.Card("Звуки", "Каталог звуков приложения: ключи, клипы, громкость, дефолты.");
+                card.Add(_kit.Status(StatusKind.Warning, $"Нет ассета настроек: {SoundSettings.AssetPath}"));
+                var create = _kit.Btn(NexusRole.Primary, "Создать", () =>
+                {
+                    EditorApplication.ExecuteMenuItem(SettingsMenu);
+                    Show();
+                });
+                create.style.alignSelf = Align.FlexStart;
+                create.style.marginTop = 8f;
+                card.Add(create);
+                _root.Add(card);
+                return;
+            }
+
+            _root.Add(Toolbar());
+            _body = new VisualElement();
+            _root.Add(_body);
+
+            if (_view == 1) RenderSettings();
+            else if (_view == 2) RenderExchange();
+            else RenderCatalog();
+        }
+
+        private VisualElement Toolbar()
+        {
+            var bar = _kit.Row();
+            bar.style.marginBottom = 10f;
+
+            bar.Add(Context.Ui.Segmented(ViewTitles, _view, i => TrySwitch(() =>
+            {
+                _view = i;
+                SessionState.SetInt(Context.GetSessionKey("sounds.view"), i);
+                Render();
+            })));
+            bar.Add(_kit.Gap(12f));
+
+            _stats = _kit.Mono(Stats(), NexusToken.TextDim);
+            bar.Add(_stats);
+            bar.Add(_kit.Spacer());
+
+            if (!_settings.Enabled) bar.Add(_kit.Badge(StatusKind.Warning, "звук выключен в настройках"));
+            bar.Add(_kit.Gap(8f));
+            bar.Add(_kit.Btn(NexusRole.Primary, "+ Звук", () => TrySwitch(() => NewKey(false)), true));
+            bar.Add(_kit.Btn(NexusRole.Common, "+ Дефолт", () => TrySwitch(() => NewKey(true)), true));
+            bar.Add(_kit.Btn(NexusRole.Ghost, "Синхронизировать с папками", () => TrySwitch(Sync), true));
+            return bar;
+        }
+
+        private string Stats()
+        {
+            int keys = 0, defaults = 0, clips = 0;
+            long bytes = 0;
+            foreach (SoundEntry e in Entries)
+            {
+                if (e.isDefault) defaults++;
+                else keys++;
+                if (e.clips == null) continue;
+                foreach (SoundClip c in e.clips)
+                {
+                    if (c.clip == null) continue;
+                    clips++;
+                    bytes += SoundEdit.DecodedBytes(c.clip);
+                }
+            }
+            return $"{keys} событий · {defaults} дефолтов · {clips} клипов · ~{Mb(bytes)} в памяти после распаковки";
+        }
+
+        private static string Mb(long bytes) => bytes < 1024 * 1024 ? $"{bytes / 1024} КБ" : $"{bytes / 1048576f:0.0} МБ";
+
+        // ============================================================ каталог
+
+        private void RenderCatalog()
+        {
+            var row = _kit.Row();
+            row.style.alignItems = Align.FlexStart;
+            row.style.flexWrap = Wrap.NoWrap;
+
+            var left = new VisualElement();
+            left.style.width = TreeWidth;
+            left.style.flexShrink = 0;
+            left.style.marginRight = 12f;
+
+            var right = new VisualElement();
+            right.style.flexGrow = 1;
+            right.style.flexShrink = 1;
+            right.style.minWidth = 380f;
+
+            row.Add(left);
+            row.Add(right);
+            _body.Add(row);
+
+            left.Add(TreePane());
+            right.Add(_draft == null ? EmptyDetail() : Detail());
+        }
+
+        private VisualElement TreePane()
+        {
+            var card = _kit.Card(null);
+
+            var search = _kit.Input(_query, v =>
+            {
+                _query = v ?? string.Empty;
+                FillTree();
+            });
+            search.style.marginBottom = 6f;
+            card.Add(search);
+
+            var filter = Context.Ui.Segmented(FilterTitles, _filter, i =>
+            {
+                _filter = i;
+                SessionState.SetInt(Context.GetSessionKey("sounds.filter"), i);
+                FillTree();
+            });
+            filter.style.marginBottom = 6f;
+            card.Add(filter);
+
+            // верхние домены
+            var domains = _kit.Row();
+            domains.style.marginBottom = 6f;
+            var tops = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (SoundEntry e in Entries)
+                if (!string.IsNullOrEmpty(e.key)) tops.Add(e.key.Split('.')[0]);
+            domains.Add(DomainChip("все", null));
+            foreach (string top in tops) domains.Add(DomainChip(top, top));
+            card.Add(domains);
+
+            _tree = new VisualElement();
+            card.Add(_tree);
+            FillTree();
+            return card;
+        }
+
+        private VisualElement DomainChip(string text, string domain)
+        {
+            bool on = _domain == domain;
+            var b = _kit.Btn(on ? NexusRole.Primary : NexusRole.Ghost, text, () =>
+            {
+                _domain = domain;
+                Render();
+            }, true);
+            b.style.marginBottom = 4f;
+            return b;
+        }
+
+        private bool Visible(in SoundEntry e)
+        {
+            if (string.IsNullOrEmpty(e.key)) return true;
+            if (_domain != null && e.key.Split('.')[0] != _domain) return false;
+
+            if (_query.Length > 0)
+            {
+                string q = _query;
+                if (e.key.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    (e.title ?? string.Empty).IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    (e.when ?? string.Empty).IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+
+            int clips = SoundCatalog.CountClips(e);
+            return _filter switch
+            {
+                1 => clips == 0,
+                2 => clips > 0,
+                3 => _issues.ContainsKey(e.key),
+                _ => true,
+            };
+        }
+
+        /// <summary>Дерево: группы-префиксы (сворачиваются) и строки ключей по порядку каталога.</summary>
+        private void FillTree()
+        {
+            if (_tree == null) return;
+            _tree.Clear();
+
+            var shown = new HashSet<string>(StringComparer.Ordinal);
+            int count = 0;
+
+            foreach (SoundEntry e in Entries)
+            {
+                if (!Visible(e)) continue;
+                count++;
+                string key = e.key ?? string.Empty;
+                string[] levels = key.Split('.');
+
+                // заголовки групп, которых ещё не было
+                string prefix = null;
+                bool hidden = false;
+                for (int d = 0; d < levels.Length - 1; d++)
+                {
+                    prefix = prefix == null ? levels[d] : prefix + "." + levels[d];
+                    if (hidden) break;
+                    if (shown.Add(prefix)) _tree.Add(GroupRow(prefix, levels[d], d));
+                    if (_collapsed.Contains(prefix)) hidden = true;
+                }
+
+                if (hidden) continue;
+                shown.Add(key);
+                _tree.Add(KeyRow(e, levels[^1], levels.Length - 1));
+            }
+
+            if (count == 0) _tree.Add(_kit.Faint(Entries.Length == 0 ? "Каталог пуст: «+ Звук» или «Синхронизировать с папками»." : "Ничего не найдено."));
+        }
+
+        private VisualElement GroupRow(string prefix, string name, int depth)
+        {
+            bool collapsed = _collapsed.Contains(prefix);
+            var row = _kit.ListRow(() =>
+            {
+                if (!_collapsed.Remove(prefix)) _collapsed.Add(prefix);
+                SessionState.SetString(Context.GetSessionKey("sounds.collapsed"), string.Join("|", _collapsed));
+                FillTree();
+            });
+            row.style.paddingLeft = 6f + depth * 14f;
+            row.style.flexWrap = Wrap.NoWrap;
+            row.Add(_kit.Mono(collapsed ? "▸" : "▾", NexusToken.TextFaint));
+            row.Add(_kit.Gap(6f));
+            var label = _kit.Text(name, NexusToken.TextDim, 12);
+            label.style.unityFontStyleAndWeight = FontStyle.Bold;
+            row.Add(label);
+            return row;
+        }
+
+        private VisualElement KeyRow(SoundEntry e, string name, int depth)
+        {
+            bool selected = _selected == e.key;
+            var row = _kit.ListRow(() => TrySwitch(() => SelectKey(e.key)), selected);
+            row.style.paddingLeft = 6f + depth * 14f;
+            row.style.flexWrap = Wrap.NoWrap;
+
+            row.Add(_kit.Dot(StateToken(e)));
+            var label = _kit.Text(name, NexusToken.TextNormal, 12);
+            label.style.flexGrow = 1;
+            label.style.flexShrink = 1;
+            row.Add(label);
+
+            if (e.isDefault) row.Add(_kit.Tag(NexusTagColor.Violet, "дефолт"));
+            int clips = SoundCatalog.CountClips(e);
+            if (clips > 0) row.Add(_kit.Mono(clips.ToString(), NexusToken.TextFaint));
+            if (_issues.TryGetValue(e.key ?? string.Empty, out var issues)) row.tooltip = Join(issues);
+            return row;
+        }
+
+        private NexusToken StateToken(in SoundEntry e)
+        {
+            if (_issues.TryGetValue(e.key ?? string.Empty, out var issues))
+                foreach (var i in issues)
+                    if (i.Level != SoundCatalog.IssueLevel.Info) return i.Level == SoundCatalog.IssueLevel.Error ? NexusToken.Error : NexusToken.Warning;
+
+            return e.mode switch
+            {
+                SoundMode.Off => NexusToken.TextFaint,
+                SoundMode.Default => NexusToken.Accent,
+                _ => SoundCatalog.CountClips(e) > 0 ? NexusToken.Ok : NexusToken.Warning,
+            };
+        }
+
+        private static string Join(List<SoundCatalog.Issue> issues)
+        {
+            var sb = new StringBuilder();
+            foreach (var i in issues) sb.Append("• ").Append(i.Text).Append('\n');
+            return sb.ToString().TrimEnd();
+        }
+
+        private VisualElement EmptyDetail()
+        {
+            var card = _kit.Card("Звук не выбран", "Выберите ключ слева или создайте новый: «+ Звук» — событие, «+ Дефолт» — общий звук, на который ссылаются события.");
+            card.Add(_kit.Faint($"Клипы лежат в {SoundSettings.ClipsRoot}/<уровни ключа>. Код: AppSound.Play(AppSounds.UI.Effects.Click_S)."));
+            return card;
+        }
+
+        // ============================================================ карточка ключа
+
+        private VisualElement Detail()
+        {
+            var root = new VisualElement();
+            root.Add(HeadCard());
+            root.Add(LevelsCard());
+
+            var columns = _kit.Columns(out var left, out var right, 340f);
+            left.Add(ClipsCard());
+            left.Add(DescriptionCard());
+            right.Add(ModeCard());
+            right.Add(SoundCard());
+            root.Add(columns);
+
+            root.Add(ActionsCard());
+            root.Add(PreviewCard());
+            return root;
+        }
+
+        private VisualElement HeadCard()
+        {
+            var card = _kit.Card(null);
+            var line = _kit.Row();
+            _keyTitle = _kit.Title(string.Empty);
+            _keyTitle.style.fontSize = 15;
+            line.Add(_keyTitle);
+            line.Add(_kit.Gap(8f));
+            _dirtyTag = _kit.Tag(NexusTagColor.Amber, "правка");
+            line.Add(_dirtyTag);
+            line.Add(_kit.Spacer());
+            line.Add(_kit.Btn(NexusRole.Ghost, "Копировать константу", () =>
+            {
+                EditorGUIUtility.systemCopyBuffer = SoundKeys.ConstantOf(_draft.Entry.key);
+                Context.SetStatus("Скопировано: " + EditorGUIUtility.systemCopyBuffer, StatusKind.Ok);
+            }, true));
+            line.Add(_kit.Btn(NexusRole.Ghost, "Показать в Project", PingFolder, true));
+            card.Add(line);
+
+            _keyConst = _kit.Mono(string.Empty, NexusToken.AccentText);
+            _keyPath = _kit.Mono(string.Empty, NexusToken.TextFaint);
+            card.Add(_keyConst);
+            card.Add(_keyPath);
+            UpdateHead();
+            return card;
+        }
+
+        private void UpdateHead()
+        {
+            if (_draft == null || _keyTitle == null) return;
+            string key = _draft.Entry.key ?? string.Empty;
+            _keyTitle.text = string.IsNullOrEmpty(key) ? "новый звук" : key;
+            _keyConst.text = SoundKeys.ValidateKey(key) == null ? $"AppSound.Play({SoundKeys.ConstantOf(key)})" : string.Empty;
+            _keyPath.text = string.IsNullOrEmpty(key) ? string.Empty : SoundKeys.FolderOf(key);
+            _dirtyTag.style.display = _dirty ? DisplayStyle.Flex : DisplayStyle.None;
+            if (_applyButton != null) _applyButton.SetEnabled(_dirty);
+        }
+
+        private void PingFolder()
+        {
+            string folder = SoundKeys.FolderOf(_draft.OriginalKey ?? _draft.Entry.key ?? string.Empty);
+            var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(AssetDatabase.IsValidFolder(folder) ? folder : SoundSettings.ClipsRoot);
+            if (obj == null) { Context.SetStatus($"Папки ещё нет: {folder}", StatusKind.Info); return; }
+            EditorGUIUtility.PingObject(obj);
+            Selection.activeObject = obj;
+        }
+
+        // ---- уровни ключа
+
+        private VisualElement LevelsCard()
+        {
+            var card = _kit.Card("Домены", "Уровень — папка клипов. Латиница, цифры и «_»; не с цифры; без точки; не как родитель; до 5 уровней.");
+            var list = new VisualElement();
+            card.Add(list);
+
+            _keyError = _kit.Text(string.Empty, NexusToken.Error, 11);
+            card.Add(_keyError);
+
+            FillLevels(list);
+            return card;
+        }
+
+        private List<string> Levels() => new((_draft.Entry.key ?? string.Empty).Split('.'));
+
+        private void SetLevels(List<string> levels)
+        {
+            _draft.Entry.key = string.Join(".", levels);
+            Changed();
+        }
+
+        private void FillLevels(VisualElement list)
+        {
+            list.Clear();
+            List<string> levels = Levels();
+
+            for (int i = 0; i < levels.Count; i++)
+            {
+                int index = i;
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginBottom = 4f;
+
+                var num = _kit.Mono((i + 1).ToString(), NexusToken.TextFaint);
+                num.style.width = 18f;
+                row.Add(num);
+
+                var field = _kit.Input(levels[i], v =>
+                {
+                    List<string> current = Levels();
+                    if (index >= current.Count) return;
+                    current[index] = (v ?? string.Empty).Trim();
+                    SetLevels(current);
+                });
+                field.style.flexGrow = 1;
+                row.Add(field);
+
+                row.Add(_kit.Btn(NexusRole.Ghost, "▾", () => LevelMenu(index, field), true));
+                if (levels.Count > 1)
+                    row.Add(_kit.Btn(NexusRole.Ghost, "✕", () =>
+                    {
+                        List<string> current = Levels();
+                        current.RemoveAt(index);
+                        SetLevels(current);
+                        FillLevels(list);
+                    }, true));
+                list.Add(row);
+            }
+
+            if (levels.Count < SoundSettings.MaxDepth)
+            {
+                var add = _kit.Btn(NexusRole.Ghost, "+ уровень", () =>
+                {
+                    List<string> current = Levels();
+                    current.Add(string.Empty);
+                    SetLevels(current);
+                    FillLevels(list);
+                }, true);
+                add.style.alignSelf = Align.FlexStart;
+                list.Add(add);
+            }
+
+            UpdateKeyError();
+        }
+
+        /// <summary>Меню существующих имён на этом уровне под тем же родителем.</summary>
+        private void LevelMenu(int index, TextField field)
+        {
+            List<string> levels = Levels();
+            string parent = index == 0 ? null : string.Join(".", levels.GetRange(0, index));
+            var names = new SortedSet<string>(StringComparer.Ordinal);
+
+            foreach (SoundEntry e in Entries)
+            {
+                if (string.IsNullOrEmpty(e.key)) continue;
+                string[] l = e.key.Split('.');
+                if (l.Length <= index) continue;
+                if (parent != null && string.Join(".", l, 0, index) != parent) continue;
+                names.Add(l[index]);
+            }
+
+            var menu = new GenericMenu();
+            if (names.Count == 0) menu.AddDisabledItem(new GUIContent("нет существующих — введите новое"));
+            foreach (string name in names)
+                menu.AddItem(new GUIContent(name), name == levels[index], () => field.value = name);
+            menu.ShowAsContext();
+        }
+
+        private void UpdateKeyError()
+        {
+            if (_keyError == null) return;
+            string key = _draft.Entry.key;
+            string error = SoundKeys.ValidateKey(key);
+            if (error == null)
+            {
+                int other = SoundEdit.IndexOf(Entries, key);
+                if (other >= 0 && key != _draft.OriginalKey) error = "такой ключ уже есть";
+            }
+            _keyError.text = error ?? string.Empty;
+            _keyError.style.display = error != null ? DisplayStyle.Flex : DisplayStyle.None;
+        }
+
+        // ---- режим
+
+        private VisualElement ModeCard()
+        {
+            var card = _kit.Card("Режим");
+            var content = new VisualElement();
+            card.Add(content);
+            FillMode(content);
+            return card;
+        }
+
+        private void FillMode(VisualElement content)
+        {
+            content.Clear();
+            bool isDefault = _draft.Entry.isDefault;
+
+            int selected = isDefault ? (_draft.Entry.mode == SoundMode.Off ? 0 : 1) : (int)_draft.Entry.mode;
+            content.Add(Context.Ui.Segmented(isDefault ? DefaultModes : EventModes, selected, i =>
+            {
+                _draft.Entry.mode = isDefault ? (i == 0 ? SoundMode.Off : SoundMode.Custom) : (SoundMode)i;
+                Changed();
+                FillMode(content);
+            }));
+
+            var asDefault = _kit.Check("Дефолтный звук (на него ссылаются события)", isDefault, v =>
+            {
+                _draft.Entry.isDefault = v;
+                if (v && _draft.Entry.mode == SoundMode.Default) _draft.Entry.mode = SoundMode.Custom;
+                Changed();
+                FillMode(content);
+            });
+            asDefault.style.marginTop = 6f;
+            content.Add(asDefault);
+
+            if (!isDefault && _draft.Entry.mode == SoundMode.Default)
+            {
+                var defaults = new List<string>();
+                foreach (SoundEntry e in Entries)
+                    if (e.isDefault && !string.IsNullOrEmpty(e.key)) defaults.Add(e.key);
+
+                if (defaults.Count == 0)
+                {
+                    content.Add(_kit.Status(StatusKind.Warning, "Дефолтов нет", "«+ Дефолт» в тулбаре — общий звук для событий."));
+                    return;
+                }
+
+                int index = Math.Max(0, defaults.IndexOf(_draft.Entry.defaultKey));
+                if (_draft.Entry.defaultKey != defaults[index])
+                {
+                    _draft.Entry.defaultKey = defaults[index];
+                    Changed();
+                }
+
+                var dd = _kit.Dropdown("Дефолт", defaults, index, i =>
+                {
+                    _draft.Entry.defaultKey = defaults[i];
+                    Changed();
+                });
+                dd.style.marginTop = 6f;
+                content.Add(dd);
+            }
+        }
+
+        // ---- звук
+
+        private VisualElement SoundCard()
+        {
+            var card = _kit.Card("Звук", "Громкость в игре: общая × событие × клип. В режиме «Дефолт» высота — дефолта.");
+
+            card.Add(_kit.Labeled("Громкость", SliderWithValue(_draft.Entry.volume, 0f, 1f, v => { _draft.Entry.volume = v; Changed(); })));
+
+            var pitch = new MinMaxSlider(_draft.Entry.pitchMin, _draft.Entry.pitchMax, 0.5f, 2f);
+            var min = new FloatField { value = _draft.Entry.pitchMin };
+            var max = new FloatField { value = _draft.Entry.pitchMax };
+            min.style.width = 52f;
+            max.style.width = 52f;
+
+            void SetPitch(float a, float b, bool fromSlider)
+            {
+                a = Mathf.Clamp(a, 0.5f, 2f);
+                b = Mathf.Clamp(b, 0.5f, 2f);
+                if (a > b) (a, b) = (b, a);
+                _draft.Entry.pitchMin = a;
+                _draft.Entry.pitchMax = b;
+                if (!fromSlider) pitch.SetValueWithoutNotify(new Vector2(a, b));
+                min.SetValueWithoutNotify((float)Math.Round(a, 3));
+                max.SetValueWithoutNotify((float)Math.Round(b, 3));
+                Changed();
+            }
+
+            pitch.RegisterValueChangedCallback(e => SetPitch(e.newValue.x, e.newValue.y, true));
+            min.RegisterValueChangedCallback(e => SetPitch(e.newValue, _draft.Entry.pitchMax, false));
+            max.RegisterValueChangedCallback(e => SetPitch(_draft.Entry.pitchMin, e.newValue, false));
+
+            var pitchRow = _kit.Row();
+            pitchRow.style.flexWrap = Wrap.NoWrap;
+            pitch.style.flexGrow = 1;
+            pitchRow.Add(min);
+            pitchRow.Add(pitch);
+            pitchRow.Add(max);
+            card.Add(_kit.Labeled("Высота", pitchRow));
+
+            var cooldown = new FloatField { value = _draft.Entry.cooldown };
+            cooldown.RegisterValueChangedCallback(e =>
+            {
+                _draft.Entry.cooldown = Mathf.Max(0f, e.newValue);
+                Changed();
+            });
+            card.Add(_kit.Labeled("Кулдаун, с", cooldown));
+
+            var buses = new List<string> { "UI (2D)", "Мир (3D) — пока как 2D" };
+            card.Add(_kit.Labeled("Шина", _kit.Dropdown(null, buses, (int)_draft.Entry.bus, i => { _draft.Entry.bus = (SoundBus)i; Changed(); })));
+
+            var output = new ObjectField { objectType = typeof(AudioMixerGroup), allowSceneObjects = false, value = _draft.Entry.output };
+            output.RegisterValueChangedCallback(e => { _draft.Entry.output = e.newValue as AudioMixerGroup; Changed(); });
+            card.Add(_kit.Labeled("Микшер", output));
+
+            _kit.PaintFieldInput(card);
+            return card;
+        }
+
+        private VisualElement SliderWithValue(float value, float lo, float hi, Action<float> onChanged)
+        {
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+            var slider = new Slider(lo, hi) { value = value };
+            slider.style.flexGrow = 1;
+            var field = new FloatField { value = (float)Math.Round(value, 3) };
+            field.style.width = 52f;
+            slider.RegisterValueChangedCallback(e =>
+            {
+                field.SetValueWithoutNotify((float)Math.Round(e.newValue, 3));
+                onChanged(e.newValue);
+            });
+            field.RegisterValueChangedCallback(e =>
+            {
+                float v = Mathf.Clamp(e.newValue, lo, hi);
+                slider.SetValueWithoutNotify(v);
+                onChanged(v);
+            });
+            row.Add(slider);
+            row.Add(field);
+            return row;
+        }
+
+        // ---- клипы
+
+        private VisualElement ClipsCard()
+        {
+            var card = _kit.Card("Клипы", "Варианты события: в игре — случайный, без повтора предыдущего. Перетащите клипы из Project или файлы с диска.");
+            var list = new VisualElement();
+            card.Add(list);
+            FillClips(list);
+
+            var add = new ObjectField { objectType = typeof(AudioClip), allowSceneObjects = false, label = "Добавить" };
+            add.RegisterValueChangedCallback(e =>
+            {
+                if (e.newValue is not AudioClip clip) return;
+                _draft.Clips.Add(new DraftClip { Clip = clip, Volume = 1f });
+                add.SetValueWithoutNotify(null);
+                Changed();
+                FillClips(list);
+            });
+            add.style.marginTop = 6f;
+            card.Add(add);
+
+            // перетаскивание на всю карточку
+            card.RegisterCallback<DragUpdatedEvent>(evt =>
+            {
+                if (DraggedClips(out _, out _)) DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            });
+            card.RegisterCallback<DragPerformEvent>(evt =>
+            {
+                if (!DraggedClips(out var clips, out var files)) return;
+                DragAndDrop.AcceptDrag();
+                foreach (AudioClip c in clips) _draft.Clips.Add(new DraftClip { Clip = c, Volume = 1f });
+                foreach (string f in files) _draft.Clips.Add(new DraftClip { ExternalPath = f, Volume = 1f });
+                Changed();
+                FillClips(list);
+            });
+
+            _kit.PaintFieldInput(card);
+            return card;
+        }
+
+        private static bool DraggedClips(out List<AudioClip> clips, out List<string> files)
+        {
+            clips = new List<AudioClip>();
+            files = new List<string>();
+            foreach (UnityEngine.Object o in DragAndDrop.objectReferences)
+                if (o is AudioClip c) clips.Add(c);
+
+            if (clips.Count == 0)
+                foreach (string p in DragAndDrop.paths)
+                    if (Path.IsPathRooted(p) && SoundCatalog.IsAudioFile(p) && File.Exists(p)) files.Add(p);
+
+            return clips.Count > 0 || files.Count > 0;
+        }
+
+        private void FillClips(VisualElement list)
+        {
+            list.Clear();
+            if (_draft.Clips.Count == 0)
+            {
+                list.Add(_kit.Faint(_draft.Entry.mode == SoundMode.Custom ? "Клипов нет — в игре будет тишина." : "Клипов нет."));
+                return;
+            }
+
+            long bytes = 0;
+            for (int i = 0; i < _draft.Clips.Count; i++)
+            {
+                int index = i;
+                DraftClip d = _draft.Clips[i];
+                var row = _kit.ListRow(() => { _selectedClip = index; FillClips(list); }, index == _selectedClip);
+                row.style.flexWrap = Wrap.NoWrap;
+
+                row.Add(_kit.Btn(NexusRole.Ghost, "▶", () =>
+                {
+                    _selectedClip = index;
+                    if (d.Clip != null) PlayRaw(d.Clip);
+                    else Context.SetStatus("Внешний файл слышен после Apply.", StatusKind.Info);
+                }, true));
+
+                var texts = new VisualElement();
+                texts.style.flexGrow = 1;
+                texts.style.flexShrink = 1;
+                texts.Add(_kit.Text(d.Name, NexusToken.TextNormal, 12));
+                texts.Add(_kit.Mono(ClipInfo(d), ClipWarning(d) ? NexusToken.Warning : NexusToken.TextFaint));
+                row.Add(texts);
+                bytes += SoundEdit.DecodedBytes(d.Clip);
+
+                var vol = SliderWithValue(d.Volume, 0f, 1f, v =>
+                {
+                    DraftClip c = _draft.Clips[index];
+                    c.Volume = v;
+                    _draft.Clips[index] = c;
+                    Changed();
+                });
+                vol.style.width = 150f;
+                vol.tooltip = "Поправка громкости клипа";
+                row.Add(vol);
+
+                row.Add(_kit.Btn(NexusRole.Ghost, "↑", () => Move(list, index, -1), true));
+                row.Add(_kit.Btn(NexusRole.Ghost, "↓", () => Move(list, index, 1), true));
+                row.Add(_kit.Btn(NexusRole.Alarm, "✕", () =>
+                {
+                    _draft.Clips.RemoveAt(index);
+                    _selectedClip = Math.Min(_selectedClip, _draft.Clips.Count - 1);
+                    Changed();
+                    FillClips(list);
+                }, true));
+                list.Add(row);
+            }
+
+            list.Add(_kit.Faint($"В памяти после распаковки: ~{Mb(bytes)}. Имена после Apply: {SoundKeys.LastLevel(_draft.Entry.key ?? "Key")}_01…"));
+        }
+
+        private void Move(VisualElement list, int index, int delta)
+        {
+            int to = index + delta;
+            if (to < 0 || to >= _draft.Clips.Count) return;
+            (_draft.Clips[index], _draft.Clips[to]) = (_draft.Clips[to], _draft.Clips[index]);
+            _selectedClip = to;
+            Changed();
+            FillClips(list);
+        }
+
+        private static string ClipInfo(DraftClip d)
+        {
+            if (d.Clip == null) return "внешний файл — скопируется в папку по Apply";
+            AudioClip c = d.Clip;
+            string channels = c.channels == 1 ? "моно" : c.channels == 2 ? "стерео" : c.channels + " кан.";
+            return $"{c.length:0.00} с · {channels} · {c.frequency} Гц";
+        }
+
+        private static bool ClipWarning(DraftClip d) => d.Clip != null && (d.Clip.channels > 1 || d.Clip.length > 5f);
+
+        // ---- описание
+
+        private VisualElement DescriptionCard()
+        {
+            var card = _kit.Card("Описание", "Для каталога, звуковика и подсказки к константе.");
+            card.Add(_kit.Labeled("Название", _kit.Input(_draft.Entry.title, v => { _draft.Entry.title = v; Changed(); })));
+            var when = _kit.Input(_draft.Entry.when, v => { _draft.Entry.when = v; Changed(); });
+            when.multiline = true;
+            when.style.minHeight = 44f;
+            card.Add(_kit.Labeled("Когда звучит", when));
+            return card;
+        }
+
+        // ---- Apply / Reset
+
+        private VisualElement ActionsCard()
+        {
+            var card = _kit.Card(null);
+            var row = _kit.Row();
+            _applyButton = _kit.Btn(NexusRole.Primary, "Apply", () => ApplyDraft());
+            row.Add(_applyButton);
+            row.Add(_kit.Btn(NexusRole.Common, "Reset", ResetDraft));
+            row.Add(_kit.Spacer());
+            if (_draft.OriginalKey != null) row.Add(_kit.Btn(NexusRole.Alarm, "Удалить звук", DeleteKey));
+            card.Add(row);
+
+            _applyStatus = _kit.Text(string.Empty, NexusToken.TextDim, 11);
+            _applyStatus.style.marginTop = 6f;
+            card.Add(_applyStatus);
+
+            if (_issues.TryGetValue(_draft.OriginalKey ?? string.Empty, out var issues))
+                foreach (var i in issues)
+                    card.Add(_kit.Status(i.Level == SoundCatalog.IssueLevel.Error ? StatusKind.Error :
+                                         i.Level == SoundCatalog.IssueLevel.Warning ? StatusKind.Warning : StatusKind.Info, i.Text));
+
+            UpdateHead();
+            return card;
+        }
+
+        private void Changed()
+        {
+            if (_draft == null) return;
+            int index = SoundEdit.IndexOf(Entries, _draft.OriginalKey);
+            _dirty = index < 0 || !_draft.SameAs(Entries[index]);
+            UpdateHead();
+            UpdateKeyError();
+            if (_applyStatus != null) _applyStatus.text = _dirty ? "Есть неприменённые правки." : "Готово.";
+        }
+
+        private bool ApplyDraft()
+        {
+            if (_draft == null) return true;
+            var report = new List<string>();
+            string error = SoundEdit.Apply(_settings, _draft, report);
+            if (error != null)
+            {
+                Context.SetStatus("Звук не применён: " + error, StatusKind.Error);
+                if (_applyStatus != null) _applyStatus.text = error;
+                return false;
+            }
+
+            _dirty = false;
+            _selected = _draft.Entry.key;
+            SessionState.SetString(Context.GetSessionKey("sounds.key"), _selected);
+            Context.SetStatus($"Звук {_selected} применён" + (report.Count > 0 ? ": " + string.Join("; ", report) : "."), StatusKind.Ok);
+            Load();
+            Render();
+            return true;
+        }
+
+        private void ResetDraft()
+        {
+            if (_draft == null) return;
+            if (_draft.OriginalKey == null)
+            {
+                _draft = null;
+                _dirty = false;
+                Render();
+                return;
+            }
+            SelectKey(_draft.OriginalKey);
+        }
+
+        private void DeleteKey()
+        {
+            string key = _draft.OriginalKey;
+            if (!EditorUtility.DisplayDialog("Удалить звук", $"Удалить {key}?\nЗапись уйдёт из каталога, клипы папки — в корзину.", "Удалить", "Отмена")) return;
+            var report = new List<string>();
+            SoundEdit.Delete(_settings, key, report);
+            Context.SetStatus(string.Join("; ", report), StatusKind.Ok);
+            _draft = null;
+            _dirty = false;
+            _selected = null;
+            Load();
+            Render();
+        }
+
+        private void NewKey(bool isDefault)
+        {
+            _view = 0;
+            string prefix = isDefault ? "Defaults." : _domain != null ? _domain + "." : string.Empty;
+            _draft = SoundDraft.New(prefix, isDefault);
+            _selected = null;
+            _dirty = true;
+            Render();
+        }
+
+        private void Sync()
+        {
+            var report = new List<string>();
+            SoundEntry[] synced = SoundCatalog.SyncWithFolders(Entries, report);
+            SoundCatalog.Commit(_settings, synced, "Синхронизация звуков с папками");
+            Context.SetStatus(report.Count == 0 ? "Каталог совпадает с папками." : "Синхронизация: " + string.Join("; ", report),
+                              report.Count == 0 ? StatusKind.Info : StatusKind.Ok);
+            Load();
+            Render();
+        }
+
+        // ---- прослушивание
+
+        private VisualElement PreviewCard()
+        {
+            var card = _kit.Card("Прослушивание", "«Играть» — как в игре: режим, случайный клип без повтора, итоговая громкость, новая высота каждый раз. «Как записано» — выбранный клип без обработки.");
+            var row = _kit.Row();
+            row.Add(_kit.Btn(NexusRole.Primary, "Играть", PlayAsGame));
+            row.Add(_kit.Btn(NexusRole.Common, "Как записано", () =>
+            {
+                if (_draft.Clips.Count == 0) { Context.SetStatus("Клипов нет.", StatusKind.Info); return; }
+                DraftClip d = _draft.Clips[Mathf.Clamp(_selectedClip, 0, _draft.Clips.Count - 1)];
+                if (d.Clip != null) PlayRaw(d.Clip);
+            }));
+            row.Add(_kit.Btn(NexusRole.Ghost, "Стоп", () => _preview.Stop()));
+            card.Add(row);
+
+            var track = new VisualElement();
+            track.style.height = 4f;
+            track.style.marginTop = 10f;
+            AppKit.Surface(track, NexusToken.BgHard, NexusToken.Border, 2f);
+            _progressFill = new VisualElement();
+            _progressFill.style.height = Length.Percent(100);
+            _progressFill.style.width = Length.Percent(0);
+            NexusClass.SetBg(_progressFill, NexusToken.Accent);
+            track.Add(_progressFill);
+            card.Add(track);
+
+            _previewInfo = _kit.Mono(string.Empty, NexusToken.TextDim);
+            _previewInfo.style.marginTop = 6f;
+            card.Add(_previewInfo);
+            return card;
+        }
+
+        private void PlayAsGame()
+        {
+            string silent = _preview.PlayAsGame(_settings, _draft.Entry, _draft.Clips);
+            if (silent != null)
+            {
+                Context.SetStatus("Тишина: " + silent, StatusKind.Warning);
+                return;
+            }
+            StartPoll();
+        }
+
+        private void PlayRaw(AudioClip clip)
+        {
+            _preview.PlayRaw(clip);
+            StartPoll();
+        }
+
+        private void StartPoll()
+        {
+            _poll ??= _root.schedule.Execute(Poll).Every(50);
+            _poll.Resume();
+            Poll();
+        }
+
+        private void Poll()
+        {
+            AudioClip clip = _preview.Clip;
+            if (_progressFill == null || clip == null) { _poll?.Pause(); return; }
+
+            float t = _preview.Time;
+            float length = clip.length;
+            _progressFill.style.width = Length.Percent(length > 0f ? Mathf.Clamp01(t / length) * 100f : 0f);
+            _previewInfo.text = $"{t:0.00} / {length:0.00} с · высота {_preview.Pitch:0.00} · громкость {_preview.Volume:0.00} · {clip.name}";
+
+            if (!_preview.IsPlaying)
+            {
+                _progressFill.style.width = Length.Percent(0);
+                _poll?.Pause();
+            }
+        }
+
+        // ============================================================ обмен со звуковиком
+
+        private void RenderExchange()
+        {
+            var columns = _kit.Columns(out var left, out var right, 392f);
+            _body.Add(columns);
+
+            // ---- экспорт
+            bool withClips = SessionState.GetBool(Context.GetSessionKey("sounds.export.clips"), true);
+            var export = _kit.Card("Экспорт для звуковика",
+                "Zip: страница приёмки с вшитым каталогом (ключи, названия, «когда звучит»), manifest.json с настройками и папка Clips. " +
+                "Звуковик распаковывает, открывает html, выбирает эту папку рабочей — и видит и слышит всё, что уже есть в игре.");
+            export.Add(_kit.Check("С текущими клипами", withClips, v => SessionState.SetBool(Context.GetSessionKey("sounds.export.clips"), v)));
+            var exportButton = _kit.Btn(NexusRole.Primary, "Экспорт…", () =>
+            {
+                string name = $"{SoundExchange.ProjectName()}Sounds_{DateTime.Now:yyyy-MM-dd}.zip";
+                string path = EditorUtility.SaveFilePanel("Экспорт звуков", string.Empty, name, "zip");
+                if (string.IsNullOrEmpty(path)) return;
+                var report = new List<string>();
+                string error = SoundExchange.Export(_settings, path, SessionState.GetBool(Context.GetSessionKey("sounds.export.clips"), true), report);
+                if (error != null) { Context.SetStatus("Экспорт: " + error, StatusKind.Error); return; }
+                Context.SetStatus("Экспорт: " + string.Join("; ", report), StatusKind.Ok);
+                EditorUtility.RevealInFinder(path);
+            });
+            exportButton.style.alignSelf = Align.FlexStart;
+            exportButton.style.marginTop = 6f;
+            export.Add(exportButton);
+            right.Add(export);
+
+            // ---- импорт
+            var import = _kit.Card("Импорт от звуковика",
+                "Архив или распакованная папка (с manifest.json). Сначала — разница по ключам; применяется только выбранное, " +
+                "каждый ключ — как Apply на вкладке: клипы в папку ключа, нумерация, старые — в корзину.");
+            var row = _kit.Row();
+            row.Add(_kit.Btn(NexusRole.Common, "Из архива…", () => ReadPack(EditorUtility.OpenFilePanel("Архив звуков", string.Empty, "zip"))));
+            row.Add(_kit.Btn(NexusRole.Common, "Из папки…", () => ReadPack(EditorUtility.OpenFolderPanel("Папка звуков", string.Empty, string.Empty))));
+            import.Add(row);
+            right.Add(import);
+
+            left.Add(_pack == null ? EmptyDiff() : DiffCard());
+        }
+
+        private VisualElement EmptyDiff()
+        {
+            var card = _kit.Card("Разница", "Выберите архив или папку справа — здесь появятся изменения по ключам.");
+            return card;
+        }
+
+        private void ReadPack(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            string error = SoundExchange.Read(path, out SoundExchange.Pack pack);
+            if (error != null)
+            {
+                Context.SetStatus("Импорт: " + error, StatusKind.Error);
+                return;
+            }
+            _pack = pack;
+            _diffs = SoundExchange.Diff(_settings, pack);
+            Render();
+        }
+
+        private VisualElement DiffCard()
+        {
+            int changed = 0;
+            foreach (var d in _diffs) if (d.HasChanges) changed++;
+
+            var head = _kit.Row();
+            head.Add(_kit.Btn(NexusRole.Ghost, "Все", () => { foreach (var d in _diffs) d.Selected = d.HasChanges && d.Errors.Count == 0; Render(); }, true));
+            head.Add(_kit.Btn(NexusRole.Ghost, "Ничего", () => { foreach (var d in _diffs) d.Selected = false; Render(); }, true));
+            head.Add(_kit.Btn(NexusRole.Primary, "Применить выбранное", ApplyPack, true));
+            head.Add(_kit.Btn(NexusRole.Ghost, "Закрыть", () => { _pack = null; _diffs = null; Render(); }, true));
+
+            var card = _kit.Card($"Разница: {_pack.Source}",
+                changed == 0 ? "Изменений нет — пакет совпадает с каталогом." : $"Ключей с изменениями: {changed}.", head);
+
+            foreach (SoundExchange.KeyDiff diff in _diffs)
+            {
+                var box = new VisualElement();
+                box.style.marginBottom = 8f;
+
+                var line = _kit.Row();
+                line.style.flexWrap = Wrap.NoWrap;
+                var toggle = new Toggle { value = diff.Selected };
+                toggle.SetEnabled(diff.HasChanges && diff.Errors.Count == 0);
+                toggle.RegisterValueChangedCallback(e => diff.Selected = e.newValue);
+                line.Add(toggle);
+                var key = _kit.Text(diff.Key == "*" ? "Общие настройки" : diff.Key, NexusToken.TextNormal, 12);
+                key.style.unityFontStyleAndWeight = FontStyle.Bold;
+                line.Add(key);
+                if (diff.IsNew) { line.Add(_kit.Gap(6f)); line.Add(_kit.Tag(NexusTagColor.Green, "новый")); }
+                if (diff.ClipsChanged) { line.Add(_kit.Gap(6f)); line.Add(_kit.Tag(NexusTagColor.Amber, "клипы")); }
+                box.Add(line);
+
+                foreach (string c in diff.Changes)
+                {
+                    var l = _kit.Mono("• " + c, NexusToken.TextDim);
+                    l.style.marginLeft = 22f;
+                    box.Add(l);
+                }
+                foreach (string e in diff.Errors)
+                {
+                    var l = _kit.Mono("✕ " + e, NexusToken.Error);
+                    l.style.marginLeft = 22f;
+                    box.Add(l);
+                }
+                if (!string.IsNullOrEmpty(diff.Note))
+                {
+                    var l = _kit.Text("Комментарий: " + diff.Note, NexusToken.AccentText, 11);
+                    l.style.marginLeft = 22f;
+                    box.Add(l);
+                }
+                card.Add(box);
+            }
+            return card;
+        }
+
+        private void ApplyPack()
+        {
+            if (_pack == null) return;
+            var report = new List<string>();
+            SoundExchange.Apply(_settings, _pack, _diffs, report);
+            Context.SetStatus(report.Count == 0 ? "Ничего не выбрано." : "Импорт: " + string.Join("; ", report), report.Count == 0 ? StatusKind.Info : StatusKind.Ok);
+            _pack = null;
+            _diffs = null;
+            Load();
+            Render();
+        }
+
+        // ============================================================ настройки
+
+        private void RenderSettings()
+        {
+            _so.Update();
+            var columns = _kit.Columns(out var left, out var right, 392f);
+            _body.Add(columns);
+
+            var main = _kit.Card("Звук приложения", "Выключено — каталог не запекается, голоса не создаются, Play выходит сразу.");
+            foreach (string name in new[] { "enabled", "disableInBatchMode", "masterVolume", "voices", "output", "pauseWhenUnfocused" })
+            {
+                SerializedProperty prop = _so.FindProperty(name);
+                if (prop == null) continue;
+                var field = new PropertyField(prop);
+                field.Bind(_so);
+                field.RegisterValueChangeCallback(_ => Changed(true));
+                main.Add(field);
+            }
+            left.Add(main);
+
+            var tools = _kit.Card("Инструменты");
+            var row = _kit.Row();
+            row.Add(_kit.Btn(NexusRole.Common, "Синхронизировать с папками", Sync, true));
+            row.Add(_kit.Btn(NexusRole.Common, "Перегенерировать ключи", () =>
+            {
+                bool changed = SoundCatalog.Generate(SoundCatalog.Sorted(Entries));
+                Context.SetStatus(changed ? "AppSounds.cs обновлён." : "AppSounds.cs уже актуален.", StatusKind.Ok);
+            }, true));
+            row.Add(_kit.Btn(NexusRole.Ghost, "Ассет настроек", () => { Selection.activeObject = _settings; EditorGUIUtility.PingObject(_settings); }, true));
+            tools.Add(row);
+            left.Add(tools);
+
+            var paths = _kit.Card("Пути", "Фиксированы в AppCore.");
+            paths.Add(_kit.Labeled("Настройки", _kit.Mono(SoundSettings.AssetPath)));
+            paths.Add(_kit.Labeled("Клипы", _kit.Mono(SoundSettings.ClipsRoot + "/<уровни ключа>/<Последний>_NN")));
+            paths.Add(_kit.Labeled("Ключи", _kit.Mono(SoundSettings.KeysPath)));
+            paths.Add(_kit.Labeled("Вызов", _kit.Mono("AppSound.Play(AppSounds.UI.Effects.Click_S)")));
+            right.Add(paths);
+
+            var check = _kit.Card("Проверка каталога");
+            List<SoundCatalog.Issue> issues = SoundCatalog.Validate(Entries);
+            if (issues.Count == 0) check.Add(_kit.Status(StatusKind.Ok, "Замечаний нет."));
+            foreach (SoundCatalog.Issue i in issues)
+                check.Add(_kit.Status(i.Level == SoundCatalog.IssueLevel.Error ? StatusKind.Error :
+                                      i.Level == SoundCatalog.IssueLevel.Warning ? StatusKind.Warning : StatusKind.Info, i.Key, i.Text));
+            right.Add(check);
+        }
+
+        private void Changed(bool settings)
+        {
+            if (!settings || _so == null) return;
+            _so.ApplyModifiedProperties();
+            _save ??= _root.schedule.Execute(Flush);
+            _save.ExecuteLater(500);
+        }
+
+        private void Flush()
+        {
+            if (_settings != null) AssetDatabase.SaveAssetIfDirty(_settings);
+        }
+    }
+}
+#endif

@@ -1,5 +1,6 @@
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.TextCore.LowLevel;
 using UnityEngine.TextCore.Text;
 using UnityEngine.UIElements;
 
@@ -53,7 +54,8 @@ namespace Exerussus.Nexus.Theme
         private static void Load()
         {
             // Ассеты в памяти переживают перекомпиляцию плохо — после перезагрузки домена собираем заново.
-            if (_loaded && (_sans != null || _mono != null)) return;
+            // Живость проверяем целиком: шрифт без материала или атласа рисовать нельзя.
+            if (_loaded && (Alive(_sans) || Alive(_mono))) return;
             _loaded = true;
 
             _sans = Pair("Inter-Regular.ttf", "Inter-Bold.ttf");
@@ -80,9 +82,27 @@ namespace Exerussus.Nexus.Theme
             var font = AssetDatabase.LoadAssetAtPath<Font>(Dir + "/" + file);
             if (font == null) return null;
 
-            var asset = FontAsset.CreateFontAsset(font);
-            if (asset != null) asset.hideFlags = HideFlags.HideAndDontSave;
+            // Один атлас без дозаказа новых: каждый объект шрифта создаётся здесь и сразу защищается.
+            var asset = FontAsset.CreateFontAsset(font, 90, 9, GlyphRenderMode.SDFAA, 1024, 1024, AtlasPopulationMode.Dynamic, false);
+            if (asset == null) return null;
+
+            // Шрифт собран в памяти, это не ассет на диске. Без DontSave редактор выгружает его материал и
+            // атлас при сборке неиспользуемых ассетов (смена сцены, вход в префаб), а UI Toolkit падает
+            // MissingReferenceException на каждом кадре и дальше — InvalidOperationException в рендере.
+            Protect(asset);
+            Protect(asset.material);
+            if (asset.atlasTextures != null)
+                foreach (var texture in asset.atlasTextures) Protect(texture);
+
             return asset;
         }
+
+        private static void Protect(Object obj)
+        {
+            if (obj != null) obj.hideFlags = HideFlags.HideAndDontSave;
+        }
+
+        private static bool Alive(FontAsset asset) =>
+            asset != null && asset.material != null && asset.atlasTexture != null;
     }
 }

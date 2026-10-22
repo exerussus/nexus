@@ -2,6 +2,14 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [0.4.1]
+
+### Исправлено
+- Шрифты хаба: материал и атлас собранных в памяти шрифтов защищены от выгрузки. Смена сцены, вход в префаб
+  или сборка неиспользуемых ассетов больше не роняют отрисовку окон Nexus (`MissingReferenceException: Material`
+  в `TextUtilities.GetTextCoreSettingsForElement`, за ним `InvalidOperationException` в рендере UI Toolkit).
+  Шрифт без материала или атласа пересобирается при следующем обращении.
+
 ## [0.4.0]
 
 ### Добавлено

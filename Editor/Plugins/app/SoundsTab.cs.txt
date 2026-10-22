@@ -1192,7 +1192,7 @@ namespace Exerussus.Nexus.Pages.App
                 line.style.flexWrap = Wrap.NoWrap;
                 var toggle = new Toggle { value = diff.Selected };
                 toggle.SetEnabled(diff.HasChanges && diff.Errors.Count == 0);
-                toggle.RegisterValueChangedCallback(e => diff.Selected = e.newValue);
+                toggle.RegisterValueChangedCallback(evt => diff.Selected = evt.newValue);
                 line.Add(toggle);
                 var key = _kit.Text(diff.Key == "*" ? "Общие настройки" : diff.Key, NexusToken.TextNormal, 12);
                 key.style.unityFontStyleAndWeight = FontStyle.Bold;
@@ -1207,9 +1207,9 @@ namespace Exerussus.Nexus.Pages.App
                     l.style.marginLeft = 22f;
                     box.Add(l);
                 }
-                foreach (string e in diff.Errors)
+                foreach (string error in diff.Errors)
                 {
-                    var l = _kit.Mono("✕ " + e, NexusToken.Error);
+                    var l = _kit.Mono("✕ " + error, NexusToken.Error);
                     l.style.marginLeft = 22f;
                     box.Add(l);
                 }

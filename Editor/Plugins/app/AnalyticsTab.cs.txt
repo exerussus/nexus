@@ -1,0 +1,1015 @@
+// ============================================================
+//  AnalyticsTab.cs — вкладка «Аналитика»: каталог событий, данные, настройки, справка.
+//
+//  Аналитика — часть app-core 4.7 (Exerussus.AppCore.Analytics). Каталог живёт в AnalyticsSettings
+//  (Assets/App/Settings/AnalyticsSettings.asset); правки копятся в памяти и пишутся кнопкой «Сохранить»
+//  через AnalyticsCatalog.Commit — он сортирует каталог (порядок = Id событий) и перегенерирует
+//  Assets/App/Generated/AppEvents.cs.
+//
+//  «Данные» — в Play Mode: профиль, сессия, прогон, режим, очередь и кнопки; вне игры — пакеты,
+//  сохранённые экспортом в файлы (persistentDataPath/AppAnalytics/Export), с просмотром.
+// ============================================================
+
+#if APPCORE_ANALYTICS
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using Exerussus.AppCore.Analytics;
+using Exerussus.AppCore.Analytics.Editor;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.UIElements;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed class AnalyticsTab : IAppTab
+    {
+        private const string SubtabKey = "analytics.subtab";
+        private static readonly string[] Subtabs = { "Каталог", "Данные", "Настройки", "Справка" };
+        private static readonly List<string> TypeNames = new() { "Целое (long)", "Дробное (double)", "Логическое (bool)", "Строка (string)" };
+
+        private const int MaxFiles = 40;
+        private const int MaxPreviewLines = 60;
+
+        private readonly AppKit _kit;
+
+        private VisualElement _root;
+        private VisualElement _body;
+        private VisualElement _list;
+        private VisualElement _editor;
+        private Button _saveButton;
+        private Label _summary;
+        private int _subtab;
+        private bool _renderedEnabled;
+
+        // черновик каталога
+        private readonly List<EntryDraft> _draft = new();
+        private int _selected = -1;
+        private bool _dirty;
+        private string _filter = string.Empty;
+
+        // данные
+        private string _previewPath;
+
+        private Action<PlayModeStateChange> _playMode;
+
+        public string Title => "Аналитика";
+
+        public AnalyticsTab(AppKit kit) => _kit = kit;
+
+        private IPageContext Context => _kit.Context;
+
+        public VisualElement Build()
+        {
+            _root = new VisualElement();
+            _subtab = Mathf.Clamp(SessionState.GetInt(Context.GetSessionKey(SubtabKey), 0), 0, Subtabs.Length - 1);
+            return _root;
+        }
+
+        public void Show()
+        {
+            if (!_dirty) Load();
+
+            _playMode ??= _ => Render();
+            EditorApplication.playModeStateChanged -= _playMode;
+            EditorApplication.playModeStateChanged += _playMode;
+            Render();
+        }
+
+        public void Hide()
+        {
+            if (_playMode != null) EditorApplication.playModeStateChanged -= _playMode;
+        }
+
+        public void Refresh()
+        {
+            if (_dirty && !EditorUtility.DisplayDialog("Аналитика", "Перечитать каталог? Несохранённые правки пропадут.", "Перечитать", "Отмена"))
+                return;
+
+            Load();
+            Render();
+        }
+
+        public bool CanClose()
+        {
+            if (!_dirty) return true;
+
+            var choice = EditorUtility.DisplayDialogComplex("Аналитика", "В каталоге есть несохранённые правки.", "Сохранить", "Отмена", "Не сохранять");
+            if (choice == 1) return false;
+            if (choice == 0) Save();
+            return true;
+        }
+
+        public void Dispose() => Hide();
+
+        // ============================================================ черновик
+
+        private sealed class FieldDraft
+        {
+            public string Name = string.Empty;
+            public AnalyticsFieldType Type = AnalyticsFieldType.String;
+            public string Note = string.Empty;
+        }
+
+        private sealed class EntryDraft
+        {
+            public string Key = string.Empty;
+            public string Title = string.Empty;
+            public string When = string.Empty;
+            public bool Disabled;
+            public readonly List<FieldDraft> Fields = new();
+
+            public static EntryDraft From(AnalyticsEventEntry e)
+            {
+                var d = new EntryDraft { Key = e.key ?? string.Empty, Title = e.title ?? string.Empty, When = e.when ?? string.Empty, Disabled = e.disabled };
+                if (e.fields != null)
+                    foreach (var f in e.fields)
+                        d.Fields.Add(new FieldDraft { Name = f.name ?? string.Empty, Type = f.type, Note = f.note ?? string.Empty });
+                return d;
+            }
+
+            public AnalyticsEventEntry ToEntry()
+            {
+                var fields = new AnalyticsField[Fields.Count];
+                for (var i = 0; i < fields.Length; i++)
+                    fields[i] = new AnalyticsField { name = Fields[i].Name.Trim(), type = Fields[i].Type, note = Fields[i].Note };
+                return new AnalyticsEventEntry { key = Key.Trim(), title = Title, when = When, disabled = Disabled, fields = fields };
+            }
+        }
+
+        private void Load()
+        {
+            _draft.Clear();
+            _dirty = false;
+
+            var settings = AnalyticsCatalog.Load();
+            if (settings != null)
+                foreach (var e in settings.Entries)
+                    _draft.Add(EntryDraft.From(e));
+
+            _selected = Mathf.Clamp(_selected, -1, _draft.Count - 1);
+        }
+
+        private AnalyticsEventEntry[] DraftEntries()
+        {
+            var entries = new AnalyticsEventEntry[_draft.Count];
+            for (var i = 0; i < entries.Length; i++) entries[i] = _draft[i].ToEntry();
+            return entries;
+        }
+
+        private void MarkDirty()
+        {
+            _dirty = true;
+            UpdateSummary();
+        }
+
+        private void Save()
+        {
+            var settings = AnalyticsCatalog.Load();
+            if (settings == null) return;
+
+            var entries = DraftEntries();
+            var errors = 0;
+            foreach (var issue in AnalyticsCatalog.Validate(entries))
+                if (issue.Level == AnalyticsCatalog.IssueLevel.Error) errors++;
+
+            if (errors > 0 &&
+                !EditorUtility.DisplayDialog("Аналитика", $"В каталоге ошибок: {errors}. События с ошибками не попадут в AppEvents, а сборка остановится. Сохранить?", "Сохранить", "Отмена"))
+                return;
+
+            var selectedKey = _selected >= 0 && _selected < _draft.Count ? _draft[_selected].Key.Trim() : null;
+
+            AnalyticsCatalog.Commit(settings, entries, "Каталог аналитики");
+            Load();
+            _selected = selectedKey != null ? _draft.FindIndex(d => d.Key == selectedKey) : -1;
+
+            Context.SetStatus($"Сохранено: {_draft.Count} событий · {AnalyticsSettings.KeysPath} обновлён", StatusKind.Ok);
+            RenderBody();
+        }
+
+        // ============================================================ рендер
+
+        private void Render()
+        {
+            if (_root == null) return;
+            _root.Clear();
+
+            var settings = AnalyticsCatalog.Load();
+            _renderedEnabled = settings != null && settings.Enabled;
+
+            if (settings == null)
+            {
+                var card = _kit.Card("Аналитика", "Профиль игрока, события партии и приложения, пакеты с доставкой через адаптер.");
+                card.Add(_kit.Status(StatusKind.Warning, $"Нет ассета настроек: {AnalyticsSettings.AssetPath}"));
+                var create = _kit.Btn(NexusRole.Primary, "Создать", () =>
+                {
+                    AnalyticsCatalog.Ensure(true);
+                    var created = AnalyticsCatalog.Load();
+                    if (created != null) AnalyticsCatalog.Generate(AnalyticsCatalog.Sorted(created.Entries));
+                    Load();
+                    Render();
+                });
+                create.style.alignSelf = Align.FlexStart;
+                create.style.marginTop = 8f;
+                card.Add(create);
+                _root.Add(card);
+                return;
+            }
+
+            if (!settings.Enabled)
+            {
+                var card = _kit.Card("Аналитика выключена",
+                                     "Пока галочка снята, AppCore не поднимает модуль: ни профиля, ни файлов, ни PlayerLoop, ни команд консоли; " +
+                                     "каждый Raise выходит на первой проверке.");
+                var enable = _kit.Btn(NexusRole.Primary, "Включить", () =>
+                {
+                    var so = new SerializedObject(settings);
+                    so.FindProperty("enabled").boolValue = true;
+                    so.ApplyModifiedProperties();
+                    AssetDatabase.SaveAssetIfDirty(settings);
+                    Render();
+                });
+                enable.style.alignSelf = Align.FlexStart;
+                enable.style.marginTop = 8f;
+                card.Add(enable);
+                _root.Add(card);
+                _root.Add(SettingsCard(settings));
+                return;
+            }
+
+            var bar = _kit.Row();
+            bar.style.marginBottom = 10f;
+            bar.Add(Context.Ui.Segmented(Subtabs, _subtab, i =>
+            {
+                _subtab = i;
+                SessionState.SetInt(Context.GetSessionKey(SubtabKey), i);
+                RenderBody();
+            }));
+            bar.Add(_kit.Spacer());
+            bar.Add(ModeBadge(settings));
+            _root.Add(bar);
+
+            _body = new VisualElement();
+            _root.Add(_body);
+            RenderBody();
+        }
+
+        private VisualElement ModeBadge(AnalyticsSettings settings)
+        {
+            var row = _kit.Row();
+            if (EditorApplication.isPlaying && AppAnalytics.IsAvailable)
+            {
+                row.Add(_kit.Badge(AppAnalytics.IsCollecting ? StatusKind.Ok : StatusKind.Warning,
+                                   AppAnalytics.IsCollecting ? "пишется" : "не пишется"));
+                row.Add(_kit.Gap(6f));
+                row.Add(_kit.Badge(StatusKind.Info, AppAnalytics.IsLean ? "лёгкий режим" : "полный режим"));
+                return row;
+            }
+
+            var webgl = settings.IsLeanOn(RuntimePlatform.WebGLPlayer);
+            row.Add(_kit.Faint(webgl ? "WebGL: лёгкий режим" : "WebGL: полный режим"));
+            return row;
+        }
+
+        private void RenderBody()
+        {
+            if (_body == null) return;
+            _body.Clear();
+            _list = null;
+            _editor = null;
+            _saveButton = null;
+            _summary = null;
+
+            var settings = AnalyticsCatalog.Load();
+            if (settings == null)
+            {
+                Render();
+                return;
+            }
+
+            switch (_subtab)
+            {
+                case 0: _body.Add(CatalogView()); break;
+                case 1: _body.Add(DataView()); break;
+                case 3: _body.Add(HelpView()); break;
+                default:
+                    _body.Add(SettingsCard(settings));
+                    _body.Add(ToolsCard());
+                    break;
+            }
+        }
+
+        // ============================================================ каталог
+
+        private VisualElement CatalogView()
+        {
+            var root = new VisualElement();
+
+            // ---- панель: поиск, добавить, сохранить ----
+            var bar = _kit.Row();
+            bar.style.marginBottom = 8f;
+            bar.style.flexWrap = Wrap.NoWrap;
+
+            var search = _kit.Input(_filter, v =>
+            {
+                _filter = v ?? string.Empty;
+                RenderList();
+            });
+            search.style.width = 240f;
+            search.style.flexShrink = 1;
+            search.tooltip = "Поиск по ключу и названию";
+            bar.Add(search);
+            bar.Add(_kit.Gap(8f));
+            bar.Add(_kit.Btn(NexusRole.Common, "+ Событие", AddEntry, small: true));
+            bar.Add(_kit.Spacer());
+
+            _summary = _kit.Faint(string.Empty);
+            _summary.style.marginRight = 10f;
+            bar.Add(_summary);
+
+            bar.Add(_kit.Btn(NexusRole.Ghost, "Отменить", () =>
+            {
+                if (!_dirty) return;
+                if (!EditorUtility.DisplayDialog("Аналитика", "Отменить несохранённые правки каталога?", "Отменить правки", "Нет")) return;
+                Load();
+                RenderBody();
+            }, small: true));
+            _saveButton = _kit.Btn(NexusRole.Primary, "Сохранить", Save, small: true);
+            bar.Add(_saveButton);
+            root.Add(bar);
+
+            var columns = _kit.Columns(out var left, out var right, 460f);
+            _list = left;
+            _editor = right;
+            root.Add(columns);
+
+            RenderList();
+            RenderEditor();
+            UpdateSummary();
+            return root;
+        }
+
+        private void UpdateSummary()
+        {
+            if (_summary != null)
+            {
+                var errors = 0;
+                foreach (var issue in AnalyticsCatalog.Validate(DraftEntries()))
+                    if (issue.Level == AnalyticsCatalog.IssueLevel.Error) errors++;
+
+                _summary.text = $"{_draft.Count} событий" + (errors > 0 ? $" · ошибок: {errors}" : string.Empty) + (_dirty ? " · не сохранено" : string.Empty);
+            }
+
+            _saveButton?.SetEnabled(_dirty);
+        }
+
+        private void RenderList()
+        {
+            if (_list == null) return;
+            _list.Clear();
+
+            if (_draft.Count == 0)
+            {
+                var empty = _kit.Card("Каталог пуст", "Событие — ключ по точкам (Game.Module.Focus) и типизированные поля. " +
+                                                      "После сохранения появится AppEvents.Game.Module.Focus.Raise(...).");
+                _list.Add(empty);
+                return;
+            }
+
+            // порядок показа — как будет после сохранения (ordinal по ключу)
+            var order = new List<int>(_draft.Count);
+            for (var i = 0; i < _draft.Count; i++) order.Add(i);
+            order.Sort((a, b) => string.CompareOrdinal(_draft[a].Key, _draft[b].Key));
+
+            var duplicates = new HashSet<string>(StringComparer.Ordinal);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var d in _draft)
+                if (!seen.Add(d.Key.Trim())) duplicates.Add(d.Key.Trim());
+
+            var shown = 0;
+            foreach (var index in order)
+            {
+                var d = _draft[index];
+                if (_filter.Length > 0 &&
+                    d.Key.IndexOf(_filter, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    d.Title.IndexOf(_filter, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                shown++;
+                var i = index;
+                var row = _kit.ListRow(() =>
+                {
+                    _selected = i;
+                    RenderList();
+                    RenderEditor();
+                }, i == _selected);
+                row.style.flexWrap = Wrap.NoWrap;
+
+                var error = KeyError(d, duplicates);
+                row.Add(_kit.Dot(error != null ? NexusToken.Error : d.Disabled ? NexusToken.TextDim : NexusToken.Ok));
+                row.Add(_kit.Gap(8f));
+
+                var texts = new VisualElement();
+                texts.style.flexGrow = 1;
+                texts.style.flexShrink = 1;
+                texts.style.minWidth = 0;
+                var key = _kit.Mono(string.IsNullOrEmpty(d.Key) ? "(без ключа)" : d.Key, d.Disabled ? NexusToken.TextDim : NexusToken.TextNormal);
+                key.style.overflow = Overflow.Hidden;
+                key.style.textOverflow = TextOverflow.Ellipsis;
+                texts.Add(key);
+                if (!string.IsNullOrEmpty(d.Title)) texts.Add(_kit.Faint(d.Title));
+                row.Add(texts);
+
+                if (d.Fields.Count > 0)
+                {
+                    var tag = _kit.Tag(NexusTagColor.Blue, d.Fields.Count == 1 ? d.Fields[0].Name : $"{d.Fields.Count} поля");
+                    tag.style.flexShrink = 0;
+                    row.Add(tag);
+                }
+
+                if (d.Disabled)
+                {
+                    row.Add(_kit.Gap(4f));
+                    row.Add(_kit.Badge(StatusKind.Warning, "выкл"));
+                }
+
+                _list.Add(row);
+            }
+
+            if (shown == 0) _list.Add(_kit.Faint("Ничего не найдено."));
+        }
+
+        private string KeyError(EntryDraft d, HashSet<string> duplicates = null)
+        {
+            var key = d.Key.Trim();
+            var error = AnalyticsKeys.ValidateKey(key);
+            if (error != null) return error;
+
+            if (duplicates == null)
+            {
+                var count = 0;
+                foreach (var other in _draft)
+                    if (other.Key.Trim() == key) count++;
+                return count > 1 ? "ключ повторяется" : null;
+            }
+
+            return duplicates.Contains(key) ? "ключ повторяется" : null;
+        }
+
+        private void AddEntry()
+        {
+            var key = "Game.NewEvent";
+            for (var n = 2; _draft.Exists(d => d.Key == key); n++) key = "Game.NewEvent" + n;
+
+            _draft.Add(new EntryDraft { Key = key });
+            _selected = _draft.Count - 1;
+            _filter = string.Empty;
+            MarkDirty();
+            RenderBody();
+        }
+
+        private void RenderEditor()
+        {
+            if (_editor == null) return;
+            _editor.Clear();
+
+            if (_selected < 0 || _selected >= _draft.Count)
+            {
+                var hint = _kit.Card("Событие", "Выберите событие слева или добавьте новое.");
+                _editor.Add(hint);
+                return;
+            }
+
+            var d = _draft[_selected];
+            var card = _kit.Card("Событие");
+
+            // ---- ключ ----
+            var keyStatus = new VisualElement();
+            var keyField = _kit.Input(d.Key, v =>
+            {
+                d.Key = v ?? string.Empty;
+                MarkDirty();
+                RenderList();
+                UpdateKeyStatus(keyStatus, d);
+                UpdateCallPreview(d);
+            });
+            keyField.tooltip = "Путь по точкам, до 5 уровней: Game.Module.Focus. Латиница, цифры, «_». Первый уровень «app» — системный.";
+            card.Add(_kit.Labeled("Ключ", keyField));
+            card.Add(keyStatus);
+            UpdateKeyStatus(keyStatus, d);
+
+            card.Add(_kit.Labeled("Название", _kit.Input(d.Title, v =>
+            {
+                d.Title = v ?? string.Empty;
+                MarkDirty();
+                RenderList();
+            })));
+
+            var when = _kit.Input(d.When, v =>
+            {
+                d.When = v ?? string.Empty;
+                MarkDirty();
+            });
+            when.multiline = true;
+            when.style.minHeight = 44f;
+            when.style.whiteSpace = WhiteSpace.Normal;
+            card.Add(_kit.Labeled("Когда", when));
+
+            card.Add(_kit.Check("Выключено (Raise выходит сразу)", d.Disabled, v =>
+            {
+                d.Disabled = v;
+                MarkDirty();
+                RenderList();
+            }));
+
+            // ---- поля ----
+            card.Add(_kit.Divider());
+            var fieldsHead = _kit.Row();
+            fieldsHead.Add(_kit.Text("Поля", NexusToken.TextDim, 11));
+            fieldsHead.Add(_kit.Spacer());
+            fieldsHead.Add(_kit.Btn(NexusRole.Common, "+ Поле", () =>
+            {
+                d.Fields.Add(new FieldDraft { Name = NextFieldName(d) });
+                MarkDirty();
+                RenderList();
+                RenderEditor();
+            }, small: true));
+            card.Add(fieldsHead);
+
+            if (d.Fields.Count == 0) card.Add(_kit.Faint("Без полей: событие пишет только время."));
+
+            for (var i = 0; i < d.Fields.Count; i++) card.Add(FieldRow(d, i));
+
+            // ---- вызов ----
+            card.Add(_kit.Divider());
+            _callPreview = _kit.Code(string.Empty);
+            _callPreview.style.whiteSpace = WhiteSpace.Normal;
+            card.Add(_callPreview);
+            UpdateCallPreview(d);
+
+            var actions = _kit.Row();
+            actions.style.marginTop = 8f;
+            actions.Add(_kit.Btn(NexusRole.Ghost, "Копировать вызов", () =>
+            {
+                EditorGUIUtility.systemCopyBuffer = CallText(d);
+                Context.SetStatus("Скопировано.", StatusKind.Ok);
+            }, small: true));
+            actions.Add(_kit.Btn(NexusRole.Common, "Дублировать", () =>
+            {
+                var copy = EntryDraft.From(d.ToEntry());
+                copy.Key = d.Key + "Copy";
+                _draft.Add(copy);
+                _selected = _draft.Count - 1;
+                MarkDirty();
+                RenderList();
+                RenderEditor();
+            }, small: true));
+            actions.Add(_kit.Spacer());
+            actions.Add(_kit.Btn(NexusRole.Alarm, "Удалить", () =>
+            {
+                if (!EditorUtility.DisplayDialog("Аналитика", $"Удалить событие {d.Key}? Вызовы AppEvents.{d.Key}.Raise в коде перестанут компилироваться.", "Удалить", "Отмена"))
+                    return;
+                _draft.RemoveAt(_selected);
+                _selected = Mathf.Min(_selected, _draft.Count - 1);
+                MarkDirty();
+                RenderList();
+                RenderEditor();
+            }, small: true));
+            card.Add(actions);
+
+            card.Add(_kit.Hint("Переименование ключа или полей меняет AppEvents — вызовы в коде придётся поправить. " +
+                               "Id событий — порядковые номера в отсортированном каталоге; в данных пишется строковый ключ."));
+
+            _editor.Add(card);
+        }
+
+        private Label _callPreview;
+
+        private void UpdateCallPreview(EntryDraft d)
+        {
+            if (_callPreview != null) _callPreview.text = CallText(d);
+        }
+
+        private static string CallText(EntryDraft d)
+        {
+            var sb = new StringBuilder("AppEvents.").Append(d.Key.Trim()).Append(".Raise(");
+            for (var i = 0; i < d.Fields.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(d.Fields[i].Name.Trim());
+            }
+            return sb.Append(");").ToString();
+        }
+
+        private void UpdateKeyStatus(VisualElement host, EntryDraft d)
+        {
+            host.Clear();
+            var error = KeyError(d);
+            if (error != null) host.Add(_kit.Status(StatusKind.Error, error));
+        }
+
+        private VisualElement FieldRow(EntryDraft d, int index)
+        {
+            var f = d.Fields[index];
+            var box = new VisualElement();
+            box.style.marginTop = 4f;
+            box.style.marginBottom = 4f;
+
+            var row = _kit.Row();
+            row.style.flexWrap = Wrap.NoWrap;
+
+            var status = new VisualElement();
+
+            var name = _kit.Input(f.Name, v =>
+            {
+                f.Name = v ?? string.Empty;
+                MarkDirty();
+                UpdateFieldStatus(status, d, f);
+                UpdateCallPreview(d);
+                RenderList();
+            });
+            name.style.width = 130f;
+            name.style.flexShrink = 0;
+            name.tooltip = "Имя поля: параметр Raise и ключ в JSON. Латиница, цифры, «_».";
+            row.Add(name);
+            row.Add(_kit.Gap(6f));
+
+            var type = _kit.Dropdown(null, TypeNames, (int)f.Type, i =>
+            {
+                f.Type = (AnalyticsFieldType)i;
+                MarkDirty();
+            });
+            type.style.width = 140f;
+            type.style.flexShrink = 0;
+            row.Add(type);
+            row.Add(_kit.Gap(6f));
+
+            var note = _kit.Input(f.Note, v =>
+            {
+                f.Note = v ?? string.Empty;
+                MarkDirty();
+            });
+            note.style.flexGrow = 1;
+            note.style.flexShrink = 1;
+            note.tooltip = "Что лежит в поле — для каталога и аналитика (попадает в XML-доку Raise).";
+            row.Add(note);
+            row.Add(_kit.Gap(6f));
+
+            row.Add(_kit.Btn(NexusRole.Ghost, "×", () =>
+            {
+                d.Fields.RemoveAt(index);
+                MarkDirty();
+                RenderList();
+                RenderEditor();
+            }, small: true));
+
+            box.Add(row);
+            box.Add(status);
+            UpdateFieldStatus(status, d, f);
+            return box;
+        }
+
+        private void UpdateFieldStatus(VisualElement host, EntryDraft d, FieldDraft f)
+        {
+            host.Clear();
+            var name = f.Name.Trim();
+            var error = AnalyticsKeys.ValidateField(name);
+            if (error == null)
+            {
+                var count = 0;
+                foreach (var other in d.Fields)
+                    if (other.Name.Trim() == name) count++;
+                if (count > 1) error = "поле повторяется";
+            }
+
+            if (error != null) host.Add(_kit.Status(StatusKind.Error, error));
+        }
+
+        private static string NextFieldName(EntryDraft d)
+        {
+            var name = "value";
+            for (var n = 2; d.Fields.Exists(f => f.Name == name); n++) name = "value" + n;
+            return name;
+        }
+
+        // ============================================================ данные
+
+        private VisualElement DataView()
+        {
+            var root = new VisualElement();
+            root.Add(EditorApplication.isPlaying ? LiveCard() : _kit.Card("Сессия", "Профиль, сессия, прогон и очередь видны в Play Mode."));
+            root.Add(FilesCard());
+            return root;
+        }
+
+        private VisualElement LiveCard()
+        {
+            var card = _kit.Card("Сессия", "Состояние модуля в запущенной игре.");
+
+            if (!AppAnalytics.IsAvailable)
+            {
+                card.Add(_kit.Status(StatusKind.Warning, "Модуль не поднят: выключен в настройках, нет ассета или внутренняя ошибка (см. консоль)."));
+                return card;
+            }
+
+            var lines = new VisualElement();
+            card.Add(lines);
+
+            void Fill()
+            {
+                lines.Clear();
+                lines.Add(_kit.Labeled("Профиль", _kit.Mono(AppAnalytics.ProfileId)));
+                lines.Add(_kit.Labeled("Сессия", _kit.Mono(AppAnalytics.SessionId)));
+                lines.Add(_kit.Labeled("Прогон", _kit.Mono(AppAnalytics.RunId ?? "—")));
+                lines.Add(_kit.Labeled("Сбор", _kit.Text(
+                    (AppAnalytics.CollectEnabled ? "включён игроком" : "выключен игроком") +
+                    (AppAnalytics.IsCollecting ? " · пишется" : " · не пишется"))));
+                lines.Add(_kit.Labeled("Режим", _kit.Text(AppAnalytics.IsLean ? "лёгкий (без диска, очередь в памяти)" : "полный (очередь на диске)")));
+                lines.Add(_kit.Labeled("Адаптер", _kit.Mono(AppAnalytics.AdapterName)));
+                lines.Add(_kit.Labeled("В очереди", _kit.Text($"{AppAnalytics.QueuedPackets} пакетов")));
+
+                if (AppAnalytics.IsLean && AppAnalytics.AdapterName == "—")
+                    lines.Add(_kit.Status(StatusKind.Info, "Лёгкий режим без адаптера: события не пишутся. Назначьте AppAnalytics.SetAdapter(...)."));
+            }
+
+            Fill();
+            lines.schedule.Execute(Fill).Every(1000);
+
+            var actions = _kit.Row();
+            actions.style.marginTop = 8f;
+            actions.Add(_kit.Btn(NexusRole.Common, "Закрыть пакет (flush)", () =>
+            {
+                AppAnalytics.Flush();
+                Fill();
+            }, small: true));
+            actions.Add(_kit.Btn(NexusRole.Common, AppAnalytics.CollectEnabled ? "Выключить сбор" : "Включить сбор", () =>
+            {
+                AppAnalytics.SetCollecting(!AppAnalytics.CollectEnabled);
+                RenderBody();
+            }, small: true));
+            actions.Add(_kit.Btn(NexusRole.Warning, "Новый профиль", () =>
+            {
+                AppAnalytics.NewProfile();
+                Fill();
+            }, small: true));
+            card.Add(actions);
+            return card;
+        }
+
+        private static string DataRoot => Path.Combine(Application.persistentDataPath, "AppAnalytics");
+        private static string ExportRoot => Path.Combine(DataRoot, "Export");
+
+        private VisualElement FilesCard()
+        {
+            var head = _kit.Row();
+            head.Add(_kit.Btn(NexusRole.Common, "Открыть папку", () =>
+            {
+                Directory.CreateDirectory(DataRoot);
+                EditorUtility.RevealInFinder(DataRoot);
+            }, small: true));
+            head.Add(_kit.Btn(NexusRole.Alarm, "Очистить экспорт", () =>
+            {
+                if (!Directory.Exists(ExportRoot)) return;
+                if (!EditorUtility.DisplayDialog("Аналитика", $"Удалить все пакеты в {ExportRoot}?", "Удалить", "Отмена")) return;
+                try
+                {
+                    Directory.Delete(ExportRoot, true);
+                    _previewPath = null;
+                    Context.SetStatus("Экспорт очищен.", StatusKind.Ok);
+                }
+                catch (Exception e)
+                {
+                    Context.SetStatus($"Не удалось очистить: {e.Message}", StatusKind.Error);
+                }
+                RenderBody();
+            }, small: true));
+
+            var card = _kit.Card("Пакеты", "Сохранённые экспортом в файлы (полный режим без своего адаптера): " + ExportRoot, head);
+
+            var files = new List<FileInfo>();
+            try
+            {
+                if (Directory.Exists(ExportRoot))
+                    files.AddRange(new DirectoryInfo(ExportRoot).GetFiles("*.jsonl", SearchOption.AllDirectories));
+            }
+            catch (Exception e)
+            {
+                card.Add(_kit.Status(StatusKind.Error, $"Папка не читается: {e.Message}"));
+                return card;
+            }
+
+            if (files.Count == 0)
+            {
+                card.Add(_kit.Faint("Пакетов нет. Они появятся после игры в редакторе (пакет закрывается раз в 30 с, в конце партии и на выходе)."));
+                return card;
+            }
+
+            files.Sort((a, b) => b.LastWriteTimeUtc.CompareTo(a.LastWriteTimeUtc));
+
+            var columns = _kit.Columns(out var left, out var right, 520f);
+            card.Add(columns);
+
+            for (var i = 0; i < files.Count && i < MaxFiles; i++)
+            {
+                var file = files[i];
+                var path = file.FullName;
+                var row = _kit.ListRow(() =>
+                {
+                    _previewPath = path;
+                    RenderBody();
+                }, path == _previewPath);
+                row.style.flexWrap = Wrap.NoWrap;
+
+                var name = _kit.Mono(Path.GetFileNameWithoutExtension(file.Name));
+                name.style.flexGrow = 1;
+                name.style.flexShrink = 1;
+                name.style.overflow = Overflow.Hidden;
+                name.style.textOverflow = TextOverflow.Ellipsis;
+                row.Add(name);
+                row.Add(_kit.Faint($"{file.LastWriteTime:dd.MM HH:mm} · {file.Length / 1024f:0.#} КБ"));
+                left.Add(row);
+            }
+
+            if (files.Count > MaxFiles) left.Add(_kit.Faint($"… и ещё {files.Count - MaxFiles}"));
+
+            right.Add(Preview(_previewPath));
+            return card;
+        }
+
+        private VisualElement Preview(string path)
+        {
+            var box = new VisualElement();
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                box.Add(_kit.Faint("Выберите пакет слева."));
+                return box;
+            }
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(path);
+            }
+            catch (Exception e)
+            {
+                box.Add(_kit.Status(StatusKind.Error, $"Не читается: {e.Message}"));
+                return box;
+            }
+
+            box.Add(_kit.Faint($"Строк: {lines.Length} (первая — заголовок)"));
+
+            var sb = new StringBuilder();
+            for (var i = 0; i < lines.Length && i < MaxPreviewLines; i++) sb.AppendLine(lines[i]);
+            if (lines.Length > MaxPreviewLines) sb.Append("…");
+
+            var code = _kit.Code(sb.ToString());
+            code.style.whiteSpace = WhiteSpace.Normal;
+            code.style.marginTop = 6f;
+            box.Add(code);
+
+            var actions = _kit.Row();
+            actions.style.marginTop = 6f;
+            actions.Add(_kit.Btn(NexusRole.Ghost, "Копировать", () =>
+            {
+                EditorGUIUtility.systemCopyBuffer = string.Join("\n", lines);
+                Context.SetStatus("Скопировано.", StatusKind.Ok);
+            }, small: true));
+            actions.Add(_kit.Btn(NexusRole.Ghost, "Показать файл", () => EditorUtility.RevealInFinder(path), small: true));
+            box.Add(actions);
+            return box;
+        }
+
+        // ============================================================ настройки
+
+        private VisualElement SettingsCard(AnalyticsSettings settings)
+        {
+            var card = _kit.Card("Настройки", AnalyticsSettings.AssetPath);
+
+            var so = new SerializedObject(settings);
+            var it = so.GetIterator();
+            var enter = true;
+            while (it.NextVisible(enter))
+            {
+                enter = false;
+                if (it.name == "m_Script" || it.name == "entries") continue; // каталог — на вкладке «Каталог»
+                var field = new PropertyField(it.Copy());
+                field.Bind(so);
+                card.Add(field);
+            }
+
+            card.TrackSerializedObjectValue(so, _ =>
+            {
+                AssetDatabase.SaveAssetIfDirty(settings);
+                // Включили/выключили — вкладка перестраивается.
+                if (settings.Enabled != _renderedEnabled) EditorApplication.delayCall += Render;
+            });
+
+            return card;
+        }
+
+        private VisualElement ToolsCard()
+        {
+            var card = _kit.Card("Инструменты");
+
+            var row = _kit.Row();
+            row.Add(_kit.Btn(NexusRole.Common, "Сгенерировать AppEvents", () =>
+            {
+                var settings = AnalyticsCatalog.Load();
+                if (settings == null) return;
+                var written = AnalyticsCatalog.Generate(AnalyticsCatalog.Sorted(settings.Entries));
+                Context.SetStatus(written ? $"Записано: {AnalyticsSettings.KeysPath}" : "AppEvents уже актуален.", StatusKind.Ok);
+            }, small: true));
+            row.Add(_kit.Btn(NexusRole.Info, "Проверить каталог", () =>
+            {
+                var settings = AnalyticsCatalog.Load();
+                if (settings == null) return;
+                var issues = AnalyticsCatalog.Validate(settings.Entries);
+                if (issues.Count == 0)
+                {
+                    Context.SetStatus($"Каталог без замечаний: {settings.Entries.Length} событий.", StatusKind.Ok);
+                    return;
+                }
+
+                var sb = new StringBuilder("[AppAnalytics] Замечания каталога:\n");
+                foreach (var issue in issues) sb.Append(issue.Level).Append(' ').Append(issue.Key).Append(": ").Append(issue.Text).Append('\n');
+                Debug.LogWarning(sb.ToString(), settings);
+                Context.SetStatus($"Замечаний: {issues.Count} — подробности в консоли.", StatusKind.Warning);
+            }, small: true));
+            row.Add(_kit.Btn(NexusRole.Common, "Выбрать ассет", () =>
+            {
+                var settings = AnalyticsCatalog.Load();
+                if (settings != null) Selection.activeObject = settings;
+            }, small: true));
+            card.Add(row);
+            return card;
+        }
+
+        // ============================================================ справка
+
+        private sealed class HelpCard
+        {
+            public string Title, Text, Code;
+        }
+
+        private static readonly HelpCard[] HelpCards =
+        {
+            new()
+            {
+                Title = "Отправить событие",
+                Text = "Добавьте событие в «Каталог» и сохраните — появится типизированный метод. Выключено (модуль, сбор игроком, событие) — Raise выходит на первой проверке.",
+                Code = "AppEvents.Game.Module.Focus.Raise(module.Id);",
+            },
+            new()
+            {
+                Title = "Партия и игровое время",
+                Text = "Прогон — свои пакеты, время событий от начала прогона; часы игрового времени пишутся полем g.",
+                Code = "AppAnalytics.BeginRun(scenarioId);\nAppAnalytics.SetGameClock(() => api.CurrentGameTime);\n// …\nAppAnalytics.SetGameClock(null);\nAppAnalytics.EndRun(\"Win\");",
+            },
+            new()
+            {
+                Title = "Свой адаптер доставки",
+                Text = "Пакет — JSONL (первая строка — заголовок). На каждый Deliver — ровно один ответ Complete или Fail; пакет может прийти повторно, сервер отбрасывает дубли по Id.",
+                Code = "sealed class HttpAdapter : IAnalyticsAdapter\n{\n    public void Deliver(AnalyticsPacket p) => Send(p.Content,\n        ok => { if (ok) AppAnalytics.Complete(p.Id); else AppAnalytics.Fail(p.Id); });\n    public void OnFlush(AnalyticsFlushReason reason) { }\n}\n\n[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]\nstatic void Init() => AppAnalytics.SetAdapter(new HttpAdapter());",
+            },
+            new()
+            {
+                Title = "WebGL и лёгкий режим",
+                Text = "В лёгком режиме нет диска и экспорта, очередь — несколько пакетов в памяти, без адаптера события не пишутся. Буфер пакета выделяется один раз, запись не аллоцирует; внутренняя ошибка выключает модуль, игра продолжает работать.",
+                Code = "Настройки → Лёгкий режим: WebGL / Везде / Никогда",
+            },
+            new()
+            {
+                Title = "Консоль",
+                Text = "Команды AppDeck (`).",
+                Code = "analytics.status   analytics.on   analytics.off   analytics.flush\nprofile.show   profile.new",
+            },
+        };
+
+        private VisualElement HelpView()
+        {
+            var root = new VisualElement();
+            root.style.maxWidth = 820f;
+
+            foreach (var help in HelpCards)
+            {
+                var box = _kit.Card(help.Title, help.Text);
+                var code = _kit.Code(help.Code);
+                code.style.marginBottom = 8f;
+                box.Add(code);
+                var text = help.Code;
+                box.Add(_kit.Btn(NexusRole.Ghost, "Копировать", () =>
+                {
+                    EditorGUIUtility.systemCopyBuffer = text;
+                    Context.SetStatus("Скопировано.", StatusKind.Ok);
+                }, small: true));
+                root.Add(box);
+            }
+
+            return root;
+        }
+    }
+}
+#endif

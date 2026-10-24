@@ -11,6 +11,7 @@
 //    External    — внешний след страницы с путями и очисткой сгенерированного;
 //    Text        — наборы символов, цепочка шрифтов, запекание;
 //    Звуки       — каталог звуков приложения (app-core 4.6+, иначе вкладки нет);
+//    Аналитика   — каталог событий, данные, настройки (app-core 4.7+, иначе вкладки нет);
 //    Консоль     — настройки AppDeck (консоль, быстрые действия, метрики; app-core 4.1+);
 //    Сборка      — билд, пайплайн, BuildInfo и строка версии (бывшая страница Build).
 // ============================================================
@@ -73,6 +74,9 @@ namespace Exerussus.Nexus.Pages.App
             _tabs.Add(new LocalizationTab(_kit));
 #if APPCORE_AUDIO
             _tabs.Add(new SoundsTab(_kit));
+#endif
+#if APPCORE_ANALYTICS
+            _tabs.Add(new AnalyticsTab(_kit));
 #endif
             _tabs.Add(new DeckTab(_kit));
             _tabs.Add(new BuildTab(_kit));

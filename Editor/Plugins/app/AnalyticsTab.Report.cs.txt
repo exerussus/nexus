@@ -1,0 +1,435 @@
+// ============================================================
+//  AnalyticsTab.Report.cs — вкладка «Аналитика»: роли событий в отчёте и подвкладка «Отчёт».
+//
+//  Роль события (метка, начало/конец интервала, состояние) хранится в записи каталога (report) и говорит
+//  отчёту, как читать событие: таймлайн, интервалы, сводка по субъекту, воронки. На запись и данные не влияет.
+//  Сборка — AnalyticsReports (app-core): источники и фильтр — UserSettings/AppAnalyticsReport.json.
+// ============================================================
+
+#if APPCORE_ANALYTICS
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore.Analytics;
+using Exerussus.AppCore.Analytics.Editor;
+using Exerussus.AppCore.Analytics.Reports;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed partial class AnalyticsTab
+    {
+        private static readonly List<string> RoleNames = new() { "Нет", "Метка", "Начало интервала", "Конец интервала", "Состояние" };
+        private static readonly List<string> ToneNames = new() { "Нейтрально", "Удача", "Неудача" };
+        private const string NoField = "—";
+
+        private AnalyticsReportPrefs _prefs;
+        private string _lastOutput;
+        private string _lastSummary;
+        private StatusKind _lastKind = StatusKind.Info;
+
+        // ============================================================ роль в редакторе события
+
+        private VisualElement RoleChip(EntryDraft d)
+        {
+            var r = d.Report;
+            if (r.role == AnalyticsReportRole.None) return null;
+
+            var text = r.role switch
+            {
+                AnalyticsReportRole.Mark => r.tone == AnalyticsReportTone.Negative ? "неудача" : r.tone == AnalyticsReportTone.Positive ? "удача" : "метка",
+                AnalyticsReportRole.Begin => "▸ " + (r.interval ?? "?"),
+                AnalyticsReportRole.End => (r.interval ?? "?") + " ◂",
+                AnalyticsReportRole.State => "состояние",
+                _ => null,
+            };
+
+            var tag = _kit.Tag(r.role == AnalyticsReportRole.Mark && r.tone == AnalyticsReportTone.Negative ? NexusTagColor.Amber : NexusTagColor.Violet, text);
+            tag.style.flexShrink = 0;
+            tag.style.marginLeft = 4f;
+            return tag;
+        }
+
+        private VisualElement ReportSection(EntryDraft d)
+        {
+            var box = new VisualElement();
+            var head = _kit.Row();
+            head.Add(_kit.Text("В отчёте", NexusToken.TextDim, 11));
+            box.Add(head);
+
+            var r = d.Report;
+            box.Add(_kit.Labeled("Роль", _kit.Dropdown(null, RoleNames, (int)r.role, i =>
+            {
+                d.Report.role = (AnalyticsReportRole)i;
+                if (d.Report.role == AnalyticsReportRole.Begin || d.Report.role == AnalyticsReportRole.End)
+                    if (string.IsNullOrWhiteSpace(d.Report.interval)) d.Report.interval = SuggestInterval(d);
+                MarkDirty();
+                RenderList();
+                RenderEditor();
+            })));
+
+            if (r.role == AnalyticsReportRole.None)
+            {
+                box.Add(_kit.Hint("Без роли событие есть в таблице событий отчёта и в экспорте. Роль добавляет его на таймлайн прогона, " +
+                                  "в интервалы, сводку по субъекту и воронки."));
+                return box;
+            }
+
+            if (r.role == AnalyticsReportRole.Begin || r.role == AnalyticsReportRole.End)
+            {
+                var interval = _kit.Input(r.interval ?? string.Empty, v =>
+                {
+                    d.Report.interval = v?.Trim();
+                    MarkDirty();
+                    RenderList();
+                });
+                interval.tooltip = "Имя интервала: начало и конец с одним именем и субъектом образуют пару (focus, turn, blocked).";
+                box.Add(_kit.Labeled("Интервал", interval));
+                box.Add(PairHint(d));
+            }
+
+            box.Add(_kit.Labeled("Субъект", FieldDropdown(d, r.subject, t => t == AnalyticsFieldType.String, v =>
+            {
+                d.Report.subject = v;
+                MarkDirty();
+            })));
+
+            if (r.role != AnalyticsReportRole.State)
+            {
+                box.Add(_kit.Labeled("Мера", FieldDropdown(d, r.measure, t => t == AnalyticsFieldType.Int || t == AnalyticsFieldType.Float, v =>
+                {
+                    d.Report.measure = v;
+                    MarkDirty();
+                })));
+            }
+            else
+            {
+                box.Add(_kit.Labeled("Значение", FieldDropdown(d, r.value, _ => true, v =>
+                {
+                    d.Report.value = v;
+                    MarkDirty();
+                })));
+            }
+
+            if (r.role == AnalyticsReportRole.Mark)
+            {
+                box.Add(_kit.Labeled("Окраска", _kit.Dropdown(null, ToneNames, (int)r.tone, i =>
+                {
+                    d.Report.tone = (AnalyticsReportTone)i;
+                    MarkDirty();
+                    RenderList();
+                })));
+            }
+
+            box.Add(_kit.Hint(r.role switch
+            {
+                AnalyticsReportRole.Mark => "Метка: точка на таймлайне и счётчик в сводке по субъекту; с мерой — медиана и p90. «Неудача» считается в «неудач на прогон».",
+                AnalyticsReportRole.Begin => "Начало: открывает интервал. Повторное начало без конца закрывает прошлый; незакрытый закрывается концом прогона.",
+                AnalyticsReportRole.End => "Конец: закрывает последнее начало с тем же интервалом и субъектом. Мера конца — в сводку (например, turnTime).",
+                AnalyticsReportRole.State => "Состояние: логическое значение рисуется полосой, пока true (пауза); число — метками со значением.",
+                _ => string.Empty,
+            }));
+            return box;
+        }
+
+        /// <summary>Выбор поля события: «—» и поля подходящего типа (поле, которого уже нет, остаётся видимым).</summary>
+        private VisualElement FieldDropdown(EntryDraft d, string current, Func<AnalyticsFieldType, bool> fits, Action<string> onChanged)
+        {
+            var choices = new List<string> { NoField };
+            foreach (var f in d.Fields)
+            {
+                var name = f.Name.Trim();
+                if (name.Length > 0 && fits(f.Type) && !choices.Contains(name)) choices.Add(name);
+            }
+
+            if (!string.IsNullOrEmpty(current) && !choices.Contains(current)) choices.Add(current);
+            var index = string.IsNullOrEmpty(current) ? 0 : choices.IndexOf(current);
+            return _kit.Dropdown(null, choices, index, i => onChanged(i <= 0 ? null : choices[i]));
+        }
+
+        private string SuggestInterval(EntryDraft d)
+        {
+            // конец ищет начало без пары; начало — имя по последнему уровню ключа
+            if (d.Report.role == AnalyticsReportRole.End)
+                foreach (var other in _draft)
+                    if (other != d && other.Report.role == AnalyticsReportRole.Begin && !string.IsNullOrEmpty(other.Report.interval) && !HasEnd(other.Report.interval))
+                        return other.Report.interval;
+
+            var key = d.Key.Trim();
+            var dot = key.LastIndexOf('.');
+            var last = dot >= 0 ? key.Substring(dot + 1) : key;
+            return last.Length > 0 ? char.ToLowerInvariant(last[0]) + last.Substring(1) : "interval";
+        }
+
+        private bool HasEnd(string interval)
+        {
+            foreach (var e in _draft)
+                if (e.Report.role == AnalyticsReportRole.End && e.Report.interval == interval) return true;
+            return false;
+        }
+
+        private VisualElement PairHint(EntryDraft d)
+        {
+            var name = d.Report.interval;
+            if (string.IsNullOrWhiteSpace(name)) return _kit.Status(StatusKind.Warning, "Нужно имя интервала.");
+
+            var want = d.Report.role == AnalyticsReportRole.Begin ? AnalyticsReportRole.End : AnalyticsReportRole.Begin;
+            foreach (var e in _draft)
+                if (e != d && e.Report.role == want && e.Report.interval == name)
+                    return _kit.Faint((want == AnalyticsReportRole.End ? "конец: " : "начало: ") + e.Key);
+
+            return _kit.Faint(want == AnalyticsReportRole.End ? "конца пока нет — закроется концом прогона" : "начала пока нет — конец без начала не учитывается");
+        }
+
+        // ============================================================ подвкладка «Отчёт»
+
+        private VisualElement ReportView()
+        {
+            _prefs ??= AnalyticsReports.LoadPrefs();
+            var root = new VisualElement();
+
+            var columns = _kit.Columns(out var left, out var right, 420f);
+            root.Add(columns);
+
+            left.Add(SourcesCard());
+            left.Add(FilterCard());
+            right.Add(BuildCard());
+            right.Add(OptionsCard());
+            return root;
+        }
+
+        private void SavePrefs()
+        {
+            try
+            {
+                AnalyticsReports.SavePrefs(_prefs);
+            }
+            catch (Exception e)
+            {
+                Context.SetStatus($"Настройки отчёта не сохранены: {e.Message}", StatusKind.Error);
+            }
+        }
+
+        private VisualElement SourcesCard()
+        {
+            var add = _kit.Btn(NexusRole.Common, "Добавить папку…", () =>
+            {
+                var path = EditorUtility.OpenFolderPanel("Папка с пакетами .jsonl", string.Empty, string.Empty);
+                if (string.IsNullOrEmpty(path) || _prefs.folders.Contains(path)) return;
+                _prefs.folders.Add(path);
+                SavePrefs();
+                RenderBody();
+            }, small: true);
+
+            var card = _kit.Card("Источники", "Пакеты .jsonl: папка экспорта этого редактора и любые папки (выгрузка с сервера, с устройств).", add);
+
+            card.Add(_kit.Check("Экспорт редактора", _prefs.includeExport, v =>
+            {
+                _prefs.includeExport = v;
+                SavePrefs();
+            }));
+            card.Add(_kit.Mono(AnalyticsReports.ExportFolder, NexusToken.TextFaint));
+
+            if (_prefs.folders.Count == 0) card.Add(_kit.Faint("Других папок нет."));
+            for (var i = 0; i < _prefs.folders.Count; i++)
+            {
+                var index = i;
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginTop = 4f;
+                var path = _kit.Mono(_prefs.folders[i], Directory.Exists(_prefs.folders[i]) || File.Exists(_prefs.folders[i]) ? NexusToken.TextNormal : NexusToken.Warning);
+                path.style.flexGrow = 1;
+                path.style.flexShrink = 1;
+                path.style.overflow = Overflow.Hidden;
+                path.style.textOverflow = TextOverflow.Ellipsis;
+                row.Add(path);
+                row.Add(_kit.Btn(NexusRole.Ghost, "×", () =>
+                {
+                    _prefs.folders.RemoveAt(index);
+                    SavePrefs();
+                    RenderBody();
+                }, small: true));
+                card.Add(row);
+            }
+
+            return card;
+        }
+
+        private VisualElement FilterCard()
+        {
+            var card = _kit.Card("Фильтр", "Что войдёт в отчёт и экспорт. Пусто — без ограничения.");
+
+            card.Add(_kit.Labeled("С (UTC)", DateInput(_prefs.from, v => _prefs.from = v)));
+            card.Add(_kit.Labeled("По (UTC)", DateInput(_prefs.to, v => _prefs.to = v)));
+            card.Add(_kit.Labeled("Билды", ListInput(_prefs.builds, "0.8.0, 0.7.4")));
+            card.Add(_kit.Labeled("Платформы", ListInput(_prefs.platforms, "WebGLPlayer, WindowsPlayer")));
+            card.Add(_kit.Labeled("Теги прогонов", ListInput(_prefs.tags, "id сценария через запятую")));
+
+            var clear = _kit.Btn(NexusRole.Ghost, "Сбросить фильтр", () =>
+            {
+                _prefs.from = _prefs.to = string.Empty;
+                _prefs.builds.Clear();
+                _prefs.platforms.Clear();
+                _prefs.tags.Clear();
+                SavePrefs();
+                RenderBody();
+            }, small: true);
+            clear.style.alignSelf = Align.FlexStart;
+            clear.style.marginTop = 6f;
+            card.Add(clear);
+            return card;
+        }
+
+        private VisualElement DateInput(string value, Action<string> set)
+        {
+            var host = new VisualElement();
+            var status = new VisualElement();
+            var input = _kit.Input(value ?? string.Empty, v =>
+            {
+                v = v?.Trim() ?? string.Empty;
+                set(v);
+                SavePrefs();
+                status.Clear();
+                if (v.Length > 0 && AnalyticsReports.ParseDate(v, false) == null) status.Add(_kit.Status(StatusKind.Warning, "Формат yyyy-MM-dd"));
+            });
+            input.tooltip = "yyyy-MM-dd";
+            host.Add(input);
+            host.Add(status);
+            return host;
+        }
+
+        private TextField ListInput(List<string> list, string hint)
+        {
+            var input = _kit.Input(string.Join(", ", list), v =>
+            {
+                list.Clear();
+                foreach (var part in (v ?? string.Empty).Split(','))
+                    if (!string.IsNullOrWhiteSpace(part)) list.Add(part.Trim());
+                SavePrefs();
+            });
+            input.tooltip = hint;
+            return input;
+        }
+
+        private VisualElement OptionsCard()
+        {
+            var card = _kit.Card("Экспорт");
+            card.Add(_kit.Check("Обезличить профили (хэш вместо player_…)", _prefs.anonymize, v =>
+            {
+                _prefs.anonymize = v;
+                SavePrefs();
+            }));
+            card.Add(_kit.Check("CSV: разделитель «;» (Excel RU)", _prefs.csvSemicolon, v =>
+            {
+                _prefs.csvSemicolon = v;
+                SavePrefs();
+            }));
+            card.Add(_kit.Check("CSV: UTF-8 BOM", _prefs.csvBom, v =>
+            {
+                _prefs.csvBom = v;
+                SavePrefs();
+            }));
+            card.Add(_kit.Check("CSV: время событий в UTC (ISO)", _prefs.csvIsoTimes, v =>
+            {
+                _prefs.csvIsoTimes = v;
+                SavePrefs();
+            }));
+
+            var output = _kit.Input(_prefs.outputDir ?? string.Empty, v =>
+            {
+                _prefs.outputDir = v?.Trim() ?? string.Empty;
+                SavePrefs();
+            });
+            output.tooltip = "Пусто — " + AnalyticsReports.DefaultOutput;
+            card.Add(_kit.Labeled("Папка вывода", output));
+
+            var row = _kit.Row();
+            row.style.marginTop = 4f;
+            row.Add(_kit.Btn(NexusRole.Ghost, "Выбрать…", () =>
+            {
+                var path = EditorUtility.OpenFolderPanel("Папка для отчётов", AnalyticsReports.OutputDir(_prefs), string.Empty);
+                if (string.IsNullOrEmpty(path)) return;
+                _prefs.outputDir = path;
+                SavePrefs();
+                RenderBody();
+            }, small: true));
+            row.Add(_kit.Btn(NexusRole.Ghost, "Открыть", () =>
+            {
+                var dir = AnalyticsReports.OutputDir(_prefs);
+                Directory.CreateDirectory(dir);
+                EditorUtility.RevealInFinder(dir);
+            }, small: true));
+            card.Add(row);
+            card.Add(_kit.Mono(AnalyticsReports.OutputDir(_prefs), NexusToken.TextFaint));
+            return card;
+        }
+
+        private VisualElement BuildCard()
+        {
+            var card = _kit.Card("Сборка", "Один файл report.html — открывается офлайн, можно переслать.");
+
+            var row = _kit.Row();
+            row.Add(_kit.Btn(NexusRole.Primary, "Собрать report.html", () => Run(data =>
+            {
+                var path = AnalyticsReports.WriteHtml(data, null, _prefs);
+                Application.OpenURL(new Uri(path).AbsoluteUri);
+                return path;
+            })));
+            card.Add(row);
+
+            var exports = _kit.Row();
+            exports.style.marginTop = 6f;
+            exports.Add(_kit.Btn(NexusRole.Common, "CSV · zip", () => Run(data => AnalyticsReports.Export(data, ExportFormat.CsvZip, null, _prefs)), small: true));
+            exports.Add(_kit.Btn(NexusRole.Common, "JSON", () => Run(data => AnalyticsReports.Export(data, ExportFormat.Json, null, _prefs)), small: true));
+            exports.Add(_kit.Btn(NexusRole.Common, "JSONL", () => Run(data => AnalyticsReports.Export(data, ExportFormat.Jsonl, null, _prefs)), small: true));
+            card.Add(exports);
+
+            if (!string.IsNullOrEmpty(_lastSummary)) card.Add(_kit.Status(_lastKind, _lastSummary, _lastOutput));
+            if (!string.IsNullOrEmpty(_lastOutput) && File.Exists(_lastOutput))
+            {
+                var show = _kit.Btn(NexusRole.Ghost, "Показать файл", () => EditorUtility.RevealInFinder(_lastOutput), small: true);
+                show.style.alignSelf = Align.FlexStart;
+                show.style.marginTop = 6f;
+                card.Add(show);
+            }
+
+            card.Add(_kit.Hint("Роли событий задаются в «Каталоге» (блок «В отчёте») и сохраняются вместе с ним. Из командной строки — " +
+                               "nexus analytics.report / analytics.export (CLI Nexus)."));
+            return card;
+        }
+
+        /// <summary>Собрать данные и выполнить запись; ошибка — в статус, не в окно.</summary>
+        private void Run(Func<ReportData, string> write)
+        {
+            try
+            {
+                EditorUtility.DisplayProgressBar("Аналитика", "Сборка отчёта…", 0.3f);
+                var data = AnalyticsReports.Build(_prefs);
+                EditorUtility.DisplayProgressBar("Аналитика", "Запись…", 0.8f);
+                _lastOutput = write(data);
+                _lastSummary = AnalyticsReports.Describe(data);
+                _lastKind = data.Packets == 0 ? StatusKind.Warning : data.Warnings.Count > 0 ? StatusKind.Warning : StatusKind.Ok;
+                if (data.Packets == 0) _lastSummary = "Пакетов нет — проверьте источники. " + _lastSummary;
+                Context.SetStatus("Готово: " + _lastOutput, StatusKind.Ok);
+            }
+            catch (Exception e)
+            {
+                _lastOutput = null;
+                _lastSummary = "Не собрано: " + e.Message;
+                _lastKind = StatusKind.Error;
+                Context.SetStatus(_lastSummary, StatusKind.Error);
+                Debug.LogException(e);
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+
+            RenderBody();
+        }
+    }
+}
+#endif

@@ -25,10 +25,10 @@ using UnityEngine.UIElements;
 
 namespace Exerussus.Nexus.Pages.App
 {
-    internal sealed class AnalyticsTab : IAppTab
+    internal sealed partial class AnalyticsTab : IAppTab
     {
         private const string SubtabKey = "analytics.subtab";
-        private static readonly string[] Subtabs = { "Каталог", "Данные", "Настройки", "Справка" };
+        private static readonly string[] Subtabs = { "Каталог", "Отчёт", "Данные", "Настройки", "Справка" };
         private static readonly List<string> TypeNames = new() { "Целое (long)", "Дробное (double)", "Логическое (bool)", "Строка (string)" };
 
         private const int MaxFiles = 40;
@@ -141,10 +141,11 @@ namespace Exerussus.Nexus.Pages.App
             public string When = string.Empty;
             public bool Disabled;
             public readonly List<FieldDraft> Fields = new();
+            public AnalyticsReportInfo Report;
 
             public static EntryDraft From(AnalyticsEventEntry e)
             {
-                var d = new EntryDraft { Key = e.key ?? string.Empty, Title = e.title ?? string.Empty, When = e.when ?? string.Empty, Disabled = e.disabled };
+                var d = new EntryDraft { Key = e.key ?? string.Empty, Title = e.title ?? string.Empty, When = e.when ?? string.Empty, Disabled = e.disabled, Report = e.report };
                 if (e.fields != null)
                     foreach (var f in e.fields)
                         d.Fields.Add(new FieldDraft { Name = f.name ?? string.Empty, Type = f.type, Note = f.note ?? string.Empty });
@@ -156,8 +157,15 @@ namespace Exerussus.Nexus.Pages.App
                 var fields = new AnalyticsField[Fields.Count];
                 for (var i = 0; i < fields.Length; i++)
                     fields[i] = new AnalyticsField { name = Fields[i].Name.Trim(), type = Fields[i].Type, note = Fields[i].Note };
-                return new AnalyticsEventEntry { key = Key.Trim(), title = Title, when = When, disabled = Disabled, fields = fields };
+                var report = Report;
+                report.interval = Trim(report.interval);
+                report.subject = Trim(report.subject);
+                report.measure = Trim(report.measure);
+                report.value = Trim(report.value);
+                return new AnalyticsEventEntry { key = Key.Trim(), title = Title, when = When, disabled = Disabled, fields = fields, report = report };
             }
+
+            private static string Trim(string s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
         }
 
         private void Load()
@@ -320,8 +328,9 @@ namespace Exerussus.Nexus.Pages.App
             switch (_subtab)
             {
                 case 0: _body.Add(CatalogView()); break;
-                case 1: _body.Add(DataView()); break;
-                case 3: _body.Add(HelpView()); break;
+                case 1: _body.Add(ReportView()); break;
+                case 2: _body.Add(DataView()); break;
+                case 4: _body.Add(HelpView()); break;
                 default:
                     _body.Add(SettingsCard(settings));
                     _body.Add(ToolsCard());
@@ -457,6 +466,9 @@ namespace Exerussus.Nexus.Pages.App
                     row.Add(tag);
                 }
 
+                var roleChip = RoleChip(d);
+                if (roleChip != null) row.Add(roleChip);
+
                 if (d.Disabled)
                 {
                     row.Add(_kit.Gap(4f));
@@ -569,6 +581,10 @@ namespace Exerussus.Nexus.Pages.App
             if (d.Fields.Count == 0) card.Add(_kit.Faint("Без полей: событие пишет только время."));
 
             for (var i = 0; i < d.Fields.Count; i++) card.Add(FieldRow(d, i));
+
+            // ---- отчёт ----
+            card.Add(_kit.Divider());
+            card.Add(ReportSection(d));
 
             // ---- вызов ----
             card.Add(_kit.Divider());

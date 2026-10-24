@@ -55,6 +55,8 @@ namespace Exerussus.Nexus.Pages.App
         private string _previewPath;
 
         private Action<PlayModeStateChange> _playMode;
+        private bool _disposed;
+        private bool _renderQueued;
 
         public string Title => "Аналитика";
 
@@ -103,7 +105,25 @@ namespace Exerussus.Nexus.Pages.App
             return true;
         }
 
-        public void Dispose() => Hide();
+        public void Dispose()
+        {
+            _disposed = true;
+            Hide();
+            EditorApplication.delayCall -= DelayedRender;
+        }
+
+        private void QueueRender()
+        {
+            if (_renderQueued || _disposed) return;
+            _renderQueued = true;
+            EditorApplication.delayCall += DelayedRender;
+        }
+
+        private void DelayedRender()
+        {
+            _renderQueued = false;
+            if (!_disposed) Render();
+        }
 
         // ============================================================ черновик
 
@@ -171,6 +191,13 @@ namespace Exerussus.Nexus.Pages.App
             var settings = AnalyticsCatalog.Load();
             if (settings == null) return;
 
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            {
+                // запись AppEvents.cs в игре перекомпилирует скрипты посреди сессии
+                Context.SetStatus("Каталог сохраняется вне Play Mode.", StatusKind.Warning);
+                return;
+            }
+
             var entries = DraftEntries();
             var errors = 0;
             foreach (var issue in AnalyticsCatalog.Validate(entries))
@@ -194,7 +221,7 @@ namespace Exerussus.Nexus.Pages.App
 
         private void Render()
         {
-            if (_root == null) return;
+            if (_root == null || _disposed) return;
             _root.Clear();
 
             var settings = AnalyticsCatalog.Load();
@@ -230,7 +257,7 @@ namespace Exerussus.Nexus.Pages.App
                     so.FindProperty("enabled").boolValue = true;
                     so.ApplyModifiedProperties();
                     AssetDatabase.SaveAssetIfDirty(settings);
-                    Render();
+                    QueueRender();
                 });
                 enable.style.alignSelf = Align.FlexStart;
                 enable.style.marginTop = 8f;
@@ -363,7 +390,7 @@ namespace Exerussus.Nexus.Pages.App
                 _summary.text = $"{_draft.Count} событий" + (errors > 0 ? $" · ошибок: {errors}" : string.Empty) + (_dirty ? " · не сохранено" : string.Empty);
             }
 
-            _saveButton?.SetEnabled(_dirty);
+            _saveButton?.SetEnabled(_dirty && !EditorApplication.isPlaying);
         }
 
         private void RenderList()
@@ -902,9 +929,10 @@ namespace Exerussus.Nexus.Pages.App
 
             card.TrackSerializedObjectValue(so, _ =>
             {
-                AssetDatabase.SaveAssetIfDirty(settings);
-                // Включили/выключили — вкладка перестраивается.
-                if (settings.Enabled != _renderedEnabled) EditorApplication.delayCall += Render;
+                if (_disposed) return;
+                EditorUtility.SetDirty(settings); // на диск — с обычным сохранением проекта, не на каждый символ
+                // Включили/выключили — вкладка перестраивается (одна отложенная перерисовка).
+                if (settings.Enabled != _renderedEnabled) QueueRender();
             });
 
             return card;
@@ -919,6 +947,11 @@ namespace Exerussus.Nexus.Pages.App
             {
                 var settings = AnalyticsCatalog.Load();
                 if (settings == null) return;
+                if (EditorApplication.isPlayingOrWillChangePlaymode)
+                {
+                    Context.SetStatus("Генерация — вне Play Mode.", StatusKind.Warning);
+                    return;
+                }
                 var written = AnalyticsCatalog.Generate(AnalyticsCatalog.Sorted(settings.Entries));
                 Context.SetStatus(written ? $"Записано: {AnalyticsSettings.KeysPath}" : "AppEvents уже актуален.", StatusKind.Ok);
             }, small: true));

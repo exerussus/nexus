@@ -1,0 +1,3 @@
+#!/bin/sh
+# Nexus CLI для git bash: nexus list | nexus --project JOPA help
+exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$(dirname "$0")/nexus.ps1" 2>/dev/null || echo "$(dirname "$0")/nexus.ps1")" "$@"

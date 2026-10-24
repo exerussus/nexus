@@ -29,3 +29,34 @@
 - Корень, пропавший с диска, пропускается и подсвечивается в Manage до следующего поиска.
 - Маркер — обычный json (TextAsset): в папках с `~` на конце Unity его не импортирует, и поиск
   его не увидит. Исходники плагинов и так инертны (`.txt`), прятать их в `~` не нужно.
+
+## CLI
+
+Команды в открытый редактор (Nexus → Manage → «CLI», по умолчанию включён). Клиент лежит в
+`%LOCALAPPDATA%\Exerussus\Nexus\cli` — добавьте папку в PATH.
+
+```
+nexus list                                   открытые проекты
+nexus --project JOPA help                    команды проекта
+nexus --project JOPA analytics.report --open
+nexus --project JOPA --json analytics.export --format csv --from 2026-10-17
+```
+
+Проект — `--project <имя папки|путь>` или текущая папка внутри проекта. Код выхода — код команды:
+0 успех, 1 ошибка выполнения, 2 аргументы, 3 нет команды, 4 исключение, 5 таймаут, 6 редактор занят,
+10 нет редактора, 11 проект не однозначен, 12 нет связи.
+
+Своя команда страницы:
+
+```csharp
+[NexusCommand("mypage.do", "Что делает", Usage = "mypage.do <что> [--force]")]
+private static int Do(NexusCommandContext ctx)
+{
+    var what = ctx.Arg(0) ?? throw new NexusCommandException("нужно <что>");
+    ctx.Print("готово: " + what);
+    ctx.Data = new { what };
+    return NexusCommandContext.Exit.Ok;
+}
+```
+
+Команда выполняется в главном потоке редактора, без окон и диалогов.

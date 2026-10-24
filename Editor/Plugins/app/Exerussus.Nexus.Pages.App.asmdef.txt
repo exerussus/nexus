@@ -27,7 +27,7 @@
         },
         {
             "name": "com.exerussus.app-core",
-            "expression": "4.7.0",
+            "expression": "4.8.0",
             "define": "APPCORE_ANALYTICS"
         }
     ],

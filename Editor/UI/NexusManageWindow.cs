@@ -116,6 +116,26 @@ namespace Exerussus.Nexus.UI
             _pending = new Label("нет изменений") { style = { flexGrow = 1f, color = TextDim } };
             bar.Add(_pending);
 
+            // CLI: команды в этот редактор из PowerShell / cmd / git bash (личная настройка, по умолчанию включён)
+            var cli = new Toggle("CLI") { value = NexusCliStore.Enabled };
+            cli.tooltip = CliTooltip();
+            cli.style.marginRight = 8f;
+            cli.RegisterValueChangedCallback(e =>
+            {
+                NexusCliStore.Enabled = e.newValue;
+                cli.tooltip = CliTooltip();
+            });
+            bar.Add(cli);
+
+            var copy = NexusStyles.Button("CLI ⧉", () =>
+            {
+                EditorGUIUtility.systemCopyBuffer = "& \"" + NexusCliStore.ClientPath + "\" --project \"" + NexusCliServer.Describe().Project + "\" help";
+                ShowNotification(new GUIContent("Команда скопирована"));
+            });
+            copy.tooltip = "Скопировать вызов клиента для этого проекта (PowerShell). Клиент: " + NexusCliStore.ClientPath;
+            copy.style.marginRight = 8f;
+            bar.Add(copy);
+
             // подробное логирование: показывать проглоченные ошибки, стеки и ход работы
             var verbose = new Toggle("Подробные ошибки") { value = NexusDiagnosticsStore.Verbose };
             verbose.tooltip = "Логировать все ошибки (включая штатно подавленные), со стеками и ходом работы. " +
@@ -132,6 +152,11 @@ namespace Exerussus.Nexus.UI
 
             return bar;
         }
+
+        private static string CliTooltip() =>
+            NexusCliServer.Running
+                ? $"CLI слушает 127.0.0.1:{NexusCliServer.Port}. Клиент: {NexusCliStore.ClientPath} — nexus list, nexus --project <имя> help."
+                : "CLI выключен: редактор не принимает команды. Личная настройка.";
 
         // пересканировать диск и сбросить желаемое состояние к фактическому
         private void Reload()

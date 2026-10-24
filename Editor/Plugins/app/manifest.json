@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "0a1f7c4e9b2d4f6a8c3e5d7b1a9f0e22",
   "id": "app",
-  "version": "3.5.0",
+  "version": "3.6.0",
   "typeName": "Exerussus.Nexus.Pages.App.AppPage",
   "kind": "servicing",
   "display": {
@@ -128,6 +128,10 @@
     {
       "from": "AnalyticsTab.Report.cs.txt",
       "to": "AnalyticsTab.Report.cs"
+    },
+    {
+      "from": "AnalyticsCommands.cs.txt",
+      "to": "AnalyticsCommands.cs"
     }
   ]
 }

@@ -67,7 +67,8 @@ namespace Exerussus.Nexus.Pages.App
         public VisualElement Build()
         {
             _root = new VisualElement();
-            _subtab = Mathf.Clamp(SessionState.GetInt(Context.GetSessionKey(SubtabKey), 0), 0, Subtabs.Length - 1);
+            // подвкладка хранится по имени: вставка новой не сдвигает сохранённый выбор
+            _subtab = Math.Max(0, Array.IndexOf(Subtabs, SessionState.GetString(Context.GetSessionKey(SubtabKey), Subtabs[0])));
             return _root;
         }
 
@@ -280,7 +281,7 @@ namespace Exerussus.Nexus.Pages.App
             bar.Add(Context.Ui.Segmented(Subtabs, _subtab, i =>
             {
                 _subtab = i;
-                SessionState.SetInt(Context.GetSessionKey(SubtabKey), i);
+                SessionState.SetString(Context.GetSessionKey(SubtabKey), Subtabs[i]);
                 RenderBody();
             }));
             bar.Add(_kit.Spacer());

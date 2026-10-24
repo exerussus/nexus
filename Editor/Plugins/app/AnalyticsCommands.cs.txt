@@ -1,0 +1,161 @@
+// ============================================================
+//  AnalyticsCommands.cs — команды CLI аналитики (app-core 4.8+):
+//    analytics.report    — собрать report.html;
+//    analytics.export    — экспорт CSV · zip / JSON / JSONL;
+//    analytics.validate  — проверить каталог событий.
+//
+//  Источники, фильтр и параметры экспорта — как во вкладке «Аналитика → Отчёт»
+//  (UserSettings/AppAnalyticsReport.json); аргументы команды меняют их только на этот вызов.
+// ============================================================
+
+#if APPCORE_ANALYTICS
+using System.Collections.Generic;
+using System.IO;
+using Exerussus.AppCore.Analytics.Editor;
+using Exerussus.AppCore.Analytics.Reports;
+using Exerussus.Nexus.Abstractions;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal static class AnalyticsCommands
+    {
+        private const string FilterUsage = "[--from yyyy-MM-dd] [--to yyyy-MM-dd] [--tags a,b] [--builds a,b] [--platforms a,b] " +
+                                           "[--source <папка|файл>] [--no-export] [--anonymize]";
+
+        [NexusCommand("analytics.report", "Собрать report.html из пакетов аналитики",
+                      Usage = "analytics.report [--out <файл.html>] [--open] " + FilterUsage)]
+        private static int Report(NexusCommandContext ctx)
+        {
+            var prefs = Prefs(ctx);
+            var data = AnalyticsReports.Build(prefs);
+            var path = AnalyticsReports.WriteHtml(data, OutPath(ctx), prefs);
+            Summary(ctx, data, path);
+            if (ctx.Flag("open")) Application.OpenURL(new System.Uri(path).AbsoluteUri);
+            return data.Packets == 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("analytics.export", "Экспорт аналитики: CSV-набор в zip, один JSON или склеенный JSONL",
+                      Usage = "analytics.export --format csv|json|jsonl [--out <файл>] [--semicolon true|false] [--bom true|false] [--iso] " + FilterUsage)]
+        private static int Export(NexusCommandContext ctx)
+        {
+            ExportFormat format;
+            try
+            {
+                format = AnalyticsReports.ParseFormat(ctx.Get("format", "csv"));
+            }
+            catch (System.ArgumentException e)
+            {
+                throw new NexusCommandException(e.Message);
+            }
+
+            var prefs = Prefs(ctx);
+            if (ctx.Has("semicolon")) prefs.csvSemicolon = ctx.Flag("semicolon");
+            if (ctx.Has("bom")) prefs.csvBom = ctx.Flag("bom");
+            if (ctx.Has("iso")) prefs.csvIsoTimes = ctx.Flag("iso");
+
+            var data = AnalyticsReports.Build(prefs);
+            var path = AnalyticsReports.Export(data, format, OutPath(ctx), prefs);
+            Summary(ctx, data, path);
+            return data.Packets == 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("analytics.validate", "Проверить каталог событий аналитики (ключи, поля, роли в отчёте)",
+                      Usage = "analytics.validate")]
+        private static int Validate(NexusCommandContext ctx)
+        {
+            var settings = AnalyticsCatalog.Load();
+            if (settings == null)
+            {
+                ctx.Error("Нет ассета настроек аналитики: " + Exerussus.AppCore.Analytics.AnalyticsSettings.AssetPath);
+                return NexusCommandContext.Exit.Failed;
+            }
+
+            var issues = AnalyticsCatalog.Validate(settings.Entries);
+            var errors = 0;
+            var list = new List<Dictionary<string, object>>();
+            foreach (var issue in issues)
+            {
+                var line = $"{issue.Key}: {issue.Text}";
+                if (issue.Level == AnalyticsCatalog.IssueLevel.Error)
+                {
+                    errors++;
+                    ctx.Error(line);
+                }
+                else if (issue.Level == AnalyticsCatalog.IssueLevel.Warning) ctx.Warn(line);
+                else ctx.Print("· " + line);
+
+                list.Add(new Dictionary<string, object> { { "level", issue.Level.ToString().ToLowerInvariant() }, { "key", issue.Key }, { "text", issue.Text } });
+            }
+
+            if (!AnalyticsCatalog.IsSorted(settings.Entries))
+            {
+                errors++;
+                ctx.Error("Каталог не отсортирован — Id в AppEvents не совпадут (сохраните каталог во вкладке или синхронизируйте из меню).");
+            }
+
+            ctx.Print($"Событий: {settings.Entries.Length} · ошибок: {errors} · замечаний: {issues.Count - errors}");
+            ctx.Data = new Dictionary<string, object> { { "events", settings.Entries.Length }, { "errors", errors }, { "issues", list } };
+            return errors > 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
+        }
+
+        // ---------------------------------------------------------------- общее
+
+        /// <summary>Настройки вкладки + аргументы этого вызова (на диск не пишутся).</summary>
+        private static AnalyticsReportPrefs Prefs(NexusCommandContext ctx)
+        {
+            var prefs = AnalyticsReports.LoadPrefs();
+
+            if (ctx.Has("from")) prefs.from = Date(ctx, "from");
+            if (ctx.Has("to")) prefs.to = Date(ctx, "to");
+            if (ctx.Has("tags")) prefs.tags = ctx.GetList("tags");
+            if (ctx.Has("builds")) prefs.builds = ctx.GetList("builds");
+            if (ctx.Has("platforms")) prefs.platforms = ctx.GetList("platforms");
+            if (ctx.Has("anonymize")) prefs.anonymize = ctx.Flag("anonymize");
+            if (ctx.Flag("no-export")) prefs.includeExport = false;
+
+            var source = ctx.Get("source");
+            if (!string.IsNullOrWhiteSpace(source))
+            {
+                // относительный путь — от папки, где запущен клиент
+                if (!Path.IsPathRooted(source) && !string.IsNullOrEmpty(ctx.WorkingDirectory)) source = Path.Combine(ctx.WorkingDirectory, source);
+                if (!Directory.Exists(source) && !File.Exists(source)) throw new NexusCommandException("Нет такой папки или файла: " + source, NexusCommandContext.Exit.Failed);
+                prefs.folders = new List<string> { source };
+            }
+
+            return prefs;
+        }
+
+        /// <summary>--out: относительный путь — от папки, где запущен клиент (как --source).</summary>
+        private static string OutPath(NexusCommandContext ctx)
+        {
+            var path = ctx.Get("out");
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            if (!Path.IsPathRooted(path) && !string.IsNullOrEmpty(ctx.WorkingDirectory)) path = Path.Combine(ctx.WorkingDirectory, path);
+            return path;
+        }
+
+        private static string Date(NexusCommandContext ctx, string key)
+        {
+            var v = ctx.Get(key);
+            if (string.IsNullOrWhiteSpace(v)) return string.Empty;
+            if (AnalyticsReports.ParseDate(v, false) == null) throw new NexusCommandException($"--{key}: дата в формате yyyy-MM-dd");
+            return v.Trim();
+        }
+
+        private static void Summary(NexusCommandContext ctx, ReportData data, string path)
+        {
+            if (data.Packets == 0) ctx.Warn("Пакетов нет — проверьте источники (вкладка «Аналитика → Отчёт» или --source).");
+            foreach (var w in data.Warnings) ctx.Warn(w);
+            ctx.Print(AnalyticsReports.Describe(data));
+            ctx.Print(path);
+            ctx.Data = new Dictionary<string, object>
+            {
+                { "path", path }, { "packets", data.Packets }, { "duplicates", data.DuplicatePackets }, { "broken", data.BrokenLines },
+                { "profiles", data.Profiles.Count }, { "sessions", data.Sessions.Count }, { "runs", data.Runs.Count }, { "events", data.EventCount },
+                { "filter", (data.Options.Filter ?? new ReportFilter()).Describe() }, { "warnings", data.Warnings },
+            };
+        }
+    }
+}
+#endif

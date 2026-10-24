@@ -1,16 +1,22 @@
 // ============================================================
-//  AnalyticsCommands.cs — команды CLI аналитики (app-core 4.8+):
-//    analytics.report    — собрать report.html;
-//    analytics.export    — экспорт CSV · zip / JSON / JSONL;
-//    analytics.validate  — проверить каталог событий.
+//  AnalyticsCommands.cs — команды CLI аналитики (app-core 5.0+):
+//    analytics.report    — собрать report.html (или по профилю экспорта);
+//    analytics.export    — экспорт CSV · zip / JSON / JSONL (или все форматы профиля);
+//    analytics.views     — представления: тип, события, замечания;
+//    analytics.query     — разовый расчёт: представление из каталога с перекрытиями или по маске ключей;
+//    analytics.validate  — проверить каталог и классификацию событий.
 //
 //  Источники, фильтр и параметры экспорта — как во вкладке «Аналитика → Отчёт»
 //  (UserSettings/AppAnalyticsReport.json); аргументы команды меняют их только на этот вызов.
+//  Группировка, агрегаты, фильтр событий и сравнение (--group-by, --aggs, --where, --compare) перекрывают
+//  представления тоже только на этот вызов — файл представлений не меняется.
 // ============================================================
 
 #if APPCORE_ANALYTICS
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using Exerussus.AppCore.Analytics.Editor;
 using Exerussus.AppCore.Analytics.Reports;
 using Exerussus.Nexus.Abstractions;
@@ -20,47 +26,193 @@ namespace Exerussus.Nexus.Pages.App
 {
     internal static class AnalyticsCommands
     {
-        private const string FilterUsage = "[--from yyyy-MM-dd] [--to yyyy-MM-dd] [--tags a,b] [--builds a,b] [--platforms a,b] " +
-                                           "[--source <папка|файл>] [--no-export] [--anonymize]";
+        private const string FilterUsage = "[--from yyyy-MM-dd] [--to yyyy-MM-dd] [--last N] [--tags a,b] [--builds a,b] [--platforms a,b] " +
+                                           "[--source <папка|файл>] [--no-export] [--anonymize] [--tz UTC|+03:00]";
+
+        private const string ViewUsage = "[--views a,b] [--group-by d1,d2] [--aggs count,median:f] [--where <выражение>] [--compare @dim]";
 
         [NexusCommand("analytics.report", "Собрать report.html из пакетов аналитики",
-                      Usage = "analytics.report [--out <файл.html>] [--open] " + FilterUsage)]
+                      Usage = "analytics.report [--out <файл.html>] [--open] [--profile <id>] " + ViewUsage + " " + FilterUsage)]
         private static int Report(NexusCommandContext ctx)
         {
-            var prefs = Prefs(ctx);
-            var data = AnalyticsReports.Build(prefs);
+            var prefs = Prefs(ctx, out var profile);
+            var data = Build(ctx, prefs);
             var path = AnalyticsReports.WriteHtml(data, OutPath(ctx), prefs);
             Summary(ctx, data, path);
-            if (ctx.Flag("open")) Application.OpenURL(new System.Uri(path).AbsoluteUri);
+            if (profile != null) ctx.Print("профиль: " + profile.Id);
+            if (ctx.Flag("open")) Application.OpenURL(new Uri(path).AbsoluteUri);
             return data.Packets == 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
         }
 
-        [NexusCommand("analytics.export", "Экспорт аналитики: CSV-набор в zip, один JSON или склеенный JSONL",
-                      Usage = "analytics.export --format csv|json|jsonl [--out <файл>] [--semicolon true|false] [--bom true|false] [--iso] " + FilterUsage)]
+        [NexusCommand("analytics.export", "Экспорт аналитики: CSV-набор в zip, один JSON, склеенный JSONL — или все форматы профиля",
+                      Usage = "analytics.export (--format csv|json|jsonl | --profile <id>) [--out <файл|папка для профиля>] [--raw true|false] " +
+                              "[--semicolon true|false] [--bom true|false] [--iso] " + ViewUsage + " " + FilterUsage)]
         private static int Export(NexusCommandContext ctx)
         {
+            var prefs = Prefs(ctx, out var profile);
+            if (ctx.Has("semicolon")) prefs.csvSemicolon = ctx.Flag("semicolon");
+            if (ctx.Has("bom")) prefs.csvBom = ctx.Flag("bom");
+            if (ctx.Has("iso")) prefs.csvIsoTimes = ctx.Flag("iso");
+            if (ctx.Has("raw")) prefs.rawEvents = ctx.Flag("raw");
+
+            if (profile != null && !ctx.Has("format"))
+            {
+                // все форматы профиля разом; --out — папка
+                var folder = OutPath(ctx);
+                var paths = AnalyticsReports.RunProfile(profile, prefs, folder);
+                foreach (var p in paths) ctx.Print(p);
+                ctx.Data = new Dictionary<string, object> { { "profile", profile.Id }, { "paths", paths } };
+                return NexusCommandContext.Exit.Ok;
+            }
+
             ExportFormat format;
             try
             {
                 format = AnalyticsReports.ParseFormat(ctx.Get("format", "csv"));
             }
-            catch (System.ArgumentException e)
+            catch (ArgumentException e)
             {
                 throw new NexusCommandException(e.Message);
             }
 
-            var prefs = Prefs(ctx);
-            if (ctx.Has("semicolon")) prefs.csvSemicolon = ctx.Flag("semicolon");
-            if (ctx.Has("bom")) prefs.csvBom = ctx.Flag("bom");
-            if (ctx.Has("iso")) prefs.csvIsoTimes = ctx.Flag("iso");
-
-            var data = AnalyticsReports.Build(prefs);
+            var data = Build(ctx, prefs);
             var path = AnalyticsReports.Export(data, format, OutPath(ctx), prefs);
             Summary(ctx, data, path);
             return data.Packets == 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
         }
 
-        [NexusCommand("analytics.validate", "Проверить каталог событий аналитики (ключи, поля, роли в отчёте)",
+        [NexusCommand("analytics.views", "Представления отчёта: тип, сколько событий входит, замечания",
+                      Usage = "analytics.views [--type <тип>]")]
+        private static int Views(NexusCommandContext ctx)
+        {
+            var config = AnalyticsReportStore.Load();
+            var settings = AnalyticsCatalog.Load();
+            var catalog = AnalyticsReports.Catalog(settings, config);
+            var issues = AnalyticsReportStore.Validate(settings, config);
+            var type = ctx.Get("type");
+
+            var list = new List<Dictionary<string, object>>();
+            foreach (var v in config.EffectiveViews())
+            {
+                if (!string.IsNullOrEmpty(type) && !string.Equals(ViewTypes.Name(v.Type), type, StringComparison.OrdinalIgnoreCase)) continue;
+                var events = new List<string>();
+                foreach (var e in catalog.Events)
+                    foreach (var b in config.BindingsOf(e.Key))
+                        if (b.View == v.Id) events.Add(e.Key + ":" + ViewTypes.Name(b.Role));
+                foreach (var e in config.Events)
+                    if (e.Key != null && e.Key.StartsWith("app.", StringComparison.Ordinal))
+                        foreach (var b in e.Bindings)
+                            if (b.View == v.Id) events.Add(e.Key + ":" + ViewTypes.Name(b.Role));
+
+                var errors = 0;
+                foreach (var i in issues)
+                    if (i.Key == "view:" + v.Id && i.Level == ReportIssueLevel.Error) errors++;
+
+                ctx.Print($"{v.Id,-22} {ViewTypes.Of(v.Type).Title,-18} {v.DisplayTitle}" + (v.Builtin ? "  [AppCore]" : string.Empty) +
+                          (v.Pin ? "  [обзор]" : string.Empty) + (events.Count > 0 ? $"  ← {events.Count} соб." : string.Empty) + (errors > 0 ? $"  ошибок: {errors}" : string.Empty));
+                list.Add(new Dictionary<string, object>
+                {
+                    { "id", v.Id }, { "type", ViewTypes.Name(v.Type) }, { "title", v.DisplayTitle }, { "builtin", v.Builtin }, { "pin", v.Pin },
+                    { "events", events }, { "groupBy", v.GroupBy }, { "aggs", v.Aggs }, { "where", v.Where }, { "compare", v.Compare }, { "errors", errors },
+                });
+            }
+
+            var profiles = new List<string>();
+            foreach (var p in config.Profiles) profiles.Add(p.Id);
+            if (profiles.Count > 0) ctx.Print("профили экспорта: " + string.Join(", ", profiles));
+            ctx.Data = new Dictionary<string, object> { { "views", list }, { "profiles", profiles }, { "file", AnalyticsReportStore.Path } };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("analytics.query", "Разовый расчёт представления: из каталога с перекрытиями (--view) или по маске ключей (--events)",
+                      Usage = "analytics.query (--view <id> | --events <маска,маска> [--type breakdown] [--role point] [--subject f] [--measure f] [--value f] [--unit runs]) " +
+                              "[--group-by …] [--aggs …] [--where …] [--compare …] [--format table|csv|json] [--out <файл>] " + FilterUsage)]
+        private static int Query(NexusCommandContext ctx)
+        {
+            var prefs = Prefs(ctx, out _);
+            var config = AnalyticsReportStore.Load();
+            ReportView view;
+
+            var id = ctx.Get("view");
+            var masks = ctx.GetList("events");
+            if (!string.IsNullOrEmpty(id))
+            {
+                view = null;
+                foreach (var v in config.EffectiveViews())
+                    if (v.Id == id) view = v;
+                if (view == null) throw new NexusCommandException($"Нет представления «{id}» (nexus analytics.views)", NexusCommandContext.Exit.Failed);
+            }
+            else if (masks.Count > 0)
+            {
+                // разовое представление по маске: в копии файла, на диск не пишется
+                var type = ViewTypes.ParseType(ctx.Get("type", "breakdown"), out var ok);
+                if (!ok) throw new NexusCommandException("--type: " + string.Join(", ", TypeNames()));
+                var role = ViewTypes.DefaultRole(type);
+                if (ctx.Has("role"))
+                {
+                    role = ViewTypes.ParseRole(ctx.Get("role"), out var roleOk);
+                    if (!roleOk) throw new NexusCommandException("--role: point, begin, end, step, done, value, a, b, x, y");
+                }
+                config = ReportConfig.Parse(config.ToJson());
+                view = new ReportView { Id = "query", Title = "Запрос: " + string.Join(", ", masks), Type = type };
+                view.Keys.AddRange(masks);
+                view.Bind = new ViewBinding { Role = role, Subject = ctx.Get("subject"), Measure = ctx.Get("measure"), Value = ctx.Get("value") };
+                if (ctx.Has("unit"))
+                {
+                    if (!ViewTypes.TryParseUnit(ctx.Get("unit"), out var unit)) throw new NexusCommandException("--unit: events, runs, sessions, profiles");
+                    view.Unit = unit;
+                }
+
+                config.Views.Add(view);
+            }
+            else
+            {
+                throw new NexusCommandException("Нужно --view <id> или --events <маска>");
+            }
+
+            prefs.views = new List<string> { view.Id };
+            var options = Options(ctx, prefs);
+            var catalog = AnalyticsReports.Catalog(null, config);
+            var data = ReportBuilder.Build(AnalyticsReports.Sources(prefs), catalog, options);
+            foreach (var w in data.Warnings) ctx.Warn(w);
+
+            ViewResult result = null;
+            foreach (var r in data.ViewResults)
+                if (r.View.Id == view.Id) result = r;
+            if (result == null) throw new NexusCommandException("Представление не посчитано (скрыто?)", NexusCommandContext.Exit.Failed);
+            if (result.Error != null) throw new NexusCommandException(result.Error, NexusCommandContext.Exit.Failed);
+
+            var headline = result.Data.Str("headlineText") ?? Format(result.Headline, result.Data.Str("headlineFmt"));
+            ctx.Print($"{view.DisplayTitle} · {ViewTypes.Of(view.Type).Title} · {result.Data.Str("headlineLabel")}: {headline} · n = {result.Data.Num("n", 0)}");
+
+            var table = result.Tables.Count > 0 ? result.Tables[0] : null;
+            var format = ctx.Get("format", "table").ToLowerInvariant();
+            var outPath = OutPath(ctx);
+            switch (format)
+            {
+                case "csv":
+                {
+                    if (table == null) throw new NexusCommandException("У представления нет таблицы", NexusCommandContext.Exit.Failed);
+                    var sw = new StringWriter();
+                    ReportExport.WriteCsv(sw, table, prefs.csvSemicolon ? ';' : ',', prefs.csvSemicolon);
+                    Emit(ctx, sw.ToString(), outPath);
+                    break;
+                }
+                case "json":
+                    Emit(ctx, result.Data.ToPretty(), outPath);
+                    break;
+                case "table":
+                    if (table != null) PrintTable(ctx, table, ctx.GetInt("limit", 40));
+                    break;
+                default:
+                    throw new NexusCommandException("--format: table, csv, json");
+            }
+
+            ctx.Data = ToObject(result.Data);
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("analytics.validate", "Проверить каталог событий и классификацию (каждое событие — в представлениях или «только сырые»)",
                       Usage = "analytics.validate")]
         private static int Validate(NexusCommandContext ctx)
         {
@@ -71,7 +223,7 @@ namespace Exerussus.Nexus.Pages.App
                 return NexusCommandContext.Exit.Failed;
             }
 
-            var issues = AnalyticsCatalog.Validate(settings.Entries);
+            var issues = AnalyticsCatalog.ValidateAll(settings);
             var errors = 0;
             var list = new List<Dictionary<string, object>>();
             foreach (var issue in issues)
@@ -94,23 +246,49 @@ namespace Exerussus.Nexus.Pages.App
                 ctx.Error("Каталог не отсортирован — Id в AppEvents не совпадут (сохраните каталог во вкладке или синхронизируйте из меню).");
             }
 
-            ctx.Print($"Событий: {settings.Entries.Length} · ошибок: {errors} · замечаний: {issues.Count - errors}");
+            var config = AnalyticsReportStore.Load();
+            ctx.Print($"Событий: {settings.Entries.Length} · представлений: {config.EffectiveViews().Count} · ошибок: {errors} · замечаний: {issues.Count - errors}");
             ctx.Data = new Dictionary<string, object> { { "events", settings.Entries.Length }, { "errors", errors }, { "issues", list } };
             return errors > 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
         }
 
         // ---------------------------------------------------------------- общее
 
-        /// <summary>Настройки вкладки + аргументы этого вызова (на диск не пишутся).</summary>
-        private static AnalyticsReportPrefs Prefs(NexusCommandContext ctx)
+        /// <summary>Настройки вкладки + профиль (--profile) + аргументы этого вызова (на диск не пишутся).</summary>
+        private static AnalyticsReportPrefs Prefs(NexusCommandContext ctx, out ExportProfile profile)
         {
             var prefs = AnalyticsReports.LoadPrefs();
+            profile = null;
 
-            if (ctx.Has("from")) prefs.from = Date(ctx, "from");
-            if (ctx.Has("to")) prefs.to = Date(ctx, "to");
+            var profileId = ctx.Get("profile");
+            if (!string.IsNullOrWhiteSpace(profileId))
+            {
+                var config = AnalyticsReportStore.Load();
+                profile = config.FindProfile(profileId.Trim());
+                if (profile == null)
+                {
+                    var ids = new List<string>();
+                    foreach (var p in config.Profiles) ids.Add(p.Id);
+                    throw new NexusCommandException($"Нет профиля «{profileId}»" + (ids.Count > 0 ? ": есть " + string.Join(", ", ids) : " — профилей нет"), NexusCommandContext.Exit.Failed);
+                }
+
+                prefs = AnalyticsReports.ApplyProfile(prefs, profile);
+            }
+
+            if (ctx.Has("from") || ctx.Has("to"))
+            {
+                // явный период вызова сильнее «последних дней» вкладки или профиля
+                prefs.lastDays = 0;
+                prefs.from = ctx.Has("from") ? Date(ctx, "from") : string.Empty;
+                prefs.to = ctx.Has("to") ? Date(ctx, "to") : string.Empty;
+            }
+
+            if (ctx.Has("last")) prefs.lastDays = Math.Max(0, ctx.GetInt("last", 0));
             if (ctx.Has("tags")) prefs.tags = ctx.GetList("tags");
             if (ctx.Has("builds")) prefs.builds = ctx.GetList("builds");
             if (ctx.Has("platforms")) prefs.platforms = ctx.GetList("platforms");
+            if (ctx.Has("views")) prefs.views = ctx.GetList("views");
+            if (ctx.Has("tz")) prefs.timezone = ctx.Get("tz") ?? string.Empty;
             if (ctx.Has("anonymize")) prefs.anonymize = ctx.Flag("anonymize");
             if (ctx.Flag("no-export")) prefs.includeExport = false;
 
@@ -125,6 +303,50 @@ namespace Exerussus.Nexus.Pages.App
 
             return prefs;
         }
+
+        /// <summary>Опции сборки: из настроек + перекрытия представлений этого вызова (проверяются до сборки).</summary>
+        private static ReportOptions Options(NexusCommandContext ctx, AnalyticsReportPrefs prefs)
+        {
+            var options = AnalyticsReports.Options(prefs);
+            foreach (var g in ctx.GetList("group-by"))
+            {
+                if (g.StartsWith("@", StringComparison.Ordinal) && !g.StartsWith("@prop.", StringComparison.Ordinal) && Array.IndexOf(ViewTypes.Dimensions, g) < 0)
+                    throw new NexusCommandException($"--group-by: измерение «{g}» — {string.Join(" ", ViewTypes.Dimensions)} @prop.<имя>, поле события или subject");
+                options.GroupBy.Add(g);
+            }
+            foreach (var a in ctx.GetList("aggs"))
+            {
+                try
+                {
+                    ReportViews.ValidateAgg(a);
+                }
+                catch (FormatException e)
+                {
+                    throw new NexusCommandException("--aggs: " + e.Message);
+                }
+
+                options.Aggs.Add(a);
+            }
+
+            var where = ctx.Get("where");
+            if (!string.IsNullOrWhiteSpace(where))
+            {
+                if (!ReportExpr.TryCompile(where, out _, out var error)) throw new NexusCommandException("--where: " + error);
+                options.Where = where;
+            }
+
+            if (ctx.Has("compare")) options.Compare = ctx.Get("compare");
+            if (!string.IsNullOrWhiteSpace(options.TimeZone))
+            {
+                ReportTime.Parse(options.TimeZone, out var w);
+                if (w != null) ctx.Warn(w);
+            }
+
+            return options;
+        }
+
+        private static ReportData Build(NexusCommandContext ctx, AnalyticsReportPrefs prefs) =>
+            ReportBuilder.Build(AnalyticsReports.Sources(prefs), AnalyticsReports.Catalog(), Options(ctx, prefs));
 
         /// <summary>--out: относительный путь — от папки, где запущен клиент (как --source).</summary>
         private static string OutPath(NexusCommandContext ctx)
@@ -143,6 +365,100 @@ namespace Exerussus.Nexus.Pages.App
             return v.Trim();
         }
 
+        private static IEnumerable<string> TypeNames()
+        {
+            foreach (var i in ViewTypes.List) yield return i.Name;
+        }
+
+        private static void Emit(NexusCommandContext ctx, string text, string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                foreach (var line in text.Replace("\r\n", "\n").TrimEnd('\n').Split('\n')) ctx.Print(line);
+                return;
+            }
+
+            ReportExport.WriteAtomic(path, text, false);
+            ctx.Print(Path.GetFullPath(path));
+        }
+
+        private static void PrintTable(NexusCommandContext ctx, ReportTable table, int limit)
+        {
+            var widths = new int[table.Columns.Count];
+            var header = new string[table.Columns.Count];
+            for (var i = 0; i < header.Length; i++)
+            {
+                header[i] = i < table.Labels.Count ? table.Labels[i] : table.Columns[i];
+                widths[i] = Math.Min(28, header[i].Length);
+            }
+
+            var rows = new List<string[]>();
+            foreach (var r in table.Rows)
+            {
+                if (rows.Count >= limit) break;
+                var cells = new string[widths.Length];
+                for (var i = 0; i < cells.Length && i < r.Length; i++)
+                {
+                    cells[i] = r[i].AsText() ?? "—";
+                    if (cells[i].Length > 28) cells[i] = cells[i].Substring(0, 27) + "…";
+                    widths[i] = Math.Max(widths[i], cells[i].Length);
+                }
+
+                rows.Add(cells);
+            }
+
+            string Line(string[] cells)
+            {
+                var sb = new StringBuilder();
+                for (var i = 0; i < cells.Length; i++)
+                {
+                    if (i > 0) sb.Append("  ");
+                    var c = cells[i] ?? string.Empty;
+                    if (c.Length > widths[i]) c = c.Substring(0, widths[i]);
+                    sb.Append(c.PadRight(widths[i]));
+                }
+
+                return sb.ToString().TrimEnd();
+            }
+
+            ctx.Print(Line(header));
+            foreach (var r in rows) ctx.Print(Line(r));
+            if (table.Rows.Count > rows.Count) ctx.Print($"… ещё {table.Rows.Count - rows.Count} строк (--limit N, --format csv)");
+        }
+
+        /// <summary>Дерево JSON → словари и списки (ответ CLI сериализуется Newtonsoft).</summary>
+        private static object ToObject(JsonNode n)
+        {
+            if (n == null) return null;
+            switch (n.Kind)
+            {
+                case JsonNodeKind.Bool: return n.Flag;
+                case JsonNodeKind.Number: return n.Number;
+                case JsonNodeKind.String: return n.Text;
+                case JsonNodeKind.Array:
+                {
+                    var list = new List<object>(n.Items.Count);
+                    foreach (var i in n.Items) list.Add(ToObject(i));
+                    return list;
+                }
+                case JsonNodeKind.Object:
+                {
+                    var map = new Dictionary<string, object>();
+                    foreach (var p in n.Props) map[p.Key] = ToObject(p.Value);
+                    return map;
+                }
+                default: return null;
+            }
+        }
+
+        private static string Format(double v, string fmt)
+        {
+            if (double.IsNaN(v)) return "—";
+            if (fmt == "pct") return Math.Round(v * 100, 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + "%";
+            if (fmt == "dur") return Math.Round(v, 1).ToString(System.Globalization.CultureInfo.InvariantCulture) + " с";
+            return ReportFormat.Number(Math.Round(v, 3));
+        }
+
         private static void Summary(NexusCommandContext ctx, ReportData data, string path)
         {
             if (data.Packets == 0) ctx.Warn("Пакетов нет — проверьте источники (вкладка «Аналитика → Отчёт» или --source).");
@@ -153,7 +469,7 @@ namespace Exerussus.Nexus.Pages.App
             {
                 { "path", path }, { "packets", data.Packets }, { "duplicates", data.DuplicatePackets }, { "broken", data.BrokenLines },
                 { "profiles", data.Profiles.Count }, { "sessions", data.Sessions.Count }, { "runs", data.Runs.Count }, { "events", data.EventCount },
-                { "filter", (data.Options.Filter ?? new ReportFilter()).Describe() }, { "warnings", data.Warnings },
+                { "views", data.ViewResults.Count }, { "filter", (data.Options.Filter ?? new ReportFilter()).Describe() }, { "warnings", data.Warnings },
             };
         }
     }

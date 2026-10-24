@@ -36,10 +36,14 @@
 `%LOCALAPPDATA%\Exerussus\Nexus\cli` — добавьте папку в PATH.
 
 ```
-nexus list                                   открытые проекты
-nexus --project JOPA help                    команды проекта
-nexus --project JOPA analytics.report --open
-nexus --project JOPA --json analytics.export --format csv --from 2026-10-17
+nexus list                                     открытые проекты
+nexus --project MyGame help                    команды проекта
+nexus --project MyGame analytics.views         представления отчёта
+nexus --project MyGame analytics.report --open
+nexus --project MyGame analytics.export --profile weekly
+nexus --project MyGame --json analytics.export --format csv --from 2026-10-17
+nexus --project MyGame analytics.query --view fights --group-by @build --aggs count,median:duration
+nexus --project MyGame analytics.query --events "Shop.*" --type breakdown --group-by @event,@platform
 ```
 
 Проект — `--project <имя папки|путь>` или текущая папка внутри проекта. Код выхода — код команды:

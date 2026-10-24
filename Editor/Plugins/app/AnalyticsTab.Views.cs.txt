@@ -1,0 +1,695 @@
+// ============================================================
+//  AnalyticsTab.Views.cs — вкладка «Аналитика», подвкладка «Представления».
+//
+//  Представление — шаблон отчёта (app-core 5.0): тип-примитив AppCore (счётчик, интервал, воронка,
+//  доля, удержание…), группировка, агрегаты, фильтр, сравнение, цель, где показывать и как выгружать.
+//  События входят в представление через привязки в карточке события («Каталог» → «Куда входит») или
+//  по маске ключей. Встроенные представления AppCore (активность, удержание, итоги прогонов) можно
+//  перекрыть — копия с тем же id ложится в файл представлений.
+// ============================================================
+
+#if APPCORE_ANALYTICS
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using Exerussus.AppCore.Analytics.Editor;
+using Exerussus.AppCore.Analytics.Reports;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed partial class AnalyticsTab
+    {
+        private int _selectedView = -1;
+        private VisualElement _viewList;
+        private VisualElement _viewEditor;
+
+        private static readonly List<string> UnitChoices = new() { "по умолчанию", "события", "прогоны", "сессии", "игроки" };
+        private static readonly List<string> TriChoices = new() { "по умолчанию", "да", "нет" };
+        private static readonly List<string> BucketChoices = new() { "день", "час", "неделя" };
+        private static readonly string[] BucketIds = { "day", "hour", "week" };
+        private static readonly List<string> ClockChoices = new() { "игровое (если есть)", "реальное" };
+
+        private VisualElement ViewsView()
+        {
+            var root = new VisualElement();
+            var bar = _kit.Row();
+            bar.style.marginBottom = 8f;
+            bar.style.flexWrap = Wrap.NoWrap;
+            bar.Add(_kit.Btn(NexusRole.Common, "+ Представление", NewViewTypeMenu, small: true));
+            bar.Add(_kit.Btn(NexusRole.Ghost, "Встроенные…", BuiltinMenu, small: true));
+            bar.Add(_kit.Spacer());
+            AddSaveControls(bar);
+            root.Add(bar);
+
+            if (AnalyticsReportStore.Broken != null)
+                root.Add(_kit.Status(StatusKind.Error, "Файл представлений не разбирается — правки не сохранятся, пока он битый.", AnalyticsReportStore.Broken));
+
+            var columns = _kit.Columns(out var left, out var right, 520f);
+            _viewList = left;
+            _viewEditor = right;
+            root.Add(columns);
+            RenderViewList();
+            RenderViewEditor();
+            UpdateSummary();
+            return root;
+        }
+
+        // ============================================================ список
+
+        private void RenderViewList()
+        {
+            if (_viewList == null) return;
+            _viewList.Clear();
+
+            _viewList.Add(FileCard());
+            _viewList.Add(IssuesCard());
+
+            var list = _kit.Card("Представления проекта");
+            if (_config.Views.Count == 0) list.Add(_kit.Faint("Пока нет. Создайте («+ Представление») или из карточки события («+ Новое…»)."));
+            var issues = ReportIssues();
+            for (var i = 0; i < _config.Views.Count; i++)
+            {
+                var index = i;
+                var v = _config.Views[i];
+                var row = _kit.ListRow(() =>
+                {
+                    _selectedView = index;
+                    RenderViewList();
+                    RenderViewEditor();
+                }, i == _selectedView);
+                row.style.flexWrap = Wrap.NoWrap;
+
+                var errors = issues.Exists(x => x.Key == "view:" + v.Id && x.Level == ReportIssueLevel.Error);
+                var warnings = issues.Exists(x => x.Key == "view:" + v.Id && x.Level == ReportIssueLevel.Warning);
+                row.Add(_kit.Dot(errors ? NexusToken.Error : warnings ? NexusToken.Warning : v.Hidden ? NexusToken.TextDim : NexusToken.Ok));
+                row.Add(_kit.Gap(8f));
+                var texts = new VisualElement();
+                texts.style.flexGrow = 1;
+                texts.style.flexShrink = 1;
+                texts.style.minWidth = 0;
+                texts.Add(_kit.Text(v.DisplayTitle, v.Hidden ? NexusToken.TextDim : NexusToken.TextNormal));
+                texts.Add(_kit.Faint(v.Id + " · " + ViewTypes.Of(v.Type).Title));
+                row.Add(texts);
+                var count = BoundCount(v.Id);
+                if (count > 0) row.Add(_kit.Tag(NexusTagColor.Blue, count + " соб."));
+                if (v.Pin) row.Add(_kit.Tag(NexusTagColor.Violet, "обзор"));
+                if (ViewTypes.Builtins().Exists(b => b.Id == v.Id)) row.Add(_kit.Tag(NexusTagColor.Green, "перекрыто"));
+                if (v.Hidden) row.Add(_kit.Badge(StatusKind.Warning, "скрыто"));
+                list.Add(row);
+            }
+
+            _viewList.Add(list);
+
+            var builtins = _kit.Card("Встроенные AppCore", "Считаются по тому, что AppCore пишет сам (сессии, прогоны). «Встроенные…» — перекрыть или скрыть.");
+            foreach (var b in ViewTypes.Builtins())
+            {
+                var overridden = _config.FindView(b.Id) != null;
+                var row = _kit.Row();
+                row.Add(_kit.Text(b.DisplayTitle, overridden ? NexusToken.TextDim : NexusToken.TextNormal));
+                row.Add(_kit.Gap(6f));
+                row.Add(_kit.Faint(b.Id + (overridden ? " — перекрыто проектом" : string.Empty)));
+                builtins.Add(row);
+            }
+
+            _viewList.Add(builtins);
+        }
+
+        private int BoundCount(string viewId)
+        {
+            var n = 0;
+            foreach (var d in _draft)
+                if (BindingsOfDraft(d).Exists(b => b.View == viewId)) n++;
+            var cls = _config.Events;
+            foreach (var e in cls)
+                if (e.Key != null && e.Key.StartsWith("app.", StringComparison.Ordinal) && e.Bindings.Exists(b => b.View == viewId)) n++;
+            return n;
+        }
+
+        private VisualElement FileCard()
+        {
+            var card = _kit.Card("Файл представлений", AnalyticsReportStore.Path + " — в git, в сборку не попадает.");
+            var tz = _kit.Input(_config.TimeZone ?? "UTC", v =>
+            {
+                _config.TimeZone = string.IsNullOrWhiteSpace(v) ? "UTC" : v.Trim();
+                MarkDirty();
+            });
+            tz.tooltip = "Дни, недели, часы суток и когорты: UTC, +03:00 или id пояса системы";
+            card.Add(_kit.Labeled("Часовой пояс", tz));
+            card.Add(_kit.Labeled("Мин. выборка", IntInput(_config.MinSample, v => _config.MinSample = Math.Max(0, v), "Группы с n меньше — серым, «мало данных»")));
+            card.Add(_kit.Labeled("Таймлайнов", IntInput(_config.TimelineRuns, v => _config.TimelineRuns = Math.Max(0, v), "Сколько последних прогонов кладётся в report.html с таймлайном (размер файла)")));
+
+            var props = _kit.Input(string.Join(", ", _config.Properties.ConvertAll(p => p.Name)), v =>
+            {
+                var names = new List<string>();
+                foreach (var part in (v ?? string.Empty).Split(','))
+                    if (!string.IsNullOrWhiteSpace(part)) names.Add(part.Trim());
+                var old = new List<PropertyInfo>(_config.Properties);
+                _config.Properties.Clear();
+                foreach (var name in names)
+                    _config.Properties.Add(old.Find(p => p.Name == name) ?? new PropertyInfo { Name = name });
+                MarkDirty();
+            });
+            props.tooltip = "Свойства AppAnalytics.SetProperty, которые пишет проект — подсказка для группировки @prop.<имя>";
+            card.Add(_kit.Labeled("Свойства", props));
+            return card;
+        }
+
+        private VisualElement IssuesCard()
+        {
+            var issues = ReportIssues();
+            var errors = issues.FindAll(i => i.Level == ReportIssueLevel.Error);
+            var warnings = issues.FindAll(i => i.Level == ReportIssueLevel.Warning);
+            var card = _kit.Card("Проверка", errors.Count + warnings.Count == 0 ? "Все события классифицированы, привязки в порядке." : null);
+            var shown = 0;
+            foreach (var issue in errors)
+            {
+                if (shown++ >= 12) break;
+                card.Add(_kit.Status(StatusKind.Error, issue.Key + ": " + issue.Text));
+            }
+
+            foreach (var issue in warnings)
+            {
+                if (shown++ >= 16) break;
+                card.Add(_kit.Status(StatusKind.Warning, issue.Key + ": " + issue.Text));
+            }
+
+            if (errors.Count + warnings.Count > shown) card.Add(_kit.Faint($"…и ещё {errors.Count + warnings.Count - shown}. Полностью: nexus analytics.validate"));
+            return card;
+        }
+
+        // ============================================================ создание
+
+        private void NewViewTypeMenu()
+        {
+            var menu = new GenericMenu();
+            foreach (var info in ViewTypes.List)
+            {
+                var t = info.Type;
+                menu.AddItem(new GUIContent($"{info.Title} — {info.Example}"), false, () =>
+                {
+                    var id = ViewTypes.Name(t);
+                    var unique = id;
+                    for (var n = 2; _config.FindView(unique) != null || EffectiveViews().Exists(v => v.Id == unique); n++) unique = id + n;
+                    NewView(t, unique, info.Title);
+                    _subtab = Array.IndexOf(Subtabs, "Представления");
+                    RenderBody();
+                });
+            }
+
+            menu.ShowAsContext();
+        }
+
+        private ReportView NewView(ViewType type, string id, string title)
+        {
+            var v = new ReportView { Id = id, Title = title, Type = type };
+            if (type == ViewType.Interval || type == ViewType.Breakdown || type == ViewType.Lane) v.GroupBy.Add("subject");
+            _config.Views.Add(v);
+            _selectedView = _config.Views.Count - 1;
+            MarkDirty();
+            return v;
+        }
+
+        private void BuiltinMenu()
+        {
+            var menu = new GenericMenu();
+            foreach (var b in ViewTypes.Builtins())
+            {
+                var builtin = b;
+                var existing = _config.FindView(b.Id);
+                if (existing != null)
+                {
+                    menu.AddItem(new GUIContent($"{b.DisplayTitle}/Вернуть встроенное (удалить перекрытие)"), false, () =>
+                    {
+                        _config.Views.Remove(existing);
+                        _selectedView = -1;
+                        MarkDirty();
+                        RenderBody();
+                    });
+                    continue;
+                }
+
+                menu.AddItem(new GUIContent($"{b.DisplayTitle}/Перекрыть (настроить)"), false, () => Override(builtin, false));
+                menu.AddItem(new GUIContent($"{b.DisplayTitle}/Скрыть"), false, () => Override(builtin, true));
+            }
+
+            menu.ShowAsContext();
+        }
+
+        private void Override(ReportView builtin, bool hide)
+        {
+            var copy = ReportConfig.FromNode(JsonNode.Obj().Set("views", JsonNode.Arr().Add(ReportConfig.WriteView(builtin)))).Views[0];
+            copy.Hidden = hide;
+            _config.Views.Add(copy);
+            _selectedView = _config.Views.Count - 1;
+            MarkDirty();
+            RenderBody();
+        }
+
+        // ============================================================ редактор
+
+        private void RenderViewEditor()
+        {
+            if (_viewEditor == null) return;
+            _viewEditor.Clear();
+
+            if (_selectedView < 0 || _selectedView >= _config.Views.Count)
+            {
+                var hint = _kit.Card("Представление", "Выберите слева или создайте. Типы:");
+                foreach (var info in ViewTypes.List)
+                    hint.Add(_kit.Faint($"{info.Title} — {info.Chart}. Пример: {info.Example}."));
+                _viewEditor.Add(hint);
+                return;
+            }
+
+            var v = _config.Views[_selectedView];
+            var info2 = ViewTypes.Of(v.Type);
+            var card = _kit.Card(v.DisplayTitle, info2.Chart + ". Пример: " + info2.Example + ".");
+
+            // ---- что это ----
+            // id меняется по Enter/уходу с поля, не на каждую букву: промежуточный текст мог совпасть с чужим id
+            var idStatus = new VisualElement();
+            var idField = TextInput(v.Id, s =>
+            {
+                idStatus.Clear();
+                var error = RenameView(v, s);
+                if (error != null) idStatus.Add(_kit.Status(StatusKind.Error, error));
+                RenderViewList();
+            }, "Латиница, цифры, «_». Переименование (Enter) переносит привязки событий и профилей");
+            idField.isDelayed = true;
+            card.Add(_kit.Labeled("Id", idField));
+            card.Add(idStatus);
+            card.Add(_kit.Labeled("Название", TextInput(v.Title, s =>
+            {
+                v.Title = s;
+                RenderViewList();
+            })));
+            card.Add(_kit.Labeled("Описание", TextInput(v.Note, s => v.Note = s)));
+
+            var types = new List<string>();
+            foreach (var i in ViewTypes.List) types.Add(i.Title);
+            card.Add(_kit.Labeled("Тип", _kit.Dropdown(null, types, (int)v.Type, i =>
+            {
+                v.Type = (ViewType)i;
+                MarkDirty();
+                RenderViewList();
+                RenderViewEditor();
+            })));
+            if (ViewTypes.Builtins().Exists(b => b.Id == v.Id))
+                card.Add(_kit.Faint("Перекрывает встроенное представление AppCore с тем же id."));
+            card.Add(_kit.Check("Скрыть из отчёта", v.Hidden, b =>
+            {
+                v.Hidden = b;
+                MarkDirty();
+                RenderViewList();
+            }));
+
+            // ---- какие события ----
+            card.Add(_kit.Divider());
+            card.Add(_kit.Text("События", NexusToken.TextDim, 11));
+            if (info2.Roles.Length == 0)
+                card.Add(_kit.Faint("Привязки не нужны: считается по сессиям и игрокам, которые пишет AppCore."));
+            else
+            {
+                card.Add(_kit.Hint("Роли: " + string.Join(", ", Array.ConvertAll(info2.Roles, ViewTypes.Title)) +
+                                   ". Привязывайте в карточке события («Каталог» → «Куда входит») или маской ниже."));
+                var bound = new List<string>();
+                foreach (var d in _draft)
+                    foreach (var b in BindingsOfDraft(d))
+                        if (b.View == v.Id) bound.Add($"{d.Key.Trim()} — {ViewTypes.Title(b.Role)}" + (b.Subject != null ? $", субъект {b.Subject}" : "") + (b.Measure != null ? $", мера {b.Measure}" : "") + (b.Value != null ? $", значение {b.Value}" : ""));
+                foreach (var e in _config.Events)
+                    if (e.Key != null && e.Key.StartsWith("app.", StringComparison.Ordinal))
+                        foreach (var b in e.Bindings)
+                            if (b.View == v.Id) bound.Add($"{e.Key} — {ViewTypes.Title(b.Role)}");
+                if (bound.Count == 0) card.Add(_kit.Status(StatusKind.Warning, "Ни одного события — представление пустое."));
+                foreach (var line in bound) card.Add(_kit.Mono(line, NexusToken.TextFaint));
+
+                card.Add(_kit.Labeled("Маски ключей", ListText(v.Keys, () =>
+                {
+                    if (v.Keys.Count > 0 && v.Bind == null) v.Bind = new ViewBinding { Role = ViewTypes.DefaultRole(v.Type) };
+                    RenderViewList();
+                }, "Level.*, *.Killed, точный ключ — все подходящие события входят с ролью ниже")));
+                if (v.Keys.Count > 0)
+                {
+                    v.Bind ??= new ViewBinding { Role = ViewTypes.DefaultRole(v.Type) };
+                    var roles = new List<BindRole>(info2.Roles);
+                    if (!roles.Contains(v.Bind.Role)) roles.Insert(0, v.Bind.Role);
+                    card.Add(_kit.Labeled("Роль по маске", _kit.Dropdown(null, roles.ConvertAll(ViewTypes.Title), roles.IndexOf(v.Bind.Role), i =>
+                    {
+                        v.Bind.Role = roles[i];
+                        MarkDirty();
+                    })));
+                    card.Add(_kit.Labeled("Субъект", TextInput(v.Bind.Subject, s => v.Bind.Subject = Clean(s), "Имя строкового поля у событий маски")));
+                    card.Add(_kit.Labeled("Мера", TextInput(v.Bind.Measure, s => v.Bind.Measure = Clean(s), "Имя числового поля")));
+                    card.Add(_kit.Labeled("Значение", TextInput(v.Bind.Value, s => v.Bind.Value = Clean(s), "Поле значения (исход, состояние)")));
+                }
+            }
+
+            if (v.Type == ViewType.Outcome)
+                card.Add(_kit.Labeled("Значение из", TextInput(v.Value, s => v.Value = Clean(s), "Без привязок: измерение единицы — @result (итог прогона), @prop.<имя>. С привязками — пусто")));
+
+            // ---- как считать ----
+            card.Add(_kit.Divider());
+            card.Add(_kit.Text("Как считать", NexusToken.TextDim, 11));
+            var unitIndex = v.Unit == null ? 0 : (int)v.Unit.Value + 1;
+            card.Add(_kit.Labeled("Единица", _kit.Dropdown(null, UnitChoices, unitIndex, i =>
+            {
+                v.Unit = i == 0 ? (CountUnit?)null : (CountUnit)(i - 1);
+                MarkDirty();
+            })));
+            card.Add(_kit.Faint("По умолчанию: " + ViewTypes.Title(ViewTypes.DefaultUnit(v.Type, v.Value)).ToLowerInvariant() + ". «100 ошибок» и «ошибка у 3 игроков» — разные выводы."));
+
+            if (UsesGroupBy(v.Type))
+                card.Add(_kit.Labeled("Группировка", ListText(v.GroupBy, null, "subject, поле события или " + string.Join(" ", ViewTypes.Dimensions) + " @prop.<имя>")));
+            if (UsesAggs(v.Type))
+                card.Add(_kit.Labeled("Агрегаты", ListText(v.Aggs, null, "count, share, distinct:f, sum:f, avg:f, median:f, p90:f, min:f, max:f (f — поле или measure)")));
+            card.Add(_kit.Labeled("Фильтр", TextInput(v.Where, s => v.Where = Clean(s), "Выражение: level = \"boss\" && time > 5. Операторы = != < > ~ && || ! ?:, функции abs round min max len lower has if")));
+            card.Add(ExprStatus(v.Where));
+
+            switch (v.Type)
+            {
+                case ViewType.Funnel:
+                case ViewType.Progress:
+                    card.Add(_kit.Labeled("Шаги по порядку", ListText(v.Steps, null, "Значения субъекта по порядку; пусто — по медиане первого появления")));
+                    break;
+                case ViewType.Series:
+                    card.Add(_kit.Labeled("Шаг", _kit.Dropdown(null, BucketChoices, Math.Max(0, Array.IndexOf(BucketIds, v.Bucket ?? "day")), i =>
+                    {
+                        v.Bucket = BucketIds[i] == "day" ? null : BucketIds[i];
+                        MarkDirty();
+                    })));
+                    break;
+                case ViewType.Retention:
+                    card.Add(_kit.Labeled("Дни", TextInput(string.Join(", ", v.Periods), s =>
+                    {
+                        v.Periods.Clear();
+                        foreach (var part in (s ?? string.Empty).Split(','))
+                            if (int.TryParse(part.Trim(), out var d) && d > 0) v.Periods.Add(d);
+                    }, "1, 3, 7, 14, 30")));
+                    break;
+                case ViewType.Distribution:
+                    card.Add(_kit.Labeled("Корзин", IntInput(v.Bins, i => v.Bins = Math.Max(0, i), "0 — 20")));
+                    break;
+                case ViewType.Heatmap:
+                    card.Add(_kit.Labeled("Ось X", TextInput(v.X, s => v.X = Clean(s), "subject, поле или @измерение")));
+                    card.Add(_kit.Labeled("Ось Y", TextInput(v.Y, s => v.Y = Clean(s), "@tag по умолчанию")));
+                    card.Add(_kit.Labeled("Значений на ось", IntInput(v.Top, i => v.Top = Math.Max(0, i), "0 — 30")));
+                    break;
+                case ViewType.Conversion:
+                    card.Add(_kit.Labeled("Окно, с", TextInput(v.Within > 0 ? v.Within.ToString(CultureInfo.InvariantCulture) : string.Empty, s =>
+                    {
+                        v.Within = double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var w) && w > 0 ? w : 0;
+                    }, "B засчитывается, если случилось не позже стольких секунд после A; пусто — без окна")));
+                    break;
+                case ViewType.Transitions:
+                case ViewType.Breakdown:
+                    card.Add(_kit.Labeled("Строк", IntInput(v.Top, i => v.Top = Math.Max(0, i), "0 — по умолчанию")));
+                    break;
+            }
+
+            if (v.Type == ViewType.Interval || v.Type == ViewType.State)
+                card.Add(_kit.Labeled("Часы", _kit.Dropdown(null, ClockChoices, v.RealClock ? 1 : 0, i =>
+                {
+                    v.Clock = i == 1 ? "real" : null;
+                    MarkDirty();
+                })));
+
+            if (v.Type == ViewType.Outcome || v.Type == ViewType.State)
+                card.Add(OutcomesEditor(v));
+
+            card.Add(ComputedEditor(v));
+
+            // ---- сравнение и цель ----
+            card.Add(_kit.Divider());
+            card.Add(_kit.Text("Сравнение и цель", NexusToken.TextDim, 11));
+            card.Add(_kit.Labeled("Сравнить по", TextInput(v.Compare, s => v.Compare = Clean(s), "@build, @platform, @prop.ab… — график разбивается на части (до 8)")));
+            card.Add(_kit.Check("С прошлым периодом (нужен период: с/по или «последние N дней»)", v.ComparePrevious, b =>
+            {
+                v.ComparePrevious = b;
+                MarkDirty();
+            }));
+            var target = v.Target ?? new ViewTarget();
+            var trow = _kit.Row();
+            trow.style.flexWrap = Wrap.NoWrap;
+            var tval = TextInput(target.IsSet ? target.Value.ToString(CultureInfo.InvariantCulture) : string.Empty, s =>
+            {
+                if (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var x))
+                {
+                    v.Target ??= new ViewTarget();
+                    v.Target.Value = x;
+                }
+                else v.Target = null;
+            }, "Число: секунды, доля 0..1, количество — в единицах главного показателя");
+            tval.style.width = 90f;
+            trow.Add(tval);
+            trow.Add(_kit.Gap(6f));
+            trow.Add(_kit.Dropdown(null, new List<string> { "лучше меньше", "лучше больше" }, target.LowerIsBetter ? 0 : 1, i =>
+            {
+                v.Target ??= new ViewTarget();
+                v.Target.LowerIsBetter = i == 0;
+                MarkDirty();
+            }));
+            card.Add(_kit.Labeled("Цель", trow));
+            card.Add(_kit.Labeled("Мин. выборка", IntInput(v.MinSample, i => v.MinSample = Math.Max(0, i), "0 — из файла (" + _config.MinSample + ")")));
+
+            // ---- где показывать ----
+            card.Add(_kit.Divider());
+            card.Add(_kit.Text("Где показывать и как выгружать", NexusToken.TextDim, 11));
+            card.Add(_kit.Check("На обзоре", v.Pin, b =>
+            {
+                v.Pin = b;
+                MarkDirty();
+                RenderViewList();
+            }));
+            card.Add(_kit.Labeled("Порядок", IntInput(v.Order, i => v.Order = i, "Меньше — выше; встроенные: −30…−10")));
+            card.Add(_kit.Labeled("На странице тега", _kit.Dropdown(null, TriChoices, v.OnTag == null ? 0 : v.OnTag.Value ? 1 : 2, i =>
+            {
+                v.OnTag = i == 0 ? (bool?)null : i == 1;
+                MarkDirty();
+            })));
+            card.Add(_kit.Labeled("На таймлайне", _kit.Dropdown(null, TriChoices, v.OnRun == null ? 0 : v.OnRun.Value ? 1 : 2, i =>
+            {
+                v.OnRun = i == 0 ? (bool?)null : i == 1;
+                MarkDirty();
+            })));
+            card.Add(_kit.Check("Выгружать таблицей (CSV, JSON)", v.Export, b =>
+            {
+                v.Export = b;
+                MarkDirty();
+            }));
+
+            // ---- проблемы ----
+            foreach (var issue in ReportIssues())
+                if (issue.Key == "view:" + v.Id && issue.Level != ReportIssueLevel.Info)
+                    card.Add(_kit.Status(issue.Level == ReportIssueLevel.Error ? StatusKind.Error : StatusKind.Warning, issue.Text));
+
+            var actions = _kit.Row();
+            actions.style.marginTop = 8f;
+            actions.Add(_kit.Btn(NexusRole.Common, "Дублировать", () =>
+            {
+                var copy = ReportConfig.FromNode(JsonNode.Obj().Set("views", JsonNode.Arr().Add(ReportConfig.WriteView(v)))).Views[0];
+                var id = v.Id + "_copy";
+                for (var n = 2; _config.FindView(id) != null; n++) id = v.Id + "_copy" + n;
+                copy.Id = id;
+                _config.Views.Add(copy);
+                _selectedView = _config.Views.Count - 1;
+                MarkDirty();
+                RenderViewList();
+                RenderViewEditor();
+            }, small: true));
+            actions.Add(_kit.Spacer());
+            actions.Add(_kit.Btn(NexusRole.Alarm, "Удалить", () =>
+            {
+                var bound = BoundCount(v.Id);
+                if (bound > 0 && !EditorUtility.DisplayDialog("Аналитика", $"Представление «{v.DisplayTitle}» — в него входит событий: {bound}. Привязки удалятся; события без других привязок станут неклассифицированными.", "Удалить", "Отмена"))
+                    return;
+                foreach (var d in _draft) d.Class.Bindings.RemoveAll(b => b.View == v.Id);
+                foreach (var e in _config.Events) e.Bindings.RemoveAll(b => b.View == v.Id);
+                foreach (var p in _config.Profiles) p.Views.Remove(v.Id);
+                _config.Views.Remove(v);
+                _selectedView = -1;
+                MarkDirty();
+                RenderViewList();
+                RenderViewEditor();
+            }, small: true));
+            card.Add(actions);
+
+            card.Add(_kit.Code("nexus analytics.query --view " + v.Id + " --group-by @build"));
+            _viewEditor.Add(card);
+        }
+
+        private static bool UsesGroupBy(ViewType t) => t != ViewType.Activity && t != ViewType.Retention && t != ViewType.Funnel && t != ViewType.Progress &&
+                                                     t != ViewType.Transitions && t != ViewType.State && t != ViewType.Flow && t != ViewType.Correlation &&
+                                                     t != ViewType.Distribution && t != ViewType.Heatmap;
+
+        private static bool UsesAggs(ViewType t) => t == ViewType.Counter || t == ViewType.Breakdown || t == ViewType.Series || t == ViewType.Heatmap;
+
+        private static readonly System.Text.RegularExpressions.Regex ViewIdPattern = new("^[A-Za-z_][A-Za-z0-9_]{0,63}$");
+
+        /// <summary>Переименовать с переносом привязок. Ошибка — текст (id занят или неверный), ничего не меняется.</summary>
+        private string RenameView(ReportView v, string id)
+        {
+            id = Clean(id);
+            if (id == null || id == v.Id) return null;
+            if (!ViewIdPattern.IsMatch(id)) return "id: латиница, цифры, «_», до 64 символов — не переименовано";
+            if (_config.FindView(id) != null || EffectiveViews().Exists(x => x.Id == id && x != v)) return $"id «{id}» уже занят — не переименовано";
+            var old = v.Id;
+            v.Id = id;
+            foreach (var d in _draft)
+                foreach (var b in d.Class.Bindings)
+                    if (b.View == old) b.View = id;
+            foreach (var e in _config.Events)
+                foreach (var b in e.Bindings)
+                    if (b.View == old) b.View = id;
+            foreach (var p in _config.Profiles)
+                for (var i = 0; i < p.Views.Count; i++)
+                    if (p.Views[i] == old) p.Views[i] = id;
+            return null;
+        }
+
+        private VisualElement OutcomesEditor(ReportView v)
+        {
+            var box = new VisualElement();
+            box.style.marginTop = 6f;
+            var head = _kit.Row();
+            head.Add(_kit.Text(v.Type == ViewType.State ? "Подписи значений" : "Классы исходов", NexusToken.TextDim, 11));
+            head.Add(_kit.Spacer());
+            head.Add(_kit.Btn(NexusRole.Common, "+ Класс", () =>
+            {
+                v.Outcomes.Add(new OutcomeClass { Value = "value", Tone = Tone.Neutral });
+                MarkDirty();
+                RenderViewEditor();
+            }, small: true));
+            box.Add(head);
+            if (v.Type == ViewType.Outcome)
+                box.Add(_kit.Faint("Значение → окраска и подпись. Успех/провал дают долю успеха; «служебное» — серым (незавершённые, прерванные)."));
+
+            for (var i = 0; i < v.Outcomes.Count; i++)
+            {
+                var index = i;
+                var o = v.Outcomes[i];
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginTop = 3f;
+                var value = TextInput(o.Value, s => o.Value = s?.Trim());
+                value.style.width = 120f;
+                row.Add(value);
+                row.Add(_kit.Gap(6f));
+                var tone = _kit.Dropdown(null, ToneTitles, (int)o.Tone, t =>
+                {
+                    o.Tone = (Tone)t;
+                    MarkDirty();
+                });
+                tone.style.width = 120f;
+                row.Add(tone);
+                row.Add(_kit.Gap(6f));
+                var label = TextInput(o.Label, s => o.Label = s);
+                label.style.flexGrow = 1;
+                row.Add(label);
+                row.Add(_kit.Btn(NexusRole.Ghost, "×", () =>
+                {
+                    v.Outcomes.RemoveAt(index);
+                    MarkDirty();
+                    RenderViewEditor();
+                }, small: true));
+                box.Add(row);
+            }
+
+            return box;
+        }
+
+        private VisualElement ComputedEditor(ReportView v)
+        {
+            var box = new VisualElement();
+            box.style.marginTop = 6f;
+            var head = _kit.Row();
+            head.Add(_kit.Text("Вычисляемые поля", NexusToken.TextDim, 11));
+            head.Add(_kit.Spacer());
+            head.Add(_kit.Btn(NexusRole.Common, "+ Поле", () =>
+            {
+                v.Computed.Add(new ComputedField { Name = "calc", Expr = "1" });
+                MarkDirty();
+                RenderViewEditor();
+            }, small: true));
+            box.Add(head);
+            if (v.Computed.Count == 0) box.Add(_kit.Faint("Например, rate = errors / duration или won = result = \"win\" ? 1 : 0 — без нового поля в событии."));
+
+            for (var i = 0; i < v.Computed.Count; i++)
+            {
+                var index = i;
+                var c = v.Computed[i];
+                var row = _kit.Row();
+                row.style.flexWrap = Wrap.NoWrap;
+                row.style.marginTop = 3f;
+                var name = TextInput(c.Name, s => c.Name = s?.Trim());
+                name.style.width = 110f;
+                row.Add(name);
+                row.Add(_kit.Text(" = ", NexusToken.TextDim));
+                var expr = TextInput(c.Expr, s => c.Expr = s);
+                expr.style.flexGrow = 1;
+                row.Add(expr);
+                row.Add(_kit.Btn(NexusRole.Ghost, "×", () =>
+                {
+                    v.Computed.RemoveAt(index);
+                    MarkDirty();
+                    RenderViewEditor();
+                }, small: true));
+                box.Add(row);
+                box.Add(ExprStatus(c.Expr));
+            }
+
+            return box;
+        }
+
+        private VisualElement ExprStatus(string expr)
+        {
+            var host = new VisualElement();
+            if (!string.IsNullOrWhiteSpace(expr) && !ReportExpr.TryCompile(expr, out _, out var error)) host.Add(_kit.Status(StatusKind.Error, error));
+            return host;
+        }
+
+        // ============================================================ поля ввода
+
+        private TextField TextInput(string value, Action<string> set, string tooltip = null)
+        {
+            var input = _kit.Input(value ?? string.Empty, s =>
+            {
+                set(s);
+                MarkDirty();
+            });
+            if (tooltip != null) input.tooltip = tooltip;
+            return input;
+        }
+
+        private TextField IntInput(int value, Action<int> set, string tooltip = null)
+        {
+            var input = _kit.Input(value != 0 ? value.ToString(CultureInfo.InvariantCulture) : string.Empty, s =>
+            {
+                set(int.TryParse(s?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : 0);
+                MarkDirty();
+            });
+            if (tooltip != null) input.tooltip = tooltip;
+            return input;
+        }
+
+        private TextField ListText(List<string> list, Action changed, string tooltip)
+        {
+            var input = _kit.Input(string.Join(", ", list), s =>
+            {
+                list.Clear();
+                foreach (var part in (s ?? string.Empty).Split(','))
+                    if (!string.IsNullOrWhiteSpace(part)) list.Add(part.Trim());
+                MarkDirty();
+                changed?.Invoke();
+            });
+            input.tooltip = tooltip;
+            return input;
+        }
+
+        private static string Clean(string s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+    }
+}
+#endif

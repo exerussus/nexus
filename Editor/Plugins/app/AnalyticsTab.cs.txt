@@ -1,10 +1,11 @@
 // ============================================================
-//  AnalyticsTab.cs — вкладка «Аналитика»: каталог событий, данные, настройки, справка.
+//  AnalyticsTab.cs — вкладка «Аналитика»: каталог событий, представления, отчёт, данные, настройки, справка.
 //
-//  Аналитика — часть app-core 4.7 (Exerussus.AppCore.Analytics). Каталог живёт в AnalyticsSettings
-//  (Assets/App/Settings/AnalyticsSettings.asset); правки копятся в памяти и пишутся кнопкой «Сохранить»
-//  через AnalyticsCatalog.Commit — он сортирует каталог (порядок = Id событий) и перегенерирует
-//  Assets/App/Generated/AppEvents.cs.
+//  Аналитика — часть app-core 5.0 (Exerussus.AppCore.Analytics). Каталог живёт в AnalyticsSettings
+//  (Assets/App/Settings/AnalyticsSettings.asset), представления и классификация событий — в файле
+//  представлений (Assets/App/Settings/Editor/AnalyticsReport.json, только редактор). Правки обоих копятся
+//  в памяти и пишутся одной кнопкой «Сохранить»: каталог — через AnalyticsCatalog.Commit (сортировка,
+//  AppEvents.cs), представления — через AnalyticsReportStore.Save.
 //
 //  «Данные» — в Play Mode: профиль, сессия, прогон, режим, очередь и кнопки; вне игры — пакеты,
 //  сохранённые экспортом в файлы (persistentDataPath/AppAnalytics/Export), с просмотром.
@@ -17,6 +18,7 @@ using System.IO;
 using System.Text;
 using Exerussus.AppCore.Analytics;
 using Exerussus.AppCore.Analytics.Editor;
+using Exerussus.AppCore.Analytics.Reports;
 using Exerussus.Nexus.Abstractions;
 using UnityEditor;
 using UnityEditor.UIElements;
@@ -28,7 +30,7 @@ namespace Exerussus.Nexus.Pages.App
     internal sealed partial class AnalyticsTab : IAppTab
     {
         private const string SubtabKey = "analytics.subtab";
-        private static readonly string[] Subtabs = { "Каталог", "Отчёт", "Данные", "Настройки", "Справка" };
+        private static readonly string[] Subtabs = { "Каталог", "Представления", "Отчёт", "Данные", "Настройки", "Справка" };
         private static readonly List<string> TypeNames = new() { "Целое (long)", "Дробное (double)", "Логическое (bool)", "Строка (string)" };
 
         private const int MaxFiles = 40;
@@ -45,8 +47,10 @@ namespace Exerussus.Nexus.Pages.App
         private int _subtab;
         private bool _renderedEnabled;
 
-        // черновик каталога
+        // черновик каталога и файла представлений
         private readonly List<EntryDraft> _draft = new();
+        private ReportConfig _config = new();
+        private DateTime _configStamp;
         private int _selected = -1;
         private bool _dirty;
         private string _filter = string.Empty;
@@ -142,11 +146,12 @@ namespace Exerussus.Nexus.Pages.App
             public string When = string.Empty;
             public bool Disabled;
             public readonly List<FieldDraft> Fields = new();
-            public AnalyticsReportInfo Report;
+            /// <summary>Куда событие входит (файл представлений); ключ переписывается при сохранении.</summary>
+            public EventClass Class = new();
 
             public static EntryDraft From(AnalyticsEventEntry e)
             {
-                var d = new EntryDraft { Key = e.key ?? string.Empty, Title = e.title ?? string.Empty, When = e.when ?? string.Empty, Disabled = e.disabled, Report = e.report };
+                var d = new EntryDraft { Key = e.key ?? string.Empty, Title = e.title ?? string.Empty, When = e.when ?? string.Empty, Disabled = e.disabled };
                 if (e.fields != null)
                     foreach (var f in e.fields)
                         d.Fields.Add(new FieldDraft { Name = f.name ?? string.Empty, Type = f.type, Note = f.note ?? string.Empty });
@@ -158,15 +163,16 @@ namespace Exerussus.Nexus.Pages.App
                 var fields = new AnalyticsField[Fields.Count];
                 for (var i = 0; i < fields.Length; i++)
                     fields[i] = new AnalyticsField { name = Fields[i].Name.Trim(), type = Fields[i].Type, note = Fields[i].Note };
-                var report = Report;
-                report.interval = Trim(report.interval);
-                report.subject = Trim(report.subject);
-                report.measure = Trim(report.measure);
-                report.value = Trim(report.value);
-                return new AnalyticsEventEntry { key = Key.Trim(), title = Title, when = When, disabled = Disabled, fields = fields, report = report };
+                return new AnalyticsEventEntry { key = Key.Trim(), title = Title, when = When, disabled = Disabled, fields = fields };
             }
 
-            private static string Trim(string s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+            /// <summary>Событие глазами отчёта (для проверки привязок черновика).</summary>
+            public ReportEventInfo ToInfo()
+            {
+                var info = new ReportEventInfo { Key = Key.Trim(), Title = Title, When = When };
+                foreach (var f in Fields) info.Fields.Add(new ReportField { Name = f.Name.Trim(), Type = (ReportFieldType)f.Type, Note = f.Note });
+                return info;
+            }
         }
 
         private void Load()
@@ -174,13 +180,73 @@ namespace Exerussus.Nexus.Pages.App
             _draft.Clear();
             _dirty = false;
 
+            // черновик — копия: правки не трогают закэшированный файл до «Сохранить»
+            AnalyticsReportStore.Invalidate();
+            _config = CloneConfig(AnalyticsReportStore.Load());
+            _configStamp = ConfigStamp();
+
             var settings = AnalyticsCatalog.Load();
             if (settings != null)
                 foreach (var e in settings.Entries)
-                    _draft.Add(EntryDraft.From(e));
+                {
+                    var d = EntryDraft.From(e);
+                    var cls = _config.FindEvent(d.Key);
+                    d.Class = cls != null ? CloneClass(cls) : new EventClass { Key = d.Key };
+                    _draft.Add(d);
+                }
 
             _selected = Mathf.Clamp(_selected, -1, _draft.Count - 1);
+            _selectedView = Mathf.Clamp(_selectedView, -1, _config.Views.Count - 1);
         }
+
+        private static DateTime ConfigStamp()
+        {
+            var path = Path.GetFullPath(AnalyticsReportStore.Path);
+            return File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+        }
+
+        private static ReportConfig CloneConfig(ReportConfig c) => ReportConfig.Parse((c ?? new ReportConfig()).ToJson());
+
+        private static EventClass CloneClass(EventClass c)
+        {
+            var copy = new EventClass { Key = c.Key, Raw = c.Raw };
+            foreach (var b in c.Bindings) copy.Bindings.Add(b.Clone());
+            return copy;
+        }
+
+        /// <summary>
+        /// Файл представлений из черновика: классификация — по текущим ключам черновика (переименование ключа
+        /// переносит привязки), системные app.* — как были; события, удалённые из каталога, выпадают.
+        /// </summary>
+        private ReportConfig ComposeConfig()
+        {
+            var config = CloneConfig(_config);
+            var system = new List<EventClass>();
+            foreach (var e in config.Events)
+                if (e.Key != null && e.Key.StartsWith("app.", StringComparison.Ordinal)) system.Add(e);
+            config.Events.Clear();
+            config.Events.AddRange(system);
+            foreach (var d in _draft)
+            {
+                var key = d.Key.Trim();
+                if (key.Length == 0 || (!d.Class.Raw && d.Class.Bindings.Count == 0) || config.FindEvent(key) != null) continue;
+                var cls = CloneClass(d.Class);
+                cls.Key = key;
+                config.Events.Add(cls);
+            }
+
+            return config;
+        }
+
+        private List<ReportEventInfo> DraftInfos()
+        {
+            var list = new List<ReportEventInfo>(_draft.Count);
+            foreach (var d in _draft) list.Add(d.ToInfo());
+            return list;
+        }
+
+        /// <summary>Замечания по классификации и представлениям черновика.</summary>
+        private List<ReportIssue> ReportIssues() => ReportValidation.Validate(ComposeConfig(), DraftInfos());
 
         private AnalyticsEventEntry[] DraftEntries()
         {
@@ -217,12 +283,41 @@ namespace Exerussus.Nexus.Pages.App
                 return;
 
             var selectedKey = _selected >= 0 && _selected < _draft.Count ? _draft[_selected].Key.Trim() : null;
+            var selectedView = _selectedView >= 0 && _selectedView < _config.Views.Count ? _config.Views[_selectedView].Id : null;
+            var config = ComposeConfig();
+
+            if (AnalyticsReportStore.Broken != null)
+            {
+                Context.SetStatus("Файл представлений не разбирается — сначала почините его: " + AnalyticsReportStore.Broken, StatusKind.Error);
+                return;
+            }
+
+            if (ConfigStamp() != _configStamp &&
+                !EditorUtility.DisplayDialog("Аналитика", "Файл представлений изменён вне вкладки (git pull, правка руками). Сохранение перезапишет эти изменения.", "Перезаписать", "Отмена"))
+                return;
+
+            // файл представлений — первым: если он не пишется (только чтение, занят), не сохраняется ничего и черновик остаётся
+            try
+            {
+                AnalyticsReportStore.Save(config);
+            }
+            catch (Exception e)
+            {
+                Context.SetStatus("Не сохранено — файл представлений не записался: " + e.Message, StatusKind.Error);
+                Debug.LogException(e);
+                return;
+            }
 
             AnalyticsCatalog.Commit(settings, entries, "Каталог аналитики");
             Load();
             _selected = selectedKey != null ? _draft.FindIndex(d => d.Key == selectedKey) : -1;
+            _selectedView = selectedView != null ? _config.Views.FindIndex(v => v.Id == selectedView) : -1;
 
-            Context.SetStatus($"Сохранено: {_draft.Count} событий · {AnalyticsSettings.KeysPath} обновлён", StatusKind.Ok);
+            var unclassified = 0;
+            foreach (var issue in ReportIssues())
+                if (issue.Level == ReportIssueLevel.Error) unclassified++;
+            Context.SetStatus($"Сохранено: {_draft.Count} событий, {_config.Views.Count} представлений" + (unclassified > 0 ? $" · ошибок классификации: {unclassified}" : string.Empty),
+                              unclassified > 0 ? StatusKind.Warning : StatusKind.Ok);
             RenderBody();
         }
 
@@ -326,12 +421,13 @@ namespace Exerussus.Nexus.Pages.App
                 return;
             }
 
-            switch (_subtab)
+            switch (Subtabs[_subtab])
             {
-                case 0: _body.Add(CatalogView()); break;
-                case 1: _body.Add(ReportView()); break;
-                case 2: _body.Add(DataView()); break;
-                case 4: _body.Add(HelpView()); break;
+                case "Каталог": _body.Add(CatalogView()); break;
+                case "Представления": _body.Add(ViewsView()); break;
+                case "Отчёт": _body.Add(ReportView()); break;
+                case "Данные": _body.Add(DataView()); break;
+                case "Справка": _body.Add(HelpView()); break;
                 default:
                     _body.Add(SettingsCard(settings));
                     _body.Add(ToolsCard());
@@ -362,20 +458,7 @@ namespace Exerussus.Nexus.Pages.App
             bar.Add(_kit.Gap(8f));
             bar.Add(_kit.Btn(NexusRole.Common, "+ Событие", AddEntry, small: true));
             bar.Add(_kit.Spacer());
-
-            _summary = _kit.Faint(string.Empty);
-            _summary.style.marginRight = 10f;
-            bar.Add(_summary);
-
-            bar.Add(_kit.Btn(NexusRole.Ghost, "Отменить", () =>
-            {
-                if (!_dirty) return;
-                if (!EditorUtility.DisplayDialog("Аналитика", "Отменить несохранённые правки каталога?", "Отменить правки", "Нет")) return;
-                Load();
-                RenderBody();
-            }, small: true));
-            _saveButton = _kit.Btn(NexusRole.Primary, "Сохранить", Save, small: true);
-            bar.Add(_saveButton);
+            AddSaveControls(bar);
             root.Add(bar);
 
             var columns = _kit.Columns(out var left, out var right, 460f);
@@ -389,6 +472,24 @@ namespace Exerussus.Nexus.Pages.App
             return root;
         }
 
+        /// <summary>Сводка, «Отменить», «Сохранить» — общие для каталога, представлений и профилей экспорта.</summary>
+        private void AddSaveControls(VisualElement bar)
+        {
+            _summary = _kit.Faint(string.Empty);
+            _summary.style.marginRight = 10f;
+            bar.Add(_summary);
+
+            bar.Add(_kit.Btn(NexusRole.Ghost, "Отменить", () =>
+            {
+                if (!_dirty) return;
+                if (!EditorUtility.DisplayDialog("Аналитика", "Отменить несохранённые правки каталога и представлений?", "Отменить правки", "Нет")) return;
+                Load();
+                RenderBody();
+            }, small: true));
+            _saveButton = _kit.Btn(NexusRole.Primary, "Сохранить", Save, small: true);
+            bar.Add(_saveButton);
+        }
+
         private void UpdateSummary()
         {
             if (_summary != null)
@@ -396,8 +497,14 @@ namespace Exerussus.Nexus.Pages.App
                 var errors = 0;
                 foreach (var issue in AnalyticsCatalog.Validate(DraftEntries()))
                     if (issue.Level == AnalyticsCatalog.IssueLevel.Error) errors++;
+                var classErrors = 0;
+                foreach (var issue in ReportIssues())
+                    if (issue.Level == ReportIssueLevel.Error) classErrors++;
 
-                _summary.text = $"{_draft.Count} событий" + (errors > 0 ? $" · ошибок: {errors}" : string.Empty) + (_dirty ? " · не сохранено" : string.Empty);
+                _summary.text = $"{_draft.Count} событий · {_config.Views.Count} представлений" +
+                                (errors > 0 ? $" · ошибок каталога: {errors}" : string.Empty) +
+                                (classErrors > 0 ? $" · ошибок классификации: {classErrors}" : string.Empty) +
+                                (_dirty ? " · не сохранено" : string.Empty);
             }
 
             _saveButton?.SetEnabled(_dirty && !EditorApplication.isPlaying);
@@ -410,8 +517,8 @@ namespace Exerussus.Nexus.Pages.App
 
             if (_draft.Count == 0)
             {
-                var empty = _kit.Card("Каталог пуст", "Событие — ключ по точкам (Game.Module.Focus) и типизированные поля. " +
-                                                      "После сохранения появится AppEvents.Game.Module.Focus.Raise(...).");
+                var empty = _kit.Card("Каталог пуст", "Событие — ключ по точкам (Level.Enemy.Killed) и типизированные поля. " +
+                                                      "После сохранения появится AppEvents.Level.Enemy.Killed.Raise(...).");
                 _list.Add(empty);
                 return;
             }
@@ -467,8 +574,7 @@ namespace Exerussus.Nexus.Pages.App
                     row.Add(tag);
                 }
 
-                var roleChip = RoleChip(d);
-                if (roleChip != null) row.Add(roleChip);
+                row.Add(ClassChip(d));
 
                 if (d.Disabled)
                 {
@@ -503,8 +609,9 @@ namespace Exerussus.Nexus.Pages.App
         {
             var key = "Game.NewEvent";
             for (var n = 2; _draft.Exists(d => d.Key == key); n++) key = "Game.NewEvent" + n;
+            // новое событие сразу помечено «только сырые»: классификацию выбирают в «Куда входит»
 
-            _draft.Add(new EntryDraft { Key = key });
+            _draft.Add(new EntryDraft { Key = key, Class = new EventClass { Key = key, Raw = true } });
             _selected = _draft.Count - 1;
             _filter = string.Empty;
             MarkDirty();
@@ -536,7 +643,7 @@ namespace Exerussus.Nexus.Pages.App
                 UpdateKeyStatus(keyStatus, d);
                 UpdateCallPreview(d);
             });
-            keyField.tooltip = "Путь по точкам, до 5 уровней: Game.Module.Focus. Латиница, цифры, «_». Первый уровень «app» — системный.";
+            keyField.tooltip = "Путь по точкам, до 5 уровней: Level.Enemy.Killed. Латиница, цифры, «_». Первый уровень «app» — системный.";
             card.Add(_kit.Labeled("Ключ", keyField));
             card.Add(keyStatus);
             UpdateKeyStatus(keyStatus, d);
@@ -583,9 +690,9 @@ namespace Exerussus.Nexus.Pages.App
 
             for (var i = 0; i < d.Fields.Count; i++) card.Add(FieldRow(d, i));
 
-            // ---- отчёт ----
+            // ---- куда входит ----
             card.Add(_kit.Divider());
-            card.Add(ReportSection(d));
+            card.Add(ClassSection(d));
 
             // ---- вызов ----
             card.Add(_kit.Divider());
@@ -604,6 +711,7 @@ namespace Exerussus.Nexus.Pages.App
             actions.Add(_kit.Btn(NexusRole.Common, "Дублировать", () =>
             {
                 var copy = EntryDraft.From(d.ToEntry());
+                copy.Class = CloneClass(d.Class);
                 copy.Key = d.Key + "Copy";
                 _draft.Add(copy);
                 _selected = _draft.Count - 1;
@@ -1010,13 +1118,32 @@ namespace Exerussus.Nexus.Pages.App
             {
                 Title = "Отправить событие",
                 Text = "Добавьте событие в «Каталог» и сохраните — появится типизированный метод. Выключено (модуль, сбор игроком, событие) — Raise выходит на первой проверке.",
-                Code = "AppEvents.Game.Module.Focus.Raise(module.Id);",
+                Code = "AppEvents.Level.Enemy.Killed.Raise(enemy.Id, damage);",
             },
             new()
             {
                 Title = "Партия и игровое время",
                 Text = "Прогон — свои пакеты, время событий от начала прогона; часы игрового времени пишутся полем g.",
-                Code = "AppAnalytics.BeginRun(scenarioId);\nAppAnalytics.SetGameClock(() => api.CurrentGameTime);\n// …\nAppAnalytics.SetGameClock(null);\nAppAnalytics.EndRun(\"Win\");",
+                Code = "AppAnalytics.BeginRun(levelId);\nAppAnalytics.SetGameClock(() => gameTime);\n// …\nAppAnalytics.SetGameClock(null);\nAppAnalytics.EndRun(\"win\");",
+            },
+            new()
+            {
+                Title = "Представления: куда идут события",
+                Text = "Каждое событие каталога либо входит в представления («Каталог» → «Куда входит»), либо отмечено «только сырые данные» — иначе проверка выдаёт ошибку. " +
+                       "Представление — тип (счётчик, интервал, воронка, доля, удержание…), группировка, агрегаты, фильтр. AppCore считает по ролям и полям — смысла событий он не знает.",
+                Code = "Level.Fight.Start → «Бои» (интервал): начало, субъект enemy\nLevel.Fight.End   → «Бои»: конец, мера damage\n                  → «Урон» (распределение): факт, мера damage",
+            },
+            new()
+            {
+                Title = "Свойства для сегментов",
+                Text = "Свойство игрока или сессии пишется в заголовок пакета; любое представление можно сгруппировать или сравнить по @prop.<имя>. Повтор значения ничего не стоит.",
+                Code = "AppAnalytics.SetProperty(\"ab\", abGroup);      // строка из кэша\nAppAnalytics.SetProperty(\"tutorial\", done);    // bool",
+            },
+            new()
+            {
+                Title = "CLI",
+                Text = "Сборка, выгрузка по профилю и разовые запросы из командной строки (Nexus CLI).",
+                Code = "nexus --project MyGame analytics.views\nnexus --project MyGame analytics.report --profile weekly --open\nnexus --project MyGame analytics.query --view fights --group-by @build --aggs median:duration\nnexus --project MyGame analytics.query --events \"Shop.*\" --type breakdown --group-by @event,@platform",
             },
             new()
             {

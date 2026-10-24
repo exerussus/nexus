@@ -353,8 +353,9 @@ namespace Exerussus.Nexus.Pages.App
             if (!settings.Enabled)
             {
                 var card = _kit.Card("Аналитика выключена",
-                                     "Пока галочка снята, AppCore не поднимает модуль: ни профиля, ни файлов, ни PlayerLoop, ни команд консоли; " +
-                                     "каждый Raise выходит на первой проверке.");
+                                     "Новый проект — выключена (AppCore 6.0): включение — решение проекта. Пока выключено, модуль не поднимается: " +
+                                     "ни профиля, ни записей PlayerPrefs, ни объекта, ни подписок страницы, ни команд консоли; каждый Raise выходит на первой проверке. " +
+                                     "Включение не меняет выбор игрока: сбор по умолчанию — в настройках ниже (collectByDefault).");
                 var enable = _kit.Btn(NexusRole.Primary, "Включить", () =>
                 {
                     var so = new SerializedObject(settings);
@@ -1154,8 +1155,9 @@ namespace Exerussus.Nexus.Pages.App
             new()
             {
                 Title = "WebGL и лёгкий режим",
-                Text = "В лёгком режиме нет диска и экспорта, очередь — несколько пакетов в памяти, без адаптера события не пишутся. Буфер пакета выделяется один раз, запись не аллоцирует; внутренняя ошибка выключает модуль, игра продолжает работать.",
-                Code = "Настройки → Лёгкий режим: WebGL / Везде / Никогда",
+                Text = "WebGL — всегда лёгкий режим: нет диска и экспорта, очередь — несколько пакетов в памяти, без адаптера события не пишутся. Буфер пакета выделяется один раз, запись не аллоцирует. " +
+                       "Важно: с «Exception Support: Explicitly Thrown Exceptions Only» catch не ловит null и выход за границы — адаптер и игровые часы должны быть безопасны сами (проверять, а не ловить), иначе упадёт страница.",
+                Code = "public void Deliver(AnalyticsPacket p)\n{\n    var link = Link;\n    if (link == null || !link.IsConnected) { AppAnalytics.Fail(p.Id, 10); return; }\n    link.Send(p.Id, p.Content, ok => { if (ok) AppAnalytics.Complete(p.Id); else AppAnalytics.Fail(p.Id); });\n}\n// соединение появилось:\nAppAnalytics.RetryNow();",
             },
             new()
             {

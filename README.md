@@ -46,8 +46,49 @@ nexus --project MyGame analytics.query --view fights --group-by @build --aggs co
 nexus --project MyGame analytics.query --events "Shop.*" --type breakdown --group-by @event,@platform
 ```
 
+### Управление редактором
+
+Встроено в ядро и работает, пока включён CLI (выключен — ни подписок на лог, ни буфера, ни заданий).
+
+```
+nexus status                                   Play/Edit, компиляция, сцена, ошибки лога, задания
+nexus refresh                                  Refresh → импорт → компиляция → reload; итог — ошибки компиляции
+nexus compile [--clean]                        перекомпилировать скрипты
+nexus compile.errors [--warnings]              ошибки последней компиляции
+nexus logs --errors                            только ошибки (коротко: первая строка, повторы схлопнуты)
+nexus logs --grep Analytics,Fault --last 20    по ключевым словам (любое из), --all — все сразу, --not — исключить
+nexus logs --errors --stack 4 --since 1532     со стеком, только новые после записи #1532
+nexus logs --play --errors                     с последнего входа в Play
+nexus logs.clear [--console]
+nexus play.start [--scene Main] [--clear-logs] [--fail-on-errors]
+nexus play.stop | play.pause [on|off] | play.step [--frames 10]
+nexus scene.list [--all] | scene.open Main [--save|--discard] | scene.save [--as …]
+nexus screenshot                               Game с UI → путь к PNG (по умолчанию ≤1280 px, --full — как есть)
+nexus screenshot scene | screenshot window --window Inspector
+nexus tests.run [--mode edit|play|all] [--filter Analytics] → итог и упавшие тесты (код 1)
+nexus tests.list [--mode play]
+nexus menu "Assets/Reimport All" | menu --list "Window"
+nexus assets.find "t:Prefab Ship" | asset.reimport <путь> | select <путь> | save
+nexus jobs | job.status <id> | job.cancel <id>
+```
+
+Команды AppCore (страница App, app-core 6.1+): `app.create page|popup|fragment <id>`, `app.delete`, `app.views`,
+`app.uxml`, `app.controller`, `app.page.set`, `app.generate`, `app.validate`, `app.runner*`, `app.deck` — см. README AppCore.
+
+**Задания.** Долгие команды (`refresh`, `compile`, `play.start/stop`, `tests.*`, `screenshot` Game) идут
+заданиями: клиент печатает этапы и ждёт итога, в том числе через перезагрузку домена — файл экземпляра в это
+время помечен `reloading`, клиент ждёт, а не считает редактор закрытым. `--no-wait` — только id задания;
+`--timeout <с>` — общий срок. Одновременно идёт одно задание, меняющее редактор (остальные — код 1 с id идущего).
+
+**Вывод экономный.** Лог по умолчанию — последние 30 строк, первая строка сообщения ≤300 символов, без стека,
+одинаковые схлопнуты (`×N`). В конце — номер последней записи: следующий вызов `--since N` вернёт только новое.
+
+**Фон.** `play.start` включает `Application.runInBackground` на сессию Play (игра идёт без фокуса редактора;
+`--no-background` — не включать). `screenshot window` читает пиксели экрана — окно должно быть видно.
+В Edit Mode снимок Game без UI Toolkit (рендер камер) — для снимка с UI запустите Play.
+
 Проект — `--project <имя папки|путь>` или текущая папка внутри проекта. Код выхода — код команды:
-0 успех, 1 ошибка выполнения, 2 аргументы, 3 нет команды, 4 исключение, 5 таймаут, 6 редактор занят,
+0 успех, 1 ошибка выполнения, 2 аргументы, 3 нет команды, 4 исключение, 5 таймаут (задание ещё идёт), 6 редактор занят,
 10 нет редактора, 11 проект не однозначен, 12 нет связи.
 
 Своя команда страницы:

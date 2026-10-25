@@ -2,6 +2,27 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [0.9.0]
+
+### Добавлено
+- Управление редактором через CLI (ядро, работает, пока включён CLI):
+  - `status`, `refresh`, `compile`, `compile.errors`, `logs` (фильтры `--errors`, `--grep`, `--all`, `--not`,
+    `--regex`, `--since`, `--play`, `--stack`; коротко по умолчанию, повторы схлопнуты), `logs.clear`;
+  - `play.start` (ждёт первых кадров, сводка ошибок старта), `play.stop`, `play.pause`, `play.step`;
+  - `scene.list`, `scene.open` (`--save`/`--discard` вместо диалога), `scene.save`;
+  - `screenshot` (Game с UI, Scene, окно редактора; ≤1280 px по умолчанию);
+  - `tests.run`, `tests.list` — отдельная сборка `Exerussus.Nexus.TestRunner`, есть только с com.unity.test-framework;
+  - `menu`, `assets.find`, `asset.reimport`, `select`, `save`, `jobs`, `job.status`, `job.cancel`.
+- Задания CLI (`NexusCliJobs`): долгие команды переживают перезагрузку домена, клиент ждёт их итога.
+- `NexusCommandContext.Job` — команда может продолжиться заданием.
+- `NexusCommandContext.WaitForEditor` — после команды хаб ждёт компиляции и отдаёт её итог (задание `settle`).
+- Плагин `app` 3.8.0 (app-core 6.1+): `app.views`, `app.create`, `app.delete`, `app.uxml`, `app.controller`,
+  `app.page.set`, `app.generate`, `app.validate`, `app.runner`, `app.runner.create`, `app.runner.set`, `app.deck`.
+
+### Изменено
+- Перед перезагрузкой домена файл экземпляра помечается `reloading`, а не удаляется: клиент ждёт.
+- Клиент 3: ожидание заданий и перезагрузки, `--no-wait`, `--timeout` — общий срок.
+
 ## [0.7.0]
 
 ### Добавлено

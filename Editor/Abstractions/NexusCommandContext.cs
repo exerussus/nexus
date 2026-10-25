@@ -63,6 +63,18 @@ namespace Exerussus.Nexus.Abstractions
         /// <summary>Данные для машины (<c>--json</c>): объект, словарь или список — хаб сериализует в JSON.</summary>
         public object Data { get; set; }
 
+        /// <summary>
+        /// Id задания хаба, которым продолжается команда (долгие операции: компиляция, Play, тесты). Задано и
+        /// задание ещё идёт — клиент ждёт его конца (<c>job.status</c>), а не берёт этот ответ как итог.
+        /// </summary>
+        public string Job { get; set; }
+
+        /// <summary>
+        /// Команда изменила код или ассеты (сгенерировала файлы): после неё хаб ждёт импорта, компиляции и
+        /// перезагрузки домена и отдаёт клиенту итог компиляции — как <c>refresh</c>. Работает при коде 0.
+        /// </summary>
+        public bool WaitForEditor { get; set; }
+
         /// <summary>Были ошибки (<see cref="Error"/>).</summary>
         public bool HasErrors { get; private set; }
 

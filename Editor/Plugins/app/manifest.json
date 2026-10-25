@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "0a1f7c4e9b2d4f6a8c3e5d7b1a9f0e22",
   "id": "app",
-  "version": "3.7.1",
+  "version": "3.8.0",
   "typeName": "Exerussus.Nexus.Pages.App.AppPage",
   "kind": "servicing",
   "display": {
@@ -21,7 +21,7 @@
     {
       "name": "com.exerussus.app-core",
       "gitUrl": "https://github.com/exerussus/app-core.git",
-      "version": "6.0.0"
+      "version": "6.1.0"
     }
   ],
   "deploy": [
@@ -136,6 +136,10 @@
     {
       "from": "AnalyticsCommands.cs.txt",
       "to": "AnalyticsCommands.cs"
+    },
+    {
+      "from": "AppCommands.cs.txt",
+      "to": "AppCommands.cs"
     }
   ]
 }

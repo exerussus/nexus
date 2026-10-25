@@ -1,0 +1,344 @@
+// ============================================================
+//  AppCommands.cs — команды CLI для AppCore (app-core 6.1+): вью, раннер, генерация, консоль AppDeck.
+//    app.views        — вью: реестр, вёрстка, контроллер, объекты в сцене;
+//    app.create       — создать страницу / попап / фрагмент целиком (id → uxml → контроллер → объект в сцене);
+//    app.delete       — удалить вью (объекты, папку, id из реестра);
+//    app.uxml         — создать вёрстку вью по шаблону;
+//    app.controller   — сгенерировать и навесить контроллер;
+//    app.page.set     — «Назад», курсор, стартовая страница;
+//    app.generate     — NavTargets, Navigation.uss, .Elements.cs, привязка вью к канону;
+//    app.validate     — проверка раскладки (--fix — привести к канону);
+//    app.runner*      — AppRunner в сцене: показать, создать, расставить объекты (бутстраппер, экраны, …);
+//    app.deck         — выполнить команду консоли AppDeck (в Play) и вернуть её вывод.
+//
+//  Логика — в редакторе AppCore (AppViewTools, AppNavigation): страница только разбирает аргументы и печатает.
+//  Команда, поменявшая код (NavTargets, контроллер), просит хаб дождаться компиляции: клиент получит её итог.
+// ============================================================
+
+#if APPCORE_TOOLS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Deck;
+using Exerussus.AppCore.Editor;
+using Exerussus.AppCore.Views;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal static class AppCommands
+    {
+        // ============================================================ вью
+
+        [NexusCommand("app.views", "Вью AppCore: id, вёрстка, контроллер, объекты в сцене", Usage = "app.views [page|popup|fragment]")]
+        private static int Views(NexusCommandContext ctx)
+        {
+            ViewKind? only = ctx.Arg(0) != null ? Kind(ctx.Arg(0)) : null;
+            var data = new List<object>();
+            var runner = AppViewTools.TryFindRunner();
+            ctx.Print("раннер: " + (runner != null ? AppViewTools.PathOf(runner) : "нет в открытых сценах"));
+
+            foreach (var v in AppViewTools.ListViews())
+            {
+                if (only.HasValue && v.Kind != only.Value) continue;
+                var flags = new List<string>();
+                if (!v.Registered) flags.Add("нет в реестре");
+                if (!v.UxmlExists) flags.Add("нет uxml");
+                if (v.ControllerExists) flags.Add(v.ControllerCompiled ? "контроллер" : "контроллер не скомпилирован");
+                flags.Add(v.SceneObjects.Count == 0 ? "нет в сцене" : v.SceneObjects.Count == 1 ? "в сцене" : $"в сцене ×{v.SceneObjects.Count}");
+                ctx.Print($"{KindName(v.Kind),-8} {v.Id,-24} {string.Join(", ", flags)}");
+                data.Add(new
+                {
+                    kind = KindName(v.Kind), id = v.Id, registered = v.Registered, uxml = v.Uxml, uxmlExists = v.UxmlExists,
+                    controller = v.ControllerExists, controllerCompiled = v.ControllerCompiled, scene = v.SceneObjects,
+                });
+            }
+
+            if (data.Count == 0) ctx.Print("Вью нет.");
+            ctx.Data = new { runner = runner != null ? AppViewTools.PathOf(runner) : null, views = data };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("app.create", "Создать страницу / попап / фрагмент: id в реестре, uxml, контроллер, объект под AppRunner",
+            Usage = "app.create page|popup|fragment <id> [--controller] [--no-scene] [--in <страница|попап>] [--host <host-id>] " +
+                    "[--unmount-on-hide] [--default] [--back none|previous|page:<id>] [--cursor keep|lock|unlock] [--save]")]
+        private static int Create(NexusCommandContext ctx)
+        {
+            var kind = Kind(ctx.Arg(0));
+            var id = ctx.Arg(1) ?? throw new NexusCommandException("нужен id: app.create page main_menu");
+            if (EditorApplication.isPlaying) throw new NexusCommandException("Идёт Play — остановите: play.stop", NexusCommandContext.Exit.Failed);
+
+            var report = Run(() => AppViewTools.CreateView(kind, id, new AppViewTools.CreateOptions
+            {
+                Controller = ctx.Flag("controller"),
+                PlaceInScene = !ctx.Flag("no-scene"),
+                Owner = ctx.Get("in"),
+                HostId = ctx.Get("host"),
+                UnmountOnHide = ctx.Flag("unmount-on-hide"),
+                MakeDefault = ctx.Flag("default"),
+                SaveScene = ctx.Flag("save") && !ctx.Has("back") && !ctx.Has("cursor"),
+            }));
+
+            if (kind == ViewKind.Page && (ctx.Has("back") || ctx.Has("cursor")) && !ctx.Flag("no-scene"))
+            {
+                var options = Run(() => AppViewTools.SetPageOptions(id, ctx.Get("back"), ctx.Get("cursor"), false));
+                report.Lines.AddRange(options.Lines);
+                if (ctx.Flag("save")) SaveScenes(ctx);
+            }
+
+            return Finish(ctx, report, new { kind = KindName(kind), id, uxml = AppCorePaths.ViewUxmlPath(kind, id), controller = AppCorePaths.ControllerPath(kind, id) });
+        }
+
+        [NexusCommand("app.delete", "Удалить вью: объекты в сцене, папку вью, id из реестра (ссылки в коде — предупреждениями)",
+            Usage = "app.delete page|popup|fragment <id> [--keep-files] [--keep-id] [--strip-classes] [--force] [--in <владелец>] [--save]")]
+        private static int Delete(NexusCommandContext ctx)
+        {
+            var kind = Kind(ctx.Arg(0));
+            var id = ctx.Arg(1) ?? throw new NexusCommandException("нужен id");
+            if (EditorApplication.isPlaying) throw new NexusCommandException("Идёт Play — остановите: play.stop", NexusCommandContext.Exit.Failed);
+
+            var report = Run(() => AppViewTools.DeleteView(kind, id, new AppViewTools.DeleteOptions
+            {
+                Files = !ctx.Flag("keep-files"),
+                Unregister = !ctx.Flag("keep-id"),
+                StripClasses = ctx.Flag("strip-classes"),
+                Force = ctx.Flag("force"),
+                Owner = ctx.Get("in"),
+                SaveScene = ctx.Flag("save"),
+            }));
+            return Finish(ctx, report, new { kind = KindName(kind), id });
+        }
+
+        [NexusCommand("app.uxml", "Создать вёрстку вью по шаблону (Containers/Default.uxml или встроенный, со слоями)",
+            Usage = "app.uxml page|popup|fragment <id>")]
+        private static int Uxml(NexusCommandContext ctx)
+        {
+            var kind = Kind(ctx.Arg(0));
+            var id = ctx.Arg(1) ?? throw new NexusCommandException("нужен id");
+            if (!AppCoreAssets.GetIds(kind).Contains(id)) throw new NexusCommandException($"id «{id}» не зарегистрирован — app.create {KindName(kind)} {id} [--no-scene]", NexusCommandContext.Exit.Failed);
+            var existed = System.IO.File.Exists(AppCorePaths.ViewUxmlPath(kind, id));
+            if (!ViewScaffold.EnsureUxml(kind, id, out var path)) throw new NexusCommandException("Не удалось создать " + path, NexusCommandContext.Exit.Failed);
+            ctx.Print((existed ? "уже есть: " : "✓ ") + path);
+            ctx.Data = new { path, created = !existed };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("app.controller", "Сгенерировать контроллер вью (partial + .Elements.cs) и навесить на объект",
+            Usage = "app.controller page|popup|fragment <id>")]
+        private static int Controller(NexusCommandContext ctx)
+        {
+            var kind = Kind(ctx.Arg(0));
+            var id = ctx.Arg(1) ?? throw new NexusCommandException("нужен id");
+            if (!AppCoreAssets.GetIds(kind).Contains(id)) throw new NexusCommandException($"id «{id}» не зарегистрирован — app.create {KindName(kind)} {id}", NexusCommandContext.Exit.Failed);
+            var report = new AppViewTools.Report();
+            Run(() =>
+            {
+                AppViewTools.AddController(kind, id, null, report);
+                return report;
+            });
+            return Finish(ctx, report, new { kind = KindName(kind), id, path = AppCorePaths.ControllerPath(kind, id) });
+        }
+
+        [NexusCommand("app.page.set", "Настройки страницы: «Назад», курсор, стартовая",
+            Usage = "app.page.set <id> [--back none|previous|page:<id>] [--cursor keep|lock|unlock] [--default] [--save]")]
+        private static int PageSet(NexusCommandContext ctx)
+        {
+            var id = ctx.Arg(0) ?? throw new NexusCommandException("нужен id страницы");
+            if (!ctx.Has("back") && !ctx.Has("cursor") && !ctx.Flag("default")) throw new NexusCommandException("нечего менять: --back, --cursor или --default");
+            var report = Run(() => AppViewTools.SetPageOptions(id, ctx.Get("back"), ctx.Get("cursor"), ctx.Flag("default")));
+            if (ctx.Flag("save")) SaveScenes(ctx);
+            return Finish(ctx, report, new { id });
+        }
+
+        // ============================================================ генерация и проверка
+
+        [NexusCommand("app.generate", "Перегенерировать: записи навигации, Navigation.uss, NavTargets, .Elements.cs; вью — к канону",
+            Usage = "app.generate [--save]")]
+        private static int Generate(NexusCommandContext ctx)
+        {
+            var report = Run(AppViewTools.GenerateAll);
+            if (ctx.Flag("save") && report.SceneDirty) SaveScenes(ctx);
+            return Finish(ctx, report, null);
+        }
+
+        [NexusCommand("app.validate", "Проверка раскладки AppCore и вью открытых сцен; проблемы — код 1",
+            Usage = "app.validate [--fix] [--max 50]")]
+        private static int Validate(NexusCommandContext ctx)
+        {
+            if (ctx.Flag("fix"))
+            {
+                var fixReport = Run(AppViewTools.GenerateAll);
+                foreach (var line in fixReport.Lines) ctx.Print(line);
+                if (fixReport.NeedsCompile) ctx.WaitForEditor = true;
+            }
+
+            var issues = AppValidator.Collect();
+            var max = Math.Max(1, ctx.GetInt("max", 50));
+            var list = new List<string>();
+            foreach (var issue in issues) list.Add(issue.Message);
+            if (issues.Count == 0) ctx.Print("✓ Всё по канону.");
+            else ctx.Print($"✗ Проблем: {issues.Count}" + (ctx.Flag("fix") ? "" : " (привести вью к канону: app.validate --fix)"));
+            for (var i = 0; i < list.Count && i < max; i++) ctx.Print("  " + list[i]);
+            if (list.Count > max) ctx.Print($"  … ещё {list.Count - max}");
+            ctx.Data = new { issues = list };
+            return issues.Count == 0 ? NexusCommandContext.Exit.Ok : NexusCommandContext.Exit.Failed;
+        }
+
+        // ============================================================ раннер
+
+        [NexusCommand("app.runner", "AppRunner в сцене: поля, страницы (первая — стартовая), попапы, фрагменты", Usage = "app.runner")]
+        private static int Runner(NexusCommandContext ctx)
+        {
+            var runner = Run(AppViewTools.FindRunner);
+            ctx.Print(AppViewTools.PathOf(runner));
+
+            var so = new SerializedObject(runner);
+            var fields = new Dictionary<string, string>();
+            foreach (var name in AppViewTools.RunnerObjectFields)
+            {
+                var prop = so.FindProperty(name);
+                var value = prop != null && prop.objectReferenceValue != null ? prop.objectReferenceValue.GetType().Name + " (" + prop.objectReferenceValue.name + ")" : "—";
+                fields[name] = value;
+                ctx.Print($"  {name,-20} {value}");
+            }
+
+            var pages = new List<string>();
+            foreach (var p in runner.GetComponentsInChildren<AppPage>(true)) pages.Add(ViewBinding.GetId(p));
+            var popups = new List<string>();
+            foreach (var p in runner.GetComponentsInChildren<AppPopup>(true)) popups.Add(ViewBinding.GetId(p));
+            var fragments = new List<string>();
+            foreach (var f in runner.GetComponentsInChildren<AppFragment>(true)) fragments.Add((f.transform.parent != null ? f.transform.parent.name + "/" : "") + ViewBinding.GetId(f));
+
+            ctx.Print("страницы: " + (pages.Count == 0 ? "нет" : string.Join(", ", pages) + " (стартовая — " + pages[0] + ")"));
+            ctx.Print("попапы: " + (popups.Count == 0 ? "нет" : string.Join(", ", popups)));
+            ctx.Print("фрагменты: " + (fragments.Count == 0 ? "нет" : string.Join(", ", fragments)));
+            ctx.Data = new { path = AppViewTools.PathOf(runner), fields, pages, popups, fragments };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("app.runner.create", "Создать объект с AppRunner (и PanelRenderer) в активной сцене", Usage = "app.runner.create [--name App] [--save]")]
+        private static int RunnerCreate(NexusCommandContext ctx)
+        {
+            if (EditorApplication.isPlaying) throw new NexusCommandException("Идёт Play — остановите: play.stop", NexusCommandContext.Exit.Failed);
+            var report = new AppViewTools.Report();
+            Run(() => AppViewTools.CreateRunner(ctx.Get("name"), report));
+            if (ctx.Flag("save")) SaveScenes(ctx);
+            return Finish(ctx, report, new { path = report.ObjectPath });
+        }
+
+        [NexusCommand("app.runner.set", "Поставить объект в поле AppRunner: найти под раннером или создать (бутстраппер, экраны, ввод, сервисы)",
+            Usage = "app.runner.set bootstrapper|inputAdapter|appServiceRegistry|loadingScreen|errorScreen|criticalScreen [--type <класс>] [--save]")]
+        private static int RunnerSet(NexusCommandContext ctx)
+        {
+            var field = ctx.Arg(0) ?? throw new NexusCommandException("нужно поле: " + string.Join(", ", AppViewTools.RunnerObjectFields));
+            if (EditorApplication.isPlaying) throw new NexusCommandException("Идёт Play — остановите: play.stop", NexusCommandContext.Exit.Failed);
+            var report = new AppViewTools.Report();
+            var component = Run(() => AppViewTools.SetRunnerObject(field, ctx.Get("type"), report));
+            if (ctx.Flag("save")) SaveScenes(ctx);
+            return Finish(ctx, report, new { field, type = component.GetType().FullName, path = AppViewTools.PathOf(component) });
+        }
+
+        // ============================================================ AppDeck
+
+        [NexusCommand("app.deck", "Выполнить команду консоли AppDeck и вернуть вывод (команды регистрируются в Play); --list — список",
+            Usage = "app.deck \"<команда> [аргументы]; <ещё>\" | app.deck --list [--filter <подстрока>]")]
+        private static int Deck(NexusCommandContext ctx)
+        {
+            if (ctx.Flag("list"))
+            {
+                var filter = ctx.Get("filter");
+                var list = new List<object>();
+                foreach (var spec in AppDeck.ListCommands())
+                {
+                    if (!string.IsNullOrEmpty(filter) && spec.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    ctx.Print($"{spec.Signature,-40} {spec.Summary}");
+                    list.Add(new { name = spec.Name, signature = spec.Signature, summary = spec.Summary });
+                }
+
+                if (list.Count == 0) ctx.Print(EditorApplication.isPlaying ? "Команд нет." : "Команд нет — они регистрируются в Play: play.start");
+                ctx.Data = list;
+                return NexusCommandContext.Exit.Ok;
+            }
+
+            var line = string.Join(" ", ctx.Positional);
+            if (string.IsNullOrWhiteSpace(line)) throw new NexusCommandException("нужна команда: app.deck \"help\"");
+            if (!EditorApplication.isPlaying) ctx.Warn("Не Play: большинство команд AppDeck регистрируются при запуске игры.");
+
+            var ok = AppDeck.ExecuteCaptured(line, out var output, CommandSource.Code);
+            if (!string.IsNullOrEmpty(output)) ctx.Print(output.TrimEnd('\n'));
+            else if (ok) ctx.Print("✓ (без вывода)");
+            ctx.Data = new { ok, output };
+            return ok ? NexusCommandContext.Exit.Ok : NexusCommandContext.Exit.Failed;
+        }
+
+        // ============================================================ общее
+
+        private static ViewKind Kind(string raw)
+        {
+            switch ((raw ?? string.Empty).Trim().ToLowerInvariant())
+            {
+                case "page": case "pages": return ViewKind.Page;
+                case "popup": case "popups": return ViewKind.Popup;
+                case "fragment": case "fragments": return ViewKind.Fragment;
+                default: throw new NexusCommandException("вид: page, popup или fragment");
+            }
+        }
+
+        private static string KindName(ViewKind kind) => kind switch
+        {
+            ViewKind.Popup => "popup",
+            ViewKind.Fragment => "fragment",
+            _ => "page",
+        };
+
+        private static T Run<T>(Func<T> action)
+        {
+            try
+            {
+                return action();
+            }
+            catch (AppToolException e)
+            {
+                throw new NexusCommandException(e.Message, NexusCommandContext.Exit.Failed);
+            }
+        }
+
+        private static void SaveScenes(NexusCommandContext ctx)
+        {
+            // изменённая сцена без пути открыла бы модальный «Save As» и заблокировала редактор
+            for (var i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++)
+            {
+                var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (scene.isDirty && string.IsNullOrEmpty(scene.path))
+                {
+                    ctx.Warn("Есть изменённая сцена без пути — сохраните её с именем (scene.save --as Assets/…/Имя.unity).");
+                    return;
+                }
+            }
+
+            if (UnityEditor.SceneManagement.EditorSceneManager.SaveOpenScenes()) ctx.Print("✓ сцены сохранены");
+            else ctx.Warn("Сцены не сохранены.");
+        }
+
+        private static int Finish(NexusCommandContext ctx, AppViewTools.Report report, object data)
+        {
+            foreach (var line in report.Lines) ctx.Print(line);
+            foreach (var warning in report.Warnings) ctx.Warn(warning);
+            if (report.SceneDirty) ctx.Print("сцена изменена и не сохранена — nexus save (или --save)");
+
+            // код поменялся — клиент дождётся компиляции и перезагрузки и получит их итог
+            if (report.NeedsCompile)
+            {
+                ctx.WaitForEditor = true;
+                ctx.Print("… жду компиляцию");
+            }
+
+            ctx.Data = new { result = data, needsCompile = report.NeedsCompile, sceneDirty = report.SceneDirty, warnings = report.Warnings, lines = report.Lines };
+            return NexusCommandContext.Exit.Ok;
+        }
+    }
+}
+#endif

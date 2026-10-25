@@ -8,7 +8,8 @@ using UnityEditor;
 namespace Exerussus.Nexus.Core
 {
     /// <summary>
-    /// Команды CLI: встроенные (<c>help</c>, <c>ping</c>) и методы с <see cref="NexusCommandAttribute"/> в
+    /// Команды CLI: встроенные (<c>help</c>, <c>ping</c>), команды управления редактором ядра (<c>status</c>,
+    /// <c>refresh</c>, <c>logs</c>, <c>play.*</c>, …) и методы с <see cref="NexusCommandAttribute"/> в
     /// скомпилированном коде. Без кэша: TypeCache Unity и так держит индекс домена, список собирается на вызов.
     /// </summary>
     public static class NexusCommands
@@ -38,6 +39,7 @@ namespace Exerussus.Nexus.Core
                 if (attr == null || string.IsNullOrWhiteSpace(attr.Name)) continue;
 
                 var source = method.DeclaringType != null ? method.DeclaringType.Assembly.GetName().Name : "?";
+                if (source.StartsWith("Exerussus.Nexus.", StringComparison.Ordinal) && !source.StartsWith("Exerussus.Nexus.Pages.", StringComparison.Ordinal)) source = "nexus";
                 var run = Bind(method, out var problem);
                 if (run == null)
                 {

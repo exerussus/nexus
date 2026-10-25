@@ -1,0 +1,32 @@
+{
+    "name": "Exerussus.Nexus.TestRunner",
+    "rootNamespace": "Exerussus.Nexus.TestRunner",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "Exerussus.Nexus.Core",
+        "Exerussus.Nexus.Deployment",
+        "UnityEditor.TestRunner",
+        "UnityEngine.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "NEXUS_TEST_FRAMEWORK"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.test-framework",
+            "expression": "1.1.0",
+            "define": "NEXUS_TEST_FRAMEWORK"
+        }
+    ],
+    "noEngineReferences": false
+}

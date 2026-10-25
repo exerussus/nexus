@@ -1,8 +1,12 @@
 ﻿# Nexus CLI: команды в открытый редактор Unity с Nexus.
-# nexus-cli-version: 2
+# nexus-cli-version: 3
 #
 #   nexus list                                         открытые проекты
-#   nexus [--project <имя|путь>] [--json] [--timeout <с>] <команда> [аргументы]
+#   nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] <команда> [аргументы]
+#
+# Долгие команды (refresh, compile, play.start, tests.run, …) идут заданиями редактора: клиент ждёт их конца,
+# в том числе через перезагрузку домена (файл экземпляра в это время помечен reloading). --no-wait — не ждать,
+# только напечатать id задания (потом: nexus job.status <id>). --timeout — общий срок ожидания, с.
 #
 # Проект выбирается явно: --project (имя папки проекта или путь, можно часть пути), иначе — проект,
 # в папке которого вы стоите. Если подходит несколько или ни одного — ошибка со списком.
@@ -46,7 +50,10 @@ function Get-Instances {
 
 function Show-Instances($list) {
     if ($list.Count -eq 0) { Write-Err 'Нет открытых редакторов с Nexus CLI.'; return }
-    foreach ($i in $list) { Write-Output ('{0,-24} {1}  (Unity {2}, порт {3})' -f $i.project, $i.path, $i.unity, $i.port) }
+    foreach ($i in $list) {
+        $state = if ($i.state -eq 'reloading') { 'перезагружается' } else { "порт $($i.port)" }
+        Write-Output ('{0,-24} {1}  (Unity {2}, {3})' -f $i.project, $i.path, $i.unity, $state)
+    }
 }
 
 function Resolve-Target($list, [string]$project) {
@@ -105,6 +112,7 @@ function Send-Command($instance, [string]$command, [string[]]$arguments, [int]$t
 $project = $null
 $json = $false
 $timeout = 600
+$noWait = $false
 $script:Sent = $false
 $rest = New-Object System.Collections.Generic.List[string]
 for ($k = 0; $k -lt $args.Count; $k++) {
@@ -112,12 +120,13 @@ for ($k = 0; $k -lt $args.Count; $k++) {
     if ($rest.Count -eq 0 -and $a -eq '--project' -and $k + 1 -lt $args.Count) { $project = [string]$args[++$k]; continue }
     if ($rest.Count -eq 0 -and $a -eq '--json') { $json = $true; continue }
     if ($rest.Count -eq 0 -and $a -eq '--timeout' -and $k + 1 -lt $args.Count) { $timeout = [Math]::Max(1, [int]$args[++$k]); continue }
+    if ($rest.Count -eq 0 -and $a -eq '--no-wait') { $noWait = $true; continue }
     $rest.Add($a)
 }
 
 if ($rest.Count -eq 0) {
     Write-Output 'nexus list'
-    Write-Output 'nexus [--project <имя|путь>] [--json] [--timeout <с>] <команда> [аргументы]'
+    Write-Output 'nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] <команда> [аргументы]'
     Write-Output 'nexus --project <имя> help       — команды проекта'
     Finish 2
 }
@@ -135,36 +144,88 @@ $command = $rest[0]
 $arguments = @()
 if ($rest.Count -gt 1) { $arguments = $rest.GetRange(1, $rest.Count - 1).ToArray() }
 
-# редактор мог перекомпилироваться: перечитать файл экземпляра и повторить (до ~60 с)
-$response = $null
-$deadline = (Get-Date).AddSeconds(60)
-while ($true) {
-    try {
-        $response = Send-Command $target $command $arguments $timeout
-    } catch {
+# общий срок: и на перезагрузку редактора, и на ожидание задания
+$deadline = (Get-Date).AddSeconds($timeout)
+$script:Waiting = $false
+
+# Один запрос с ожиданием занятого редактора: перезагрузка домена (reloading), отказ в связи, «занят», устаревший
+# токен — ждём и перечитываем файл экземпляра. $readOnly — запрос можно повторить, даже если он ушёл без ответа.
+function Invoke-Editor([string]$cmd, [string[]]$cmdArgs, [bool]$readOnly, [datetime]$until, [int]$serverWait) {
+    while ($true) {
         $response = $null
+        $script:Sent = $false
+        if ($script:target.state -ne 'reloading' -and $script:target.port) {
+            try { $response = Send-Command $script:target $cmd $cmdArgs $serverWait } catch { $response = $null }
+            if ($null -eq $response -and $script:Sent -and -not $readOnly) {
+                Write-Err "Нет ответа от редактора $($script:target.project): команда могла выполниться — не повторяю."
+                Finish 12
+            }
+        }
+
+        # 5 без задания на опросе — главный поток занят дольше ожидания сервера (долгий импорт, тест): ждать дальше
+        $busy = ($null -eq $response) -or ($response.exitCode -eq 6) -or ($response.output -like 'Неверный токен*') -or
+            ($readOnly -and $response.exitCode -eq 5 -and -not $response.job)
+        if (-not $busy) { return $response }
+        if ((Get-Date) -gt $until) { return $response }
+
+        # сообщение — один раз за ожидание: не засорять вывод
+        if (-not $script:Waiting) {
+            if ($script:target.state -eq 'reloading') { Write-Err 'Редактор перезагружает домен — жду…' } else { Write-Err 'Редактор занят — жду…' }
+            $script:Waiting = $true
+        }
+        Start-Sleep -Milliseconds 1000
+        $fresh = @(Get-Instances | Where-Object { (Normalize $_.path) -eq (Normalize $script:target.path) })
+        if ($fresh.Count -eq 1) { $script:target = $fresh[0] }
+        elseif ($fresh.Count -eq 0) {
+            # файл мог быть на миг недоступен (редактор его переписывает): закрылся — только если процесс умер
+            if (-not ($script:target.pid -and (Get-Process -Id $script:target.pid -ErrorAction SilentlyContinue))) {
+                Write-Err "Редактор $($script:target.project) закрылся."; Finish 10
+            }
+        }
     }
-
-    if ($null -eq $response -and $script:Sent) {
-        Write-Err "Нет ответа от редактора $($target.project): команда могла выполниться — не повторяю."
-        Finish 12
-    }
-
-    $busy = ($null -eq $response) -or ($response.exitCode -eq 6) -or ($response.output -like 'Неверный токен*')
-    if (-not $busy -or (Get-Date) -gt $deadline) { break }
-
-    Write-Err 'Редактор занят (перекомпиляция?) — жду…'
-    Start-Sleep -Seconds 2
-    $fresh = @(Get-Instances | Where-Object { (Normalize $_.path) -eq (Normalize $target.path) })
-    if ($fresh.Count -eq 1) { $target = $fresh[0] }
 }
 
-if ($null -eq $response) { Write-Err "Нет связи с редактором $($target.project) (порт $($target.port))."; Finish 12 }
-
-if ($json) {
-    if ($response.result) { Write-Output $response.result } else { $response | ConvertTo-Json -Depth 6 -Compress }
-} elseif ($response.output) {
-    Write-Output ($response.output.TrimEnd("`n"))
+function Write-Response($r) {
+    if ($json) {
+        if ($r.result) { Write-Output $r.result } else { $r | ConvertTo-Json -Depth 6 -Compress }
+    } elseif ($r.output) {
+        Write-Output ($r.output.TrimEnd("`n"))
+    }
 }
 
+$script:target = $target
+$firstUntil = (Get-Date).AddSeconds([Math]::Min($timeout, 300))
+$response = Invoke-Editor $command $arguments $false $firstUntil $timeout
+if ($null -eq $response) { Write-Err "Нет связи с редактором $($script:target.project)."; Finish 12 }
+
+if ($response.pending -and $response.job) {
+    $job = [string]$response.job
+    if (-not $json -and $response.output) { Write-Output ($response.output.TrimEnd("`n")) }
+    if ($noWait) {
+        Write-Output "задание $job запущено: nexus job.status $job"
+        Finish 0
+    }
+
+    # ждём задание: каждый опрос короткий и безопасен для повтора
+    $lastPhase = ''
+    while ($true) {
+        if ((Get-Date) -gt $deadline) { Write-Err "Задание $job ещё идёт (срок --timeout $timeout с): nexus job.status $job"; Finish 5 }
+        Start-Sleep -Milliseconds 700
+        $script:Waiting = $false
+        $r = Invoke-Editor 'job.status' @($job) $true $deadline 30
+        if ($null -eq $r) { continue }
+        if ($r.pending) {
+            $phase = ''
+            try { if ($r.result) { $phase = [string](($r.result | ConvertFrom-Json).phase) } } catch { }
+            if ($phase -and $phase -ne $lastPhase -and -not $json) { Write-Err "… $phase"; $lastPhase = $phase }
+            continue
+        }
+        $response = $r
+        break
+    }
+    Write-Response $response
+    Finish ([int]$response.exitCode)
+}
+
+Write-Response $response
 Finish ([int]$response.exitCode)

@@ -5,6 +5,7 @@
         "Exerussus.Nexus.Abstractions",
         "Exerussus.AppCore",
         "Exerussus.AppCore.Editor",
+        "Exerussus.AppCore.Deck",
         "Exerussus.AppCore.Audio",
         "Exerussus.AppCore.Audio.Editor",
         "Exerussus.AppCore.Analytics",
@@ -29,6 +30,11 @@
             "name": "com.exerussus.app-core",
             "expression": "5.0.0",
             "define": "APPCORE_ANALYTICS"
+        },
+        {
+            "name": "com.exerussus.app-core",
+            "expression": "6.1.0",
+            "define": "APPCORE_TOOLS"
         }
     ],
     "noEngineReferences": false

@@ -28,6 +28,12 @@ namespace Exerussus.Nexus.Core
         public int Pid;
         public string Unity;
         public string Started;
+
+        /// <summary>
+        /// <c>ready</c> — принимает команды; <c>reloading</c> — редактор перезагружает домен (порта и токена нет):
+        /// клиент ждёт и перечитывает файл, а не считает редактор закрытым.
+        /// </summary>
+        public string State = "ready";
     }
 
     /// <summary>
@@ -37,11 +43,13 @@ namespace Exerussus.Nexus.Core
     /// <remarks>
     /// <para>Работает, только пока включён (<see cref="NexusCliStore.Enabled"/>): выключен — ни потока, ни сокета,
     /// ни подписки на update, ни файла экземпляра.</para>
-    /// <para>Перед перекомпиляцией и при выходе из редактора останавливается и удаляет файлы экземпляра;
-    /// после перезагрузки домена поднимается снова с новым портом и токеном. Ждущие команды получают
-    /// «редактор занят» (<see cref="NexusCommandContext.Exit.Busy"/>).</para>
+    /// <para>Перед перезагрузкой домена останавливается и помечает файл экземпляра <c>reloading</c> (клиент ждёт);
+    /// после неё поднимается снова с новым портом и токеном. При выходе и выключении файлы экземпляра удаляются.
+    /// Ждущие команды получают «редактор занят» (<see cref="NexusCommandContext.Exit.Busy"/>).</para>
+    /// <para>Вместе с сервером живут его компоненты: буфер лога (<see cref="NexusLogBuffer"/>), итог компиляции
+    /// (<see cref="NexusCompileLog"/>) и задания (<see cref="NexusCliJobs"/>) — выключен сервер, выключены и они.</para>
     /// <para>Безопасность: только loopback, токен на каждый запрос (лежит в файле экземпляра в профиле
-    /// пользователя), лимит запроса 1 МБ, таймаут чтения 10 с.</para>
+    /// пользователя), лимит запроса 1 МБ, таймаут чтения 3 с.</para>
     /// </remarks>
     [InitializeOnLoad]
     public static class NexusCliServer
@@ -80,6 +88,10 @@ namespace Exerussus.Nexus.Core
             public string Output;
             public string Result;
             public string Project;
+
+            /// <summary>Команда продолжается заданием: клиент ждёт его через <c>job.status</c>.</summary>
+            public string Job;
+            public bool Pending;
         }
 
         private sealed class Pending
@@ -88,6 +100,8 @@ namespace Exerussus.Nexus.Core
             public readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
             public int ExitCode;
             public string Result;
+            public string Job;
+            public bool JobRunning;
         }
 
         // ---- состояние сервера: живёт, пока он запущен ----
@@ -113,12 +127,40 @@ namespace Exerussus.Nexus.Core
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeReload;
             EditorApplication.quitting += OnQuitting;
 
+            // сервер был запущен до перезагрузки — лог и итог компиляции подхватываются сразу, ещё до delayCall:
+            // иначе ошибки Awake/Start первого кадра Play и [InitializeOnLoad] пропадут
+            if (!IsServiceProcess && SessionState.GetBool(ActiveKey, false))
+            {
+                SafeDeactivate(NexusLogBuffer.Activate);
+                SafeDeactivate(NexusCompileLog.Activate);
+            }
+
             // старт — после загрузки домена, не в статическом конструкторе (там ещё рано трогать диск и настройки)
             EditorApplication.delayCall += () =>
             {
                 if (IsServiceProcess) return;
                 if (NexusCliStore.Enabled) Start();
+                if (!_running) Cleanup();
             };
+        }
+
+        private const string ActiveKey = "Exerussus.Nexus.Cli.Active";
+
+        /// <summary>Сервер работал в этой сессии редактора (переживает перезагрузку домена).</summary>
+        public static bool ActiveInSession => SessionState.GetBool(ActiveKey, false);
+
+        /// <summary>
+        /// Сервер не поднялся (выключен или ошибка): убрать «reloading»-файл экземпляра, иначе клиент ждал бы
+        /// закрытый для команд редактор, и стереть следы компонентов («off means off»).
+        /// </summary>
+        private static void Cleanup()
+        {
+            Snapshot();
+            SessionState.EraseBool(ActiveKey);
+            NexusCliStore.DeleteInstance(new NexusCliInstance { Path = _projectPath });
+            SafeDeactivate(() => NexusLogBuffer.Deactivate(false));
+            SafeDeactivate(() => NexusCompileLog.Deactivate(false));
+            SafeDeactivate(() => NexusCliJobs.Deactivate(false));
         }
 
         public static bool Running => _running;
@@ -169,23 +211,29 @@ namespace Exerussus.Nexus.Core
                     };
                     NexusCliStore.WriteInstance(_instance);
                     NexusCliStore.InstallClient();
+
+                    SessionState.SetBool(ActiveKey, true);
+                    NexusLogBuffer.Activate();
+                    NexusCompileLog.Activate();
+                    NexusCliJobs.Activate();
                     NexusDiagnostics.Trace("CLI", $"сервер слушает 127.0.0.1:{_port}");
                 }
                 catch (Exception e)
                 {
                     NexusDiagnostics.Error("CLI: сервер не запустился", e);
-                    StopLocked("не запустился");
+                    StopLocked("не запустился", false);
                 }
             }
         }
 
         public static void Stop()
         {
-            lock (Gate) StopLocked("остановлен");
+            lock (Gate) StopLocked("остановлен", false);
         }
 
-        private static void StopLocked(string reason)
+        private static void StopLocked(string reason, bool reloading)
         {
+            var wasRunning = _running;
             _running = false;
 
             try
@@ -214,20 +262,56 @@ namespace Exerussus.Nexus.Core
                 p.Done.Set();
             }
 
-            if (_instance != null) NexusCliStore.DeleteInstance(_instance);
+            if (_instance != null)
+            {
+                if (reloading)
+                {
+                    // файл остаётся: редактор жив и вернётся с новым портом — клиент подождёт
+                    _instance.State = "reloading";
+                    _instance.Port = 0;
+                    _instance.Token = null;
+                    NexusCliStore.WriteInstance(_instance);
+                }
+                else
+                {
+                    NexusCliStore.DeleteInstance(_instance);
+                }
+            }
+
             _instance = null;
+
+            if (!reloading) SessionState.EraseBool(ActiveKey);
+
+            if (wasRunning)
+            {
+                SafeDeactivate(() => NexusCliJobs.Deactivate(reloading));
+                SafeDeactivate(() => NexusCompileLog.Deactivate(reloading));
+                SafeDeactivate(() => NexusLogBuffer.Deactivate(reloading));
+            }
             _token = null;
             _port = 0;
         }
 
         private static void OnBeforeReload()
         {
-            lock (Gate) StopLocked("перекомпилирует скрипты");
+            lock (Gate) StopLocked("перезагружает домен", true);
         }
 
         private static void OnQuitting()
         {
-            lock (Gate) StopLocked("закрывается");
+            lock (Gate) StopLocked("закрывается", false);
+        }
+
+        private static void SafeDeactivate(Action stop)
+        {
+            try
+            {
+                stop();
+            }
+            catch (Exception e)
+            {
+                NexusDiagnostics.Error("CLI: остановка компонента", e);
+            }
         }
 
         private static void Snapshot()
@@ -392,6 +476,8 @@ namespace Exerussus.Nexus.Core
             response.Ok = pending.ExitCode == NexusCommandContext.Exit.Ok;
             response.Output = pending.Context.Output;
             response.Result = pending.Result;
+            response.Job = pending.Job;
+            response.Pending = pending.JobRunning;
             return response;
         }
 
@@ -437,8 +523,13 @@ namespace Exerussus.Nexus.Core
                     continue;
                 }
 
+                var generation = NexusCompileLog.Generation;
                 p.ExitCode = NexusCommands.Execute(p.Context);
+                if (p.ExitCode == NexusCommandContext.Exit.Ok && p.Context.WaitForEditor && p.Context.Job == null)
+                    NexusEditorCommands.StartSettle(p.Context, generation);
                 p.Result = Serialize(p.Context.Data, p.Context);
+                p.Job = p.Context.Job;
+                p.JobRunning = p.Job != null && NexusCliJobs.IsRunning(p.Job);
                 p.Done.Set();
             }
         }
@@ -592,8 +683,25 @@ namespace Exerussus.Nexus.Core
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path) ?? ".");
                 var temp = path + ".tmp";
                 File.WriteAllText(temp, JsonConvert.SerializeObject(instance, JsonIo.Settings), new UTF8Encoding(false));
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(temp, path);
+
+                // замена без окна «файла нет»: клиент читает его в любой момент; занят клиентом — повторить
+                for (var attempt = 0; ; attempt++)
+                {
+                    try
+                    {
+                        if (File.Exists(path)) File.Replace(temp, path, null);
+                        else File.Move(temp, path);
+                        break;
+                    }
+                    catch (IOException) when (attempt < 5)
+                    {
+                        Thread.Sleep(20);
+                    }
+                    catch (UnauthorizedAccessException) when (attempt < 5)
+                    {
+                        Thread.Sleep(20);
+                    }
+                }
             }
             catch (Exception e)
             {

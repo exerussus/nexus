@@ -206,7 +206,7 @@ namespace Exerussus.Nexus.Pages.App
             }
 
             var pages = new List<string>();
-            foreach (var p in runner.GetComponentsInChildren<AppPage>(true)) pages.Add(ViewBinding.GetId(p));
+            foreach (var p in runner.GetComponentsInChildren<Exerussus.AppCore.Views.AppPage>(true)) pages.Add(ViewBinding.GetId(p));
             var popups = new List<string>();
             foreach (var p in runner.GetComponentsInChildren<AppPopup>(true)) popups.Add(ViewBinding.GetId(p));
             var fragments = new List<string>();

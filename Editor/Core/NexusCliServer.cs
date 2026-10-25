@@ -29,9 +29,16 @@ namespace Exerussus.Nexus.Core
         public string Unity;
         public string Started;
 
+        /// <summary>Editor Bridge под Nexus Daemon (протокол демона): демон обслуживает только такие редакторы.</summary>
+        public int DaemonProtocol = 1;
+
+        /// <summary>Editor.log этого редактора — для диагноза сторожа демона.</summary>
+        public string Log;
+
         /// <summary>
         /// <c>ready</c> — принимает команды; <c>reloading</c> — редактор перезагружает домен (порта и токена нет):
-        /// клиент ждёт и перечитывает файл, а не считает редактор закрытым.
+        /// клиент ждёт и перечитывает файл, а не считает редактор закрытым; <c>closed</c> — редактор закрыт, CLI
+        /// в проекте включён (демон знает проект).
         /// </summary>
         public string State = "ready";
     }
@@ -88,6 +95,9 @@ namespace Exerussus.Nexus.Core
 
             /// <summary>Пройти блокировку идущей задачи.</summary>
             public bool Force;
+
+            /// <summary>Кто прислал: <c>nexusd</c> — демон. Прямой TCP мимо демона — только с настройкой directTcp.</summary>
+            public string Client;
         }
 #pragma warning restore 0649
 
@@ -136,6 +146,7 @@ namespace Exerussus.Nexus.Core
         private static string _projectName;
         private static string _unity;
         private static int _pid;
+        private static string _log;
 
         static NexusCliServer()
         {
@@ -149,16 +160,17 @@ namespace Exerussus.Nexus.Core
                 SafeDeactivate(NexusLogBuffer.Activate);
                 SafeDeactivate(NexusCompileLog.Activate);
                 // метка «домен загружен»: застрянет до «ready» — видно, что сервер не дошёл до старта
-                NexusCliWatchdog.MarkDomain("loaded");
-                NexusCliWatchdog.Ensure(); // сторож нужен до delayCall: именно там застревает «loaded»
+                NexusCliDomainMarks.MarkDomain("loaded");
             }
 
             // старт — после загрузки домена, не в статическом конструкторе (там ещё рано трогать диск и настройки)
             EditorApplication.delayCall += () =>
             {
                 if (IsServiceProcess) return;
-                if (NexusCliStore.Enabled) Start();
-                if (!_running) Cleanup();
+                var enabled = NexusCliStore.Enabled;
+                if (enabled) Start();
+                // выключен — стереть всё; включён, но не поднялся — оставить метки и ошибку старта для диагноза
+                if (!_running) Cleanup(!enabled);
             };
         }
 
@@ -171,7 +183,7 @@ namespace Exerussus.Nexus.Core
         /// Сервер не поднялся (выключен или ошибка): убрать «reloading»-файл экземпляра, иначе клиент ждал бы
         /// закрытый для команд редактор, и стереть следы компонентов («off means off»).
         /// </summary>
-        private static void Cleanup()
+        private static void Cleanup(bool wipeChannel)
         {
             Snapshot();
             SessionState.EraseBool(ActiveKey);
@@ -179,7 +191,14 @@ namespace Exerussus.Nexus.Core
             SafeDeactivate(() => NexusLogBuffer.Deactivate(false));
             SafeDeactivate(() => NexusCompileLog.Deactivate(false));
             SafeDeactivate(() => NexusCliJobs.Deactivate(false));
-            SafeDeactivate(() => NexusCliFileChannel.Deactivate(false));
+            if (wipeChannel) SafeDeactivate(DeleteChannel);
+        }
+
+        /// <summary>CLI выключен — папка канала демона в проекте удаляется («выключено — значит выключено»).</summary>
+        private static void DeleteChannel()
+        {
+            var dir = NexusTempPaths.Cli;
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
         }
 
         public static bool Running => _running;
@@ -230,7 +249,7 @@ namespace Exerussus.Nexus.Core
 
                     _instance = new NexusCliInstance
                     {
-                        Project = _projectName, Path = _projectPath, Port = _port, Token = _token, Pid = _pid, Unity = _unity,
+                        Project = _projectName, Path = _projectPath, Port = _port, Token = _token, Pid = _pid, Unity = _unity, Log = _log,
                         Started = DateTime.UtcNow.ToString("o"),
                     };
                     NexusCliStore.WriteInstance(_instance);
@@ -240,16 +259,15 @@ namespace Exerussus.Nexus.Core
                     NexusLogBuffer.Activate();
                     NexusCompileLog.Activate();
                     NexusCliJobs.Activate();
-                    NexusCliFileChannel.Activate();
-                    NexusCliWatchdog.ClearStartupError();
-                    NexusCliWatchdog.MarkDomain("ready");
-                    NexusCliWatchdog.Ensure();
+                    NexusCliDomainMarks.ClearStartupError();
+                    NexusCliDomainMarks.MarkDomain("ready");
+                    NexusCliDaemon.Ensure();
                     NexusDiagnostics.Trace("CLI", $"сервер слушает 127.0.0.1:{_port}");
                 }
                 catch (Exception e)
                 {
                     NexusDiagnostics.Error("CLI: сервер не запустился", e);
-                    NexusCliWatchdog.MarkStartupError(e);
+                    NexusCliDomainMarks.MarkStartupError(e);
                     StopLocked("не запустился", false);
                 }
             }
@@ -257,10 +275,10 @@ namespace Exerussus.Nexus.Core
 
         public static void Stop()
         {
-            lock (Gate) StopLocked("остановлен", false);
+            lock (Gate) StopLocked("остановлен", false, wipeChannel: true);
         }
 
-        private static void StopLocked(string reason, bool reloading)
+        private static void StopLocked(string reason, bool reloading, bool closing = false, bool wipeChannel = false)
         {
             var wasRunning = _running;
             _running = false;
@@ -301,6 +319,14 @@ namespace Exerussus.Nexus.Core
                     _instance.Token = null;
                     NexusCliStore.WriteInstance(_instance);
                 }
+                else if (closing)
+                {
+                    // редактор закрывается, CLI включён: файл остаётся «closed» — демон знает проект и не выходит
+                    _instance.State = "closed";
+                    _instance.Port = 0;
+                    _instance.Token = null;
+                    NexusCliStore.WriteInstance(_instance);
+                }
                 else
                 {
                     NexusCliStore.DeleteInstance(_instance);
@@ -311,7 +337,7 @@ namespace Exerussus.Nexus.Core
 
             if (!reloading) SessionState.EraseBool(ActiveKey);
 
-            SafeDeactivate(() => NexusCliFileChannel.Deactivate(reloading));
+            if (wipeChannel) SafeDeactivate(DeleteChannel);
 
             if (wasRunning)
             {
@@ -325,17 +351,13 @@ namespace Exerussus.Nexus.Core
 
         private static void OnBeforeReload()
         {
-            if (_running)
-            {
-                NexusCliWatchdog.MarkDomain("reloading");
-                NexusCliWatchdog.Ensure(); // перезагрузку должен видеть живой сторож — запускаем ещё старым доменом
-            }
+            if (_running) NexusCliDomainMarks.MarkDomain("reloading");
             lock (Gate) StopLocked("перезагружает домен", true);
         }
 
         private static void OnQuitting()
         {
-            lock (Gate) StopLocked("закрывается", false);
+            lock (Gate) StopLocked("закрывается", false, true);
         }
 
         private static void SafeDeactivate(Action stop)
@@ -356,6 +378,14 @@ namespace Exerussus.Nexus.Core
             _projectPath = NexusPaths.ProjectRoot;
             _projectName = System.IO.Path.GetFileName(_projectPath.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar));
             _unity = Application.unityVersion;
+            try
+            {
+                _log = Application.consoleLogPath;
+            }
+            catch
+            {
+                _log = null; // не во всех режимах редактора есть лог
+            }
             using (var p = Process.GetCurrentProcess()) _pid = p.Id;
         }
 
@@ -444,7 +474,7 @@ namespace Exerussus.Nexus.Core
                     var stream = client.GetStream();
 
                     var line = ReadLine(stream);
-                    var response = Handle(line);
+                    var response = Handle(line, stream);
                     var bytes = new UTF8Encoding(false).GetBytes(JsonConvert.SerializeObject(response, Formatting.None, Wire) + "\n");
                     stream.Write(bytes, 0, bytes.Length);
                     stream.Flush();
@@ -456,11 +486,29 @@ namespace Exerussus.Nexus.Core
             }
         }
 
-        private static Response Handle(string line)
+        private static readonly byte[] Ack = new UTF8Encoding(false).GetBytes("{\"ack\":true}\n");
+
+        private static Response Handle(string line, NetworkStream stream)
         {
             if (!TryParse(line, out var request, out var error)) return error;
 
             var pending = new Pending { Request = request, Context = NewContext(request) };
+
+            // демону — подтверждение приёма ДО постановки в очередь: оборвалось до него — команда точно не
+            // выполнялась (демон повторит); не записалось — в очередь не ставим
+            if (string.Equals(request.Client, "nexusd", StringComparison.Ordinal))
+            {
+                try
+                {
+                    stream.Write(Ack, 0, Ack.Length);
+                    stream.Flush();
+                }
+                catch (Exception e)
+                {
+                    NexusDiagnostics.Swallowed("CLI: подтверждение приёма", e);
+                    return new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = "Соединение оборвалось.", Project = _projectName };
+                }
+            }
 
             // проверка и постановка — под тем же замком, что и остановка: иначе команда могла бы застрять в очереди
             lock (Gate)
@@ -518,6 +566,17 @@ namespace Exerussus.Nexus.Core
                 return false;
             }
 
+            // команды идут через Nexus Daemon (блокировка задач, очередь, будильник); прямой TCP — только для отладки
+            if (!string.Equals(request.Client, "nexusd", StringComparison.Ordinal) && !NexusCliStore.DirectTcp)
+            {
+                error = new Response
+                {
+                    Id = request.Id, ExitCode = NexusCommandContext.Exit.Usage, Project = _projectName,
+                    Output = "Прямой TCP к редактору выключен: команды идут через Nexus Daemon (клиент nexus 5+). Для отладки: nexus-cli.json → DirectTcp.",
+                };
+                return false;
+            }
+
             return true;
         }
 
@@ -531,16 +590,7 @@ namespace Exerussus.Nexus.Core
         internal static int RunCommand(NexusCommandContext ctx)
         {
             var generation = NexusCompileLog.Generation;
-            NexusCliFileChannel.Note("команда " + ctx.Name);
-            int exit;
-            try
-            {
-                exit = NexusCommands.Execute(ctx);
-            }
-            finally
-            {
-                NexusCliFileChannel.Note(null);
-            }
+            var exit = NexusCommands.Execute(ctx);
 
             if (exit == NexusCommandContext.Exit.Ok && ctx.RetryReason != null && ctx.Job == null)
             {
@@ -618,8 +668,18 @@ namespace Exerussus.Nexus.Core
 
         // ============================================================ главный поток
 
+        private static double _nextDaemonCheck;
+
         private static void Pump()
         {
+            // демон мог упасть или выйти по простою, пока редактор открыт: проверка раз в 30 с (дешёвая — файл и pid)
+            var now = EditorApplication.timeSinceStartup;
+            if (now >= _nextDaemonCheck)
+            {
+                _nextDaemonCheck = now + 30;
+                NexusCliDaemon.Ensure();
+            }
+
             while (Queue.TryDequeue(out var p))
             {
                 if (p.Context.Cancelled)
@@ -641,8 +701,6 @@ namespace Exerussus.Nexus.Core
 
                 p.Done.Set();
             }
-
-            NexusCliFileChannel.Tick();
         }
 
         private static string Serialize(object data, NexusCommandContext ctx)
@@ -672,7 +730,16 @@ namespace Exerussus.Nexus.Core
 
             /// <summary>Будильник сторожа: off | soft | focus (см. <see cref="Wake"/>).</summary>
             public string Wake = "soft";
+
+            /// <summary>Пускать TCP-запросы мимо демона (отладка, клиенты 1.x). По умолчанию выключено.</summary>
+            public bool DirectTcp;
         }
+
+        /// <summary>
+        /// Прямой TCP к редактору мимо демона (личная настройка, для отладки). Выключено — команды принимаются только
+        /// от Nexus Daemon: блокировка задач честная, очередь и будильник общие.
+        /// </summary>
+        public static bool DirectTcp => JsonIo.Load<Config>(ConfigPath)?.DirectTcp ?? false;
 
         public static readonly string[] WakeModes = { "off", "soft", "focus" };
 

@@ -188,6 +188,7 @@ namespace Exerussus.Nexus.Core
             {
                 { "project", info.Project }, { "path", info.Path }, { "unity", info.Unity }, { "pid", info.Pid },
                 { "playing", EditorApplication.isPlaying }, { "compiling", EditorApplication.isCompiling },
+                { "phase", NexusCliDomainMarks.Phase() },
             };
             return NexusCommandContext.Exit.Ok;
         }

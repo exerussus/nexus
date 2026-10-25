@@ -171,8 +171,8 @@ namespace Exerussus.Nexus.UI
 
         private static string CliTooltip() =>
             NexusCliServer.Running
-                ? $"CLI слушает 127.0.0.1:{NexusCliServer.Port}. Клиент: {NexusCliStore.ClientPath} — nexus list, nexus --project <имя> help."
-                : "CLI выключен: редактор не принимает команды. Личная настройка.";
+                ? $"CLI включён: команды идут через Nexus Daemon. {NexusCliDaemon.Describe()}.\nКлиент: {NexusCliStore.ClientPath} — nexus list, nexus --project <имя> help; агент в VM — NexusTemp/nexus-fs."
+                : "CLI выключен: Nexus работает без агентских функций — демон не запускается, файлов канала нет. Личная настройка.";
 
         // пересканировать диск и сбросить желаемое состояние к фактическому
         private void Reload()

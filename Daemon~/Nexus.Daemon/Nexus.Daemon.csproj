@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Nexus Daemon (nexusd): фоновый сервис-мост между клиентами и редакторами Unity с Nexus. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- собран под API .NET 8, запускается на любом установленном .NET 8+ (в т.ч. на dotnet из Unity 6) -->
+    <RollForward>Major</RollForward>
+    <AssemblyName>nexusd</AssemblyName>
+    <RootNamespace>Exerussus.Nexus.Daemon</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Version>0.1.2</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>embedded</DebugType>
+    <Deterministic>true</Deterministic>
+    <!-- без платформенного exe: запуск всегда «dotnet nexusd.dll» -->
+    <UseAppHost>false</UseAppHost>
+  </PropertyGroup>
+
+</Project>

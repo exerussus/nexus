@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# nexus-cli-version: 4
+# nexus-cli-version: 5
 #
 # Nexus CLI через файловый канал проекта (NexusTemp/cli) — для сред без сети до редактора (агент в VM, WSL).
 # Тот же набор команд и коды выхода, что у nexus; ходит не через TCP, а через файлы папки проекта.
@@ -15,9 +15,11 @@
 #
 # Проект: --project, иначе NEXUS_PROJECT, иначе поиск вверх от текущей папки и от папки скрипта
 # (папка с UserSettings/Exerussus.Nexus/cli-instance.json).
+# Nexus 2: файловый канал ведёт Nexus Daemon (alive.json с daemon: true) — вызов принимается сразу, даже пока
+# редактор перезагружает домен или спит; ждать и будить его — дело демона. Nexus 1.x — канал ведёт сам Unity.
 # Коды выхода: код команды (0 — успех, 1 — ошибка, 2 — аргументы, 3 — нет команды, 4 — исключение/прервано,
 # 5 — истёк --timeout или редактор замолчал посреди вызова: итог — nexus-fs result <id>), 10 — нет открытого
-# редактора, 12 — редактор не отвечает (вызов не отправлен). Код 6 наружу не отдаётся.
+# редактора, 12 — редактор не отвечает (вызов не отправлен), 13 — демон не отвечает. Код 6 наружу не отдаётся.
 
 import json
 import os
@@ -42,7 +44,17 @@ def err(text):
     sys.stderr.flush()
 
 
+# запросы, которые этот клиент положил в requests/ и ещё не увидел забранными: уходя — убрать, чтобы
+# демон, запущенный позже, не выполнил их задним числом (забранный запрос уже лежит в active/)
+PENDING = []
+
+
 def finish(code):
+    for path in PENDING:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     sys.stdout.flush()
     sys.exit(code)
 
@@ -105,8 +117,19 @@ class Channel:
         self.instance = inst
         return inst
 
+    def daemon_mode(self):
+        alive = read_json(os.path.join(self.cli, "alive.json")) or {}
+        return bool(alive.get("daemon"))
+
     def ready_instance(self):
-        """Дождаться ready (на перезагрузке домена запрос не пишется — уйдёт со старым токеном)."""
+        """Дождаться ready (на перезагрузке домена запрос не пишется — уйдёт со старым токеном).
+        С демоном ждать не нужно: он примет вызов сразу и сам дождётся редактора."""
+        if self.daemon_mode():
+            alive = read_json(os.path.join(self.cli, "alive.json")) or {}
+            inst = read_json(os.path.join(self.project, INSTANCE)) or {}
+            inst.setdefault("path", alive.get("path"))
+            self.instance = inst
+            return inst
         while True:
             inst = self.load_instance()
             if (inst.get("state") or "ready") != "reloading" and inst.get("token"):
@@ -130,6 +153,25 @@ class Channel:
             alive = {}
         seq = alive.get("seq")
         now = time.time()
+        if alive.get("daemon"):
+            # пульс пишет демон: стоит — не отвечает демон; состояние редактора — в поле state
+            if seq != state.get("seq"):
+                state["seq"] = seq
+                state["since"] = now
+            elif now - state.setdefault("since", now) > STALE_BEFORE:
+                err("Nexus Daemon не отвечает (пульс стоит). Откройте проект в Unity с включённым CLI — он перезапустит демон.")
+                for line in diagnose(self.cli):
+                    err("  " + line)
+                finish(13)
+            editor = alive.get("state")
+            if editor == "reloading":
+                self.say_wait("Редактор перезагружает домен — демон дождётся…")
+            elif editor == "stalled":
+                self.say_wait("Редактор не отвечает — демон будит его…")
+                self.watch_stall(state, min_seconds=0)
+            elif editor == "closed":
+                self.say_wait("Редактор проекта закрыт.")
+            return alive
         if seq != state.get("seq"):
             state["seq"] = seq
             state["since"] = now
@@ -154,12 +196,12 @@ class Channel:
             finish(5)
         return alive
 
-    def watch_stall(self, state):
+    def watch_stall(self, state, min_seconds=20):
         """Пока ждём: сторож написал stall.json — показать диагноз один раз (ждать дальше или вмешаться — решать)."""
         if state.get("stall_shown") or not os.path.exists(os.path.join(self.cli, "stall.json")):
             return
         stall = read_json(os.path.join(self.cli, "stall.json")) or {}
-        if (stall.get("seconds") or 0) < 20:
+        if (stall.get("seconds") or 0) < max(min_seconds, 20):
             return
         state["stall_shown"] = True
         err("Редактор стоит — диагноз сторожа:")
@@ -179,7 +221,12 @@ def diagnose(cli, full=False):
     if alive is None:
         lines.append("пульса нет: канал не запускался (CLI выключен или Nexus старее 1.0)")
     else:
-        lines.append("пульс: %s, %s назад, фаза: %s" % (alive.get("state"), "%d с" % age if age is not None else "?", alive.get("phase") or "?"))
+        if alive.get("daemon"):
+            names = {"ready": "готов", "reloading": "перезагружает домен", "stalled": "не отвечает", "closed": "закрыт"}
+            lines.append("демон nexusd %s (pid %s): пульс %s назад" % (alive.get("daemonVersion") or "?", alive.get("daemonPid"), "%d с" % age if age is not None else "?"))
+            lines.append("редактор: %s, молчит %s с, фаза: %s" % (names.get(alive.get("state"), alive.get("state")), alive.get("silent"), alive.get("phase") or "?"))
+        else:
+            lines.append("пульс: %s, %s назад, фаза: %s" % (alive.get("state"), "%d с" % age if age is not None else "?", alive.get("phase") or "?"))
 
     domain = read_json(os.path.join(cli, "domain.json"))
     if domain:
@@ -414,7 +461,9 @@ def run_call(ch, request, no_wait, out):
         if not os.path.isdir(req_dir):
             err("Файловый канал не запущен: CLI выключен или Nexus старее 1.0.")
             finish(10)
-        write_atomic(os.path.join(req_dir, call_id + ".json"), request)
+        request_path = os.path.join(req_dir, call_id + ".json")
+        write_atomic(request_path, request)
+        PENDING.append(request_path)
 
         done = os.path.join(ch.cli, "done", call_id + ".json")
         active = os.path.join(ch.cli, "active", call_id + ".json")
@@ -439,6 +488,8 @@ def run_call(ch, request, no_wait, out):
             ch.check_alive(beat, call_id)
             time.sleep(0.15)
 
+        if request_path in PENDING:
+            PENDING.remove(request_path)
         if data.get("id") not in (None, call_id):
             err("Ответ с чужим id — пропущен.")
             finish(4)
@@ -474,10 +525,12 @@ def run_task_file(ch, definition, no_wait, out):
         if not os.path.isdir(req_dir):
             err("Файловый канал не запущен: CLI выключен или Nexus старее 1.0.")
             finish(10)
-        write_atomic(os.path.join(req_dir, task_id + ".json"), body)
+        task_path = os.path.join(req_dir, task_id + ".json")
+        write_atomic(task_path, body)
         if no_wait:
             print("задача %s принята: nexus-fs result %s" % (task_id, task_id))
             finish(0)
+        PENDING.append(task_path)
 
         done = os.path.join(ch.cli, "tasks", "done", task_id + ".json")
         active = os.path.join(ch.cli, "tasks", "active", task_id + ".json")
@@ -498,6 +551,8 @@ def run_task_file(ch, definition, no_wait, out):
             ch.check_alive(beat, task_id)
             time.sleep(0.2)
 
+        if task_path in PENDING:
+            PENDING.remove(task_path)
         if not definition.get("keep"):
             try_remove(done)
         summary = data.get("summary") or ""

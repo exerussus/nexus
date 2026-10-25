@@ -74,7 +74,7 @@ namespace Exerussus.Nexus.Core
             if (errors > 0) logLine += " — logs --errors";
             ctx.Print(logLine);
 
-            ctx.Print(NexusCliFileChannel.Describe());
+            ctx.Print(NexusCliDaemon.Describe());
 
             var jobs = new List<object>();
             foreach (var j in NexusCliJobs.All)
@@ -203,7 +203,6 @@ namespace Exerussus.Nexus.Core
 
         private static void RunTodo(NexusCliJob job, string todo)
         {
-            NexusCliFileChannel.Busy(); // Refresh и импорт держат главный поток — пульс канала встанет
             switch (todo)
             {
                 case "refresh":
@@ -344,6 +343,37 @@ namespace Exerussus.Nexus.Core
             if (!string.IsNullOrEmpty(job.Output)) ctx.Print(job.Output.TrimEnd('\n'));
             if (!string.IsNullOrEmpty(job.Data)) ctx.Data = new JRaw(job.Data);
             return job.ExitCode;
+        }
+
+        [NexusCommand("bridge.hello", "Для демона: версии пакета и протокола, состояние редактора, список команд", Usage = "bridge.hello", ReadOnly = true)]
+        private static int BridgeHello(NexusCommandContext ctx)
+        {
+            var commands = new List<object>();
+            foreach (var c in NexusCommands.All())
+                commands.Add(new { name = c.Name, summary = c.Summary, usage = c.Usage, source = c.Source, readOnly = c.ReadOnly });
+            var info = NexusCliServer.Describe();
+            ctx.Data = new
+            {
+                protocol = 1,
+                nexus = NexusCliDaemon.NexusVersion,
+                project = info.Project,
+                path = info.Path,
+                unity = info.Unity,
+                pid = info.Pid,
+                phase = NexusCliDomainMarks.Phase(),
+                playing = EditorApplication.isPlaying,
+                commands,
+            };
+            ctx.Print($"{info.Project} · Nexus {NexusCliDaemon.NexusVersion} · команд: {commands.Count}");
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("daemon.status", "Состояние Nexus Daemon (запущен ли, версия, порт)", Usage = "daemon.status", ReadOnly = true)]
+        private static int DaemonStatus(NexusCommandContext ctx)
+        {
+            ctx.Print(NexusCliDaemon.Describe());
+            ctx.Data = new { status = NexusCliDaemon.Describe() };
+            return NexusCommandContext.Exit.Ok;
         }
 
         [NexusCommand("cli.wake", "Будильник сторожа для редактора, застрявшего в фоне: off, soft (по умолчанию), focus",

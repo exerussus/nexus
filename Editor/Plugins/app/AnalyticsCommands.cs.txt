@@ -82,7 +82,7 @@ namespace Exerussus.Nexus.Pages.App
         }
 
         [NexusCommand("analytics.views", "Представления отчёта: тип, сколько событий входит, замечания",
-                      Usage = "analytics.views [--type <тип>]")]
+                      Usage = "analytics.views [--type <тип>]", ReadOnly = true)]
         private static int Views(NexusCommandContext ctx)
         {
             var config = AnalyticsReportStore.Load();
@@ -213,7 +213,7 @@ namespace Exerussus.Nexus.Pages.App
         }
 
         [NexusCommand("analytics.validate", "Проверить каталог событий и классификацию (каждое событие — в представлениях или «только сырые»)",
-                      Usage = "analytics.validate")]
+                      Usage = "analytics.validate", ReadOnly = true)]
         private static int Validate(NexusCommandContext ctx)
         {
             var settings = AnalyticsCatalog.Load();

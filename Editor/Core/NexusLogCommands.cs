@@ -15,7 +15,7 @@ namespace Exerussus.Nexus.Core
     {
         [NexusCommand("logs", "Лог редактора с фильтрами: --errors, --grep слова, --since N; коротко по умолчанию",
             Usage = "logs [--errors] [--warnings] [--type error,exception,assert,warning,log] [--grep a,b] [--all a,b] [--not a,b] " +
-                    "[--regex <re>] [--in-stack] [--since <N>|--play] [--last 30] [--stack [строк]] [--full] [--chars 300] [--no-collapse] [--count]")]
+                    "[--regex <re>] [--in-stack] [--since <N>|--play] [--last 30] [--stack [строк]] [--full] [--chars 300] [--no-collapse] [--count]", ReadOnly = true)]
         private static int Logs(NexusCommandContext ctx)
         {
             if (!NexusLogBuffer.Active) throw new NexusCommandException("Буфер лога не работает (CLI выключен?).", NexusCommandContext.Exit.Failed);

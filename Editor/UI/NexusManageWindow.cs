@@ -127,6 +127,22 @@ namespace Exerussus.Nexus.UI
             });
             bar.Add(cli);
 
+            // будильник сторожа: Unity в фоне не заканчивает перезагрузку домена, пока не получит фокус.
+            // Кнопка по кругу off → soft → focus (не PopupField: его меню рисуется в светлой теме редактора)
+            Button wake = null;
+            wake = NexusStyles.Button("будить: " + NexusCliStore.Wake, () =>
+            {
+                var modes = NexusCliStore.WakeModes;
+                var next = modes[(System.Array.IndexOf(modes, NexusCliStore.Wake) + 1) % modes.Length];
+                NexusCliStore.Wake = next;
+                wake.text = "будить: " + next;
+            });
+            wake.tooltip = "Будить редактор, застрявший в фоне после перезагрузки домена (клик — следующий режим):\n" +
+                           "off — только диагноз;\nsoft — сообщение окну без смены фокуса;\n" +
+                           "focus — если мягкого мало: Unity на пару секунд на передний план, потом фокус возвращается.";
+            wake.style.marginRight = 8f;
+            bar.Add(wake);
+
             var copy = NexusStyles.Button("CLI ⧉", () =>
             {
                 EditorGUIUtility.systemCopyBuffer = "& \"" + NexusCliStore.ClientPath + "\" --project \"" + NexusCliServer.Describe().Project + "\" help";

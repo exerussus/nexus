@@ -27,5 +27,11 @@ namespace Exerussus.Nexus.Abstractions
 
         /// <summary>Строка использования для help: <c>analytics.export --format csv|json|jsonl [--out файл]</c>.</summary>
         public string Usage { get; set; }
+
+        /// <summary>
+        /// Команда только читает (состояние, лог, списки) и ничего не меняет в редакторе и проекте: её пропускает
+        /// блокировка идущей задачи.
+        /// </summary>
+        public bool ReadOnly { get; set; }
     }
 }

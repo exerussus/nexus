@@ -20,6 +20,7 @@ namespace Exerussus.Nexus.Core
             public string Summary;
             public string Usage;
             public string Source;
+            public bool ReadOnly;
             internal Func<NexusCommandContext, int> Run;
         }
 
@@ -28,8 +29,8 @@ namespace Exerussus.Nexus.Core
         {
             var list = new List<Info>
             {
-                new Info { Name = "help", Summary = "Список команд или справка по одной", Usage = "help [команда]", Source = "nexus", Run = Help },
-                new Info { Name = "ping", Summary = "Проверка связи: проект, Unity, Nexus", Usage = "ping", Source = "nexus", Run = Ping },
+                new Info { Name = "help", Summary = "Список команд или справка по одной", Usage = "help [команда]", Source = "nexus", ReadOnly = true, Run = Help },
+                new Info { Name = "ping", Summary = "Проверка связи: проект, Unity, Nexus", Usage = "ping", Source = "nexus", ReadOnly = true, Run = Ping },
             };
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "help", "ping", "list" };
@@ -54,7 +55,7 @@ namespace Exerussus.Nexus.Core
                     continue;
                 }
 
-                list.Add(new Info { Name = attr.Name, Summary = attr.Summary, Usage = attr.Usage, Source = source, Run = run });
+                list.Add(new Info { Name = attr.Name, Summary = attr.Summary, Usage = attr.Usage, Source = source, ReadOnly = attr.ReadOnly, Run = run });
             }
 
             list.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
@@ -114,6 +115,13 @@ namespace Exerussus.Nexus.Core
             {
                 ctx.Error($"Нет команды «{ctx.Name}». Список: help");
                 return NexusCommandContext.Exit.UnknownCommand;
+            }
+
+            // идущая задача держит редактор: меняющие команды извне — только с --force (вмешательство — в её отчёт)
+            if (!command.ReadOnly && !NexusCliTasks.Admit(ctx, out var refusal))
+            {
+                ctx.Error(refusal);
+                return NexusCommandContext.Exit.Failed;
             }
 
             try

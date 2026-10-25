@@ -75,8 +75,32 @@ namespace Exerussus.Nexus.Abstractions
         /// </summary>
         public bool WaitForEditor { get; set; }
 
+        /// <summary>Вызов с <c>--force</c>: пройти блокировку идущей задачи (вмешательство пишется в её отчёт). Ставит хаб.</summary>
+        public bool Force { get; set; }
+
+        /// <summary>Id задачи, шагом которой идёт этот вызов (null — обычный вызов). Ставит хаб.</summary>
+        public string Task { get; set; }
+
         /// <summary>Были ошибки (<see cref="Error"/>).</summary>
         public bool HasErrors { get; private set; }
+
+        /// <summary>Команда попросила повтора (<see cref="RetryLater"/>): почему — для фазы ожидания.</summary>
+        public string RetryReason { get; private set; }
+
+        /// <summary>Сколько всего ждать готовности при повторах, с.</summary>
+        public double RetryTimeout { get; private set; }
+
+        /// <summary>
+        /// «Ещё не готово — повторите»: ядро CLI перезапускает команду (раз в 0,25 с) заданием, пока она не выполнится
+        /// без этого вызова или не истечёт срок. Вызывающий ждёт одного итога — ручные паузы не нужны. Вернуть
+        /// результат метода из команды: <c>return ctx.RetryLater("приложение загружается");</c>
+        /// </summary>
+        public int RetryLater(string reason, double timeoutSeconds = 30)
+        {
+            RetryReason = string.IsNullOrEmpty(reason) ? "ожидание" : reason;
+            RetryTimeout = timeoutSeconds > 0 ? timeoutSeconds : 30;
+            return Exit.Ok;
+        }
 
         /// <summary>Текст для человека.</summary>
         public string Output => _output.ToString();

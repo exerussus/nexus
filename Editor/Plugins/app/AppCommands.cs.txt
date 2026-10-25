@@ -9,6 +9,7 @@
 //    app.generate     — NavTargets, Navigation.uss, .Elements.cs, привязка вью к канону;
 //    app.validate     — проверка раскладки (--fix — привести к канону);
 //    app.runner*      — AppRunner в сцене: показать, создать, расставить объекты (бутстраппер, экраны, …);
+//    app.open         — в Play перейти на страницу / открыть попап / закрыть верхний попап;
 //    app.deck         — выполнить команду консоли AppDeck (в Play) и вернуть её вывод.
 //
 //  Логика — в редакторе AppCore (AppViewTools, AppNavigation): страница только разбирает аргументы и печатает.
@@ -33,7 +34,7 @@ namespace Exerussus.Nexus.Pages.App
     {
         // ============================================================ вью
 
-        [NexusCommand("app.views", "Вью AppCore: id, вёрстка, контроллер, объекты в сцене", Usage = "app.views [page|popup|fragment]")]
+        [NexusCommand("app.views", "Вью AppCore: id, вёрстка, контроллер, объекты в сцене", Usage = "app.views [page|popup|fragment]", ReadOnly = true)]
         private static int Views(NexusCommandContext ctx)
         {
             ViewKind? only = ctx.Arg(0) != null ? Kind(ctx.Arg(0)) : null;
@@ -189,7 +190,7 @@ namespace Exerussus.Nexus.Pages.App
 
         // ============================================================ раннер
 
-        [NexusCommand("app.runner", "AppRunner в сцене: поля, страницы (первая — стартовая), попапы, фрагменты", Usage = "app.runner")]
+        [NexusCommand("app.runner", "AppRunner в сцене: поля, страницы (первая — стартовая), попапы, фрагменты", Usage = "app.runner", ReadOnly = true)]
         private static int Runner(NexusCommandContext ctx)
         {
             var runner = Run(AppViewTools.FindRunner);
@@ -239,6 +240,53 @@ namespace Exerussus.Nexus.Pages.App
             var component = Run(() => AppViewTools.SetRunnerObject(field, ctx.Get("type"), report));
             if (ctx.Flag("save")) SaveScenes(ctx);
             return Finish(ctx, report, new { field, type = component.GetType().FullName, path = AppViewTools.PathOf(component) });
+        }
+
+        // ============================================================ навигация в Play
+
+        [NexusCommand("app.open", "В Play: перейти на страницу или открыть попап (--close — закрыть верхний попап)",
+            Usage = "app.open page|popup <id> [--screen] [--ready-timeout 30] | app.open --close")]
+        private static int Open(NexusCommandContext ctx)
+        {
+            if (!EditorApplication.isPlaying) throw new NexusCommandException("Только в Play: play.start", NexusCommandContext.Exit.Failed);
+            var runner = UnityEngine.Object.FindAnyObjectByType<AppRunner>();
+            if (runner == null) throw new NexusCommandException("В сцене нет AppRunner.", NexusCommandContext.Exit.Failed);
+            // приложение грузится сразу после play.start — ядро повторит команду, пока не будет готово
+            if (!runner.IsAppReady) return ctx.RetryLater("приложение загружается", ctx.GetInt("ready-timeout", 30));
+
+            if (ctx.Flag("close"))
+            {
+                if (!runner.IsActiveAnyPopup()) ctx.Print("Открытых попапов нет.");
+                else
+                {
+                    runner.CloseActivePopup();
+                    ctx.Print("✓ верхний попап закрывается");
+                }
+            }
+            else
+            {
+                var kind = Kind(ctx.Arg(0));
+                var id = ctx.Arg(1) ?? throw new NexusCommandException("нужен id: app.open popup telegram");
+                if (kind == ViewKind.Fragment) throw new NexusCommandException("фрагменты показывает их страница — откройте страницу или попап");
+                if (!AppCoreAssets.GetIds(kind).Contains(id)) throw new NexusCommandException($"{KindName(kind)} «{id}» не зарегистрирован (app.views).", NexusCommandContext.Exit.Failed);
+
+                if (kind == ViewKind.Page)
+                {
+                    runner.SwitchToPage(new Exerussus.AppCore.Navigation.PageId(id), withScreen: ctx.Flag("screen"), ignoreIfBusy: false);
+                    ctx.Print($"✓ переход на страницу {id}");
+                }
+                else
+                {
+                    runner.OpenPopup(new Exerussus.AppCore.Navigation.PopupId(id));
+                    ctx.Print($"✓ открывается попап {id}");
+                }
+
+                ctx.Print("переход асинхронный — перед снимком: wait --seconds 1");
+            }
+
+            var current = runner.CurrentPage != null ? runner.CurrentPage.PageId : null;
+            ctx.Data = new { page = current, anyPopup = runner.IsActiveAnyPopup() };
+            return NexusCommandContext.Exit.Ok;
         }
 
         // ============================================================ AppDeck

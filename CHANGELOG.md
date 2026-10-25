@@ -2,6 +2,37 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [1.0.0]
+
+### Добавлено
+- Файловый канал CLI: `<проект>/NexusTemp/cli` (`requests → active → done`, `tasks/…`, `alive.json` — пульс раз в
+  2 с). Для агентов и сред без доступа к localhost. `NexusTemp/.gitignore` создаётся сам.
+- Клиент `nexus-fs` (python3, без зависимостей): ставится в `NexusTemp/nexus-fs`, переводит пути Windows в пути
+  своей машины, ждёт перезагрузки домена, коды 10/11/12 — нет канала, нет ответа, редактор не отвечает.
+- Задачи: шаги-команды по очереди, `onError` stop/continue, `always`, `expect` (exit/output/notOutput/data),
+  подстановки `${шаг.поле}` и `${args.ключ}`, отчёт по задаче и шагам, артефакты.
+  - Сценарии — `ProjectSettings/Nexus/tasks/<имя>.json`.
+  - Команды `task.run` (`--steps "…"`, `--set`, `--list`), `task.status`, `task.cancel`, `tasks`, `wait`
+    (`--seconds`, `--frames`, `--idle`).
+  - Пока идёт задача, сторонние команды, меняющие состояние, отклоняются (`--force` — выполнить всё равно,
+    `"lock": false` в сценарии — без блокировки).
+- `NexusCommandAttribute.ReadOnly` — команда только читает и проходит блокировку задачи.
+- `NexusCommandContext.Force`, `NexusCommandContext.Task`.
+- `NexusCommandContext.RetryLater(причина, срок)` — «ещё не готово»: ядро повторяет команду заданием `retry`, пока
+  она не выполнится; вызывающий ждёт один итог.
+- Срок и хранение задаёт вызывающий: `timeout`, `keep` у запроса и задачи.
+- Сторож CLI (Windows): процесс `nexus-watchdog.ps1` рядом с редактором; главный поток стоит — `stall.json` с
+  фазой, окнами процесса (модальное окно видно по заголовку) и ошибками из `Editor.log`. Метки домена
+  `domain.json`, `startup-error.txt`. `nexus-fs` печатает диагноз сам, `nexus-fs diag` — полный.
+- Будильник сторожа: Unity, застрявшая в фоне после перезагрузки домена, будится без мыши — `soft` (по умолчанию)
+  или `focus` (передний план на пару секунд с возвратом фокуса); `cli.wake`, список в Manage, журнал `wake.json`.
+- Плагин `app` 3.9.0: `app.open page|popup <id>`, `app.open --close` (в Play).
+
+### Изменено
+- Скриншоты и отчёты тестов — в `NexusTemp/screenshots` и `NexusTemp/tests`.
+- Клиенты 4: `--force`, срок отправляется только если задан.
+- CLI выключен — файловый канал не пишет файлов, `NexusTemp/cli` удаляется.
+
 ## [0.9.1]
 
 ### Исправлено

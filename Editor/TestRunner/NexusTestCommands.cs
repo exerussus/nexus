@@ -90,7 +90,7 @@ namespace Exerussus.Nexus.TestRunner
             return NexusCommandContext.Exit.Ok;
         }
 
-        [NexusCommand("tests.list", "Список тестов (полные имена)", Usage = "tests.list [--mode edit|play] [--filter <подстрока>] [--max 200]")]
+        [NexusCommand("tests.list", "Список тестов (полные имена)", Usage = "tests.list [--mode edit|play] [--filter <подстрока>] [--max 200]", ReadOnly = true)]
         private static int List(NexusCommandContext ctx)
         {
             var mode = ParseMode(ctx.Get("mode"));
@@ -209,8 +209,7 @@ namespace Exerussus.Nexus.TestRunner
                 string xml = null;
                 try
                 {
-                    var dir = Path.Combine(NexusPaths.ProjectRoot, "Temp", "Nexus", "TestResults");
-                    Directory.CreateDirectory(dir);
+                    var dir = NexusTempPaths.Ensure(NexusTempPaths.Tests);
                     xml = Path.Combine(dir, job.Id + ".xml").Replace('\\', '/');
                     TestRunnerApi.SaveResultToFile(result, xml);
                 }

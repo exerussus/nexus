@@ -36,7 +36,7 @@ namespace Exerussus.Nexus.Core
 
         // ================================================================ состояние
 
-        [NexusCommand("status", "Состояние редактора: Play, компиляция, сцена, ошибки, задания", Usage = "status")]
+        [NexusCommand("status", "Состояние редактора: Play, компиляция, сцена, ошибки, задания", Usage = "status", ReadOnly = true)]
         private static int Status(NexusCommandContext ctx)
         {
             var info = NexusCliServer.Describe();
@@ -73,6 +73,8 @@ namespace Exerussus.Nexus.Core
             var logLine = $"лог: {NexusCliText.Plural(errors, "ошибка", "ошибки", "ошибок")}, {NexusCliText.Plural(warnings, "предупреждение", "предупреждения", "предупреждений")}";
             if (errors > 0) logLine += " — logs --errors";
             ctx.Print(logLine);
+
+            ctx.Print(NexusCliFileChannel.Describe());
 
             var jobs = new List<object>();
             foreach (var j in NexusCliJobs.All)
@@ -128,7 +130,7 @@ namespace Exerussus.Nexus.Core
             return NexusCommandContext.Exit.Ok;
         }
 
-        [NexusCommand("compile.errors", "Ошибки (и предупреждения) последней компиляции", Usage = "compile.errors [--warnings] [--max 30]")]
+        [NexusCommand("compile.errors", "Ошибки (и предупреждения) последней компиляции", Usage = "compile.errors [--warnings] [--max 30]", ReadOnly = true)]
         private static int CompileErrors(NexusCommandContext ctx)
         {
             var max = Math.Max(1, ctx.GetInt("max", 30));
@@ -201,6 +203,7 @@ namespace Exerussus.Nexus.Core
 
         private static void RunTodo(NexusCliJob job, string todo)
         {
+            NexusCliFileChannel.Busy(); // Refresh и импорт держат главный поток — пульс канала встанет
             switch (todo)
             {
                 case "refresh":
@@ -308,7 +311,7 @@ namespace Exerussus.Nexus.Core
 
         // ================================================================ задания
 
-        [NexusCommand("jobs", "Задания CLI: идущие и последние завершённые", Usage = "jobs")]
+        [NexusCommand("jobs", "Задания CLI: идущие и последние завершённые", Usage = "jobs", ReadOnly = true)]
         private static int Jobs(NexusCommandContext ctx)
         {
             var list = new List<object>();
@@ -324,7 +327,7 @@ namespace Exerussus.Nexus.Core
             return NexusCommandContext.Exit.Ok;
         }
 
-        [NexusCommand("job.status", "Состояние или итог задания (клиент ждёт задания этой командой)", Usage = "job.status <id>")]
+        [NexusCommand("job.status", "Состояние или итог задания (клиент ждёт задания этой командой)", Usage = "job.status <id>", ReadOnly = true)]
         private static int JobStatus(NexusCommandContext ctx)
         {
             var id = ctx.Arg(0) ?? throw new NexusCommandException("нужно <id> задания: jobs");
@@ -343,10 +346,34 @@ namespace Exerussus.Nexus.Core
             return job.ExitCode;
         }
 
+        [NexusCommand("cli.wake", "Будильник сторожа для редактора, застрявшего в фоне: off, soft (по умолчанию), focus",
+            Usage = "cli.wake [off|soft|focus]")]
+        private static int CliWake(NexusCommandContext ctx)
+        {
+            var mode = ctx.Arg(0);
+            if (mode != null)
+            {
+                if (System.Array.IndexOf(NexusCliStore.WakeModes, mode) < 0) throw new NexusCommandException("cli.wake off|soft|focus");
+                NexusCliStore.Wake = mode;
+            }
+
+            var now = NexusCliStore.Wake;
+            ctx.Print($"будильник: {now}" + (now == "focus" ? " (при застревании Unity на пару секунд выходит на передний план)" : now == "soft" ? " (без смены фокуса)" : " (только диагноз)"));
+            ctx.Data = new { wake = now };
+            return NexusCommandContext.Exit.Ok;
+        }
+
         [NexusCommand("job.cancel", "Отменить ожидание задания (сама операция Unity может продолжиться)", Usage = "job.cancel <id>")]
         private static int JobCancel(NexusCommandContext ctx)
         {
             var id = ctx.Arg(0) ?? throw new NexusCommandException("нужно <id> задания: jobs");
+            var target = NexusCliJobs.Find(id);
+            if (target != null && target.Kind == NexusCliTasks.Kind && NexusCliTasks.Cancel(id))
+            {
+                ctx.Print($"Задача {id}: отмена — выполняются шаги always.");
+                return NexusCommandContext.Exit.Ok;
+            }
+
             if (!NexusCliJobs.Cancel(id, "по команде")) throw new NexusCommandException($"Задание «{id}» не идёт.", NexusCommandContext.Exit.Failed);
             ctx.Print($"Задание {id} отменено.");
             return NexusCommandContext.Exit.Ok;
@@ -386,7 +413,7 @@ namespace Exerussus.Nexus.Core
         }
 
         [NexusCommand("assets.find", "Найти ассеты (синтаксис поиска Project: t:Scene, l:метка, имя)",
-            Usage = "assets.find \"t:Prefab Ship\" [--in Assets/Game] [--max 50]")]
+            Usage = "assets.find \"t:Prefab Ship\" [--in Assets/Game] [--max 50]", ReadOnly = true)]
         private static int AssetsFind(NexusCommandContext ctx)
         {
             var filter = ctx.Arg(0) ?? throw new NexusCommandException("нужен фильтр поиска");

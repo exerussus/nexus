@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+# nexus-cli-version: 4
+#
+# Nexus CLI через файловый канал проекта (NexusTemp/cli) — для сред без сети до редактора (агент в VM, WSL).
+# Тот же набор команд и коды выхода, что у nexus; ходит не через TCP, а через файлы папки проекта.
+#
+#   python3 nexus-fs [--project <папка проекта>] [--json] [--timeout <с>] [--keep <с>] [--no-wait] [--force] [--no-map]
+#                    <команда> [аргументы]
+#   python3 nexus-fs result <id>                      итог вызова, запущенного с --no-wait
+#   python3 nexus-fs diag                             что с редактором: пульс, домен, сторож (работает и без ответа)
+#   python3 nexus-fs task.run <файл.json>             задача из локального файла (через NexusTemp/cli/tasks)
+#   python3 nexus-fs task.run <имя> | --steps "…"     сценарий проекта / быстрая задача
+#
+# Пример: python3 ~/mnt/JOPA/NexusTemp/nexus-fs refresh
+#
+# Проект: --project, иначе NEXUS_PROJECT, иначе поиск вверх от текущей папки и от папки скрипта
+# (папка с UserSettings/Exerussus.Nexus/cli-instance.json).
+# Коды выхода: код команды (0 — успех, 1 — ошибка, 2 — аргументы, 3 — нет команды, 4 — исключение/прервано,
+# 5 — истёк --timeout или редактор замолчал посреди вызова: итог — nexus-fs result <id>), 10 — нет открытого
+# редактора, 12 — редактор не отвечает (вызов не отправлен). Код 6 наружу не отдаётся.
+
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+INSTANCE = os.path.join("UserSettings", "Exerussus.Nexus", "cli-instance.json")
+STALE_BEFORE = 15.0   # пульс стоит до отправки — редактор не отвечает (12), вызов не пишется
+STALE_DURING = 90.0   # пульс стоит после отправки — главный поток занят; вызов не потерян: код 5 и nexus-fs result
+
+
+def err(text):
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def finish(code):
+    sys.stdout.flush()
+    sys.exit(code)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_atomic(path, data):
+    tmp = path[:-5] + ".tmp" if path.endswith(".json") else path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def find_project(explicit):
+    if explicit:
+        p = os.path.abspath(os.path.expanduser(explicit))
+        return p if os.path.isfile(os.path.join(p, INSTANCE)) or os.path.isdir(p) else None
+    env = os.environ.get("NEXUS_PROJECT")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    for start in (os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        d = start
+        while True:
+            if os.path.isfile(os.path.join(d, INSTANCE)):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return None
+
+
+class Channel:
+    def __init__(self, project, timeout):
+        self.project = project
+        self.cli = os.path.join(project, "NexusTemp", "cli")
+        self.deadline = time.time() + timeout
+        self.waiting = False
+        self.instance = None
+
+    def say_wait(self, text):
+        if not self.waiting:
+            err(text)
+            self.waiting = True
+
+    def expired(self):
+        return time.time() > self.deadline
+
+    def load_instance(self):
+        inst = read_json(os.path.join(self.project, INSTANCE))
+        if inst is None:
+            err("Нет открытого редактора с Nexus CLI для %s." % self.project)
+            finish(10)
+        self.instance = inst
+        return inst
+
+    def ready_instance(self):
+        """Дождаться ready (на перезагрузке домена запрос не пишется — уйдёт со старым токеном)."""
+        while True:
+            inst = self.load_instance()
+            if (inst.get("state") or "ready") != "reloading" and inst.get("token"):
+                return inst
+            self.say_wait("Редактор перезагружает домен — жду…")
+            self.watch_stall(self.__dict__.setdefault("_reload_state", {}))
+            if self.expired():
+                err("Редактор не вернулся за срок --timeout.")
+                for line in diagnose(self.cli):
+                    err("  " + line)
+                finish(5)
+            time.sleep(0.5)
+
+    def check_alive(self, state, call_id=None):
+        """state: dict(seq, since). call_id — вызов уже отправлен: молчание — не «не отвечает», а «ещё идёт»."""
+        alive = read_json(os.path.join(self.cli, "alive.json"))
+        if alive is None:
+            if not os.path.isdir(self.cli):
+                err("Файловый канал не запущен: CLI выключен или Nexus старее 1.0.")
+                finish(10)
+            alive = {}
+        seq = alive.get("seq")
+        now = time.time()
+        if seq != state.get("seq"):
+            state["seq"] = seq
+            state["since"] = now
+            return alive
+        if alive.get("state") in ("reloading", "busy"):
+            self.watch_stall(state)
+            self.say_wait("Редактор перезагружает домен — жду…" if alive.get("state") == "reloading" else "Редактор занят (импорт) — жду…")
+            state["since"] = now
+            return alive
+        silent = now - state.setdefault("since", now)
+        if silent > 20:
+            self.watch_stall(state)
+        if call_id is None and silent > STALE_BEFORE:
+            err("Редактор не отвечает.")
+            for line in diagnose(self.cli):
+                err("  " + line)
+            finish(12)
+        if call_id is not None and silent > STALE_DURING:
+            err("Редактор молчит %d с. Вызов не потерян: nexus-fs result %s" % (silent, call_id))
+            for line in diagnose(self.cli):
+                err("  " + line)
+            finish(5)
+        return alive
+
+    def watch_stall(self, state):
+        """Пока ждём: сторож написал stall.json — показать диагноз один раз (ждать дальше или вмешаться — решать)."""
+        if state.get("stall_shown") or not os.path.exists(os.path.join(self.cli, "stall.json")):
+            return
+        stall = read_json(os.path.join(self.cli, "stall.json")) or {}
+        if (stall.get("seconds") or 0) < 20:
+            return
+        state["stall_shown"] = True
+        err("Редактор стоит — диагноз сторожа:")
+        for line in diagnose(self.cli):
+            err("  " + line)
+
+
+def diagnose(cli, full=False):
+    """Диагноз по файлам канала: пульс, метки домена, ошибка старта, отчёт сторожа. Список строк."""
+    lines = []
+    now = time.time()
+    alive = read_json(os.path.join(cli, "alive.json"))
+    try:
+        age = now - os.path.getmtime(os.path.join(cli, "alive.json"))
+    except OSError:
+        age = None
+    if alive is None:
+        lines.append("пульса нет: канал не запускался (CLI выключен или Nexus старее 1.0)")
+    else:
+        lines.append("пульс: %s, %s назад, фаза: %s" % (alive.get("state"), "%d с" % age if age is not None else "?", alive.get("phase") or "?"))
+
+    domain = read_json(os.path.join(cli, "domain.json"))
+    if domain:
+        state = domain.get("state")
+        hint = {
+            "reloading": "перезагрузка домена началась и не закончилась",
+            "loaded": "домен загружен, но сервер CLI не стартовал (главный цикл не дошёл до delayCall)",
+            "failed": "сервер CLI упал при старте",
+            "ready": "сервер CLI поднялся",
+        }.get(state, state)
+        lines.append("домен: %s (%s)" % (hint, domain.get("at") or "?"))
+
+    try:
+        with open(os.path.join(cli, "startup-error.txt"), "r", encoding="utf-8", errors="replace") as f:
+            err_lines = [l.rstrip() for l in f.read().splitlines() if l.strip()]
+        lines.append("ошибка старта сервера:")
+        lines.extend("  " + l for l in err_lines[: (40 if full else 6)])
+    except OSError:
+        pass
+
+    stall = read_json(os.path.join(cli, "stall.json"))
+    if stall:
+        responding = stall.get("responding")
+        lines.append("сторож: главный поток стоит %s с (фаза: %s); окно Unity %s" % (
+            stall.get("seconds"), stall.get("phase") or stall.get("state") or "?",
+            "отвечает — скорее всего модальное окно" if responding else "не отвечает — поток занят или завис" if responding is False else "?"))
+        if stall.get("foreground") is not None:
+            lines.append("  Unity на переднем плане: %s" % ("да" if stall.get("foreground") else "нет (в фоне)"))
+        windows = stall.get("windows") or []
+        modal = [w for w in windows if w.get("enabled") and w.get("title")]
+        blocked = [w for w in windows if not w.get("enabled")]
+        if blocked and modal:
+            lines.append("  открыто модальное окно: " + "; ".join("«%s»" % w["title"] for w in modal[:3]))
+        elif windows:
+            lines.append("  окна: " + "; ".join("«%s»" % (w.get("title") or w.get("class")) for w in windows[:5]))
+        errors = stall.get("errors") or []
+        if errors:
+            lines.append("  ошибки в Editor.log:")
+            lines.extend("    " + e for e in errors[-(15 if full else 5):])
+        if full and stall.get("tail"):
+            lines.append("  хвост Editor.log:")
+            lines.extend("    " + t for t in stall["tail"])
+    wakes = read_json(os.path.join(cli, "wake.json"))
+    if isinstance(wakes, dict):
+        wakes = [wakes]
+    if wakes:
+        names = {"soft": "мягко", "focus": "фокусом"}
+        lines.append("будильник (последние):")
+        for w in wakes[-(10 if full else 3):]:
+            lines.append("  %s %s: %s за %s с (%s)" % ((w.get("at") or "")[11:19], names.get(w.get("step"), w.get("step")),
+                         "ожил" if w.get("ok") else "не помогло", w.get("seconds"), w.get("phase") or "?"))
+    if stall and stall.get("wake") == "off":
+        lines.append("  будильник выключен: cli.wake soft|focus")
+    if not stall and full:
+        watchdog = read_json(os.path.join(cli, "watchdog.json"))
+        lines.append("сторож: %s" % ("работает, зависаний нет" if watchdog else "не запущен (не Windows или Nexus старее 1.0)"))
+    return lines
+
+
+def map_paths(text, win_root, local_root):
+    if not text or not win_root:
+        return text
+    variants = {win_root, win_root.replace("\\", "/"), win_root.replace("/", "\\")}
+    for v in sorted(variants, key=len, reverse=True):
+        pattern = re.compile(re.escape(v.rstrip("\\/")) + r"(?=[\\/\s\"'<>|,;:)\]}]|$)([\\/][^\s\"'<>|]*)?", re.IGNORECASE)
+
+        def repl(m):
+            tail = (m.group(1) or "").replace("\\", "/")
+            return local_root.rstrip("/") + tail
+
+        text = pattern.sub(repl, text)
+    return text
+
+
+def map_obj(value, win_root, local_root):
+    """Перевести пути во всех строках ответа (и во вложенном JSON поля result)."""
+    if isinstance(value, str):
+        return map_paths(value, win_root, local_root)
+    if isinstance(value, list):
+        return [map_obj(v, win_root, local_root) for v in value]
+    if isinstance(value, dict):
+        mapped = {}
+        for k, v in value.items():
+            if k == "result" and isinstance(v, str) and v[:1] in ("{", "["):
+                try:
+                    mapped[k] = json.dumps(map_obj(json.loads(v), win_root, local_root), ensure_ascii=False)
+                    continue
+                except ValueError:
+                    pass
+            mapped[k] = map_obj(v, win_root, local_root)
+        return mapped
+    return value
+
+
+def main(argv):
+    project = None
+    as_json = False
+    timeout = 600
+    timeout_set = False
+    keep = 0
+    no_wait = False
+    force = False
+    no_map = False
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if not rest and a == "--project" and i + 1 < len(argv):
+            project = argv[i + 1]; i += 2; continue
+        if not rest and a == "--json":
+            as_json = True; i += 1; continue
+        if not rest and a == "--timeout" and i + 1 < len(argv):
+            timeout = max(1, int(float(argv[i + 1]))); timeout_set = True; i += 2; continue
+        if not rest and a == "--keep" and i + 1 < len(argv):
+            keep = max(0, float(argv[i + 1])); i += 2; continue
+        if not rest and a == "--no-wait":
+            no_wait = True; i += 1; continue
+        if not rest and a == "--force":
+            force = True; i += 1; continue
+        if not rest and a == "--no-map":
+            no_map = True; i += 1; continue
+        rest.append(a)
+        i += 1
+
+    if not rest:
+        print("python3 nexus-fs [--project <папка>] [--json] [--timeout с] [--keep с] [--no-wait] [--force] <команда> [аргументы]")
+        print("python3 nexus-fs help — команды проекта")
+        finish(2)
+
+    root = find_project(project)
+    if root is None:
+        err("Проект не найден: укажите --project <папка проекта> или NEXUS_PROJECT.")
+        finish(10)
+
+    ch = Channel(root, timeout)
+    command, args = rest[0], rest[1:]
+
+    def out(response, report=False):
+        win = (ch.instance or {}).get("path")
+        if as_json:
+            data = response if no_map else map_obj(response, win, root)
+            print(json.dumps(data, ensure_ascii=False))
+            return
+        text = response.get("output") if not report else format_report(response, root)
+        if text:
+            text = text.rstrip("\n")
+            print(map_paths(text, win, root) if not no_map else text)
+
+    if command == "diag":
+        for line in diagnose(ch.cli, full=True):
+            print(line)
+        finish(0)
+
+    if command == "result":
+        if not args:
+            err("нужен id: nexus-fs result <id>")
+            finish(2)
+        for sub in ("done", os.path.join("tasks", "done")):
+            path = os.path.join(ch.cli, sub, args[0] + ".json")
+            data = read_json(path)
+            if data is not None:
+                ch.load_instance()
+                out(data, report=sub != "done")
+                if not keep:
+                    try_remove(path)
+                finish(int(data.get("exitCode", 1)))
+        for sub in ("active", os.path.join("tasks", "active")):
+            data = read_json(os.path.join(ch.cli, sub, args[0] + ".json"))
+            if data is not None:
+                print("… ещё идёт: %s" % (data.get("phase") or ""))
+                finish(0)
+        err("Нет вызова «%s» (итог уже прочитан или истёк keep)." % args[0])
+        finish(1)
+
+    # задача из локального файла — через tasks/requests (путь VM редактору не виден)
+    if command == "task.run" and args and args[0].lower().endswith(".json") and os.path.isfile(os.path.expanduser(args[0])):
+        definition = read_json(os.path.expanduser(args[0]))
+        if not isinstance(definition, dict):
+            err("Файл задачи не разбирается как JSON-объект.")
+            finish(2)
+        apply_task_flags(definition, args[1:], timeout if timeout_set else None, keep)
+        run_task_file(ch, definition, no_wait, out)
+        return
+
+    request = {"command": command, "args": args, "force": force}
+    if timeout_set:
+        request["timeout"] = timeout
+    if keep:
+        request["keep"] = keep
+    run_call(ch, request, no_wait, out)
+
+
+def apply_task_flags(definition, extra, timeout, keep):
+    if timeout:
+        definition["timeout"] = timeout
+    if keep:
+        definition["keep"] = keep
+    j = 0
+    while j < len(extra):
+        if extra[j] == "--set" and j + 1 < len(extra):
+            args = definition.setdefault("args", {})
+            for pair in extra[j + 1].replace(";", ",").split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    args[k.strip()] = v
+            j += 2
+            continue
+        if extra[j] in ("--timeout", "--keep") and j + 1 < len(extra):
+            definition[extra[j][2:]] = float(extra[j + 1])
+            j += 2
+            continue
+        j += 1
+
+
+def try_remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def run_call(ch, request, no_wait, out):
+    beat = {}
+    while True:
+        inst = ch.ready_instance()
+        ch.check_alive(beat)
+        call_id = uuid.uuid4().hex
+        request["id"] = call_id
+        request["token"] = inst.get("token")
+        request["cwd"] = inst.get("path")
+        req_dir = os.path.join(ch.cli, "requests")
+        if not os.path.isdir(req_dir):
+            err("Файловый канал не запущен: CLI выключен или Nexus старее 1.0.")
+            finish(10)
+        write_atomic(os.path.join(req_dir, call_id + ".json"), request)
+
+        done = os.path.join(ch.cli, "done", call_id + ".json")
+        active = os.path.join(ch.cli, "active", call_id + ".json")
+        last_phase = None
+        while True:
+            data = read_json(done) if os.path.exists(done) else None
+            if data is not None:
+                break
+            if os.path.exists(active):
+                a = read_json(active)
+                if a is not None and a.get("job"):
+                    if no_wait:
+                        print("вызов %s принят: nexus-fs result %s" % (call_id, call_id))
+                        finish(0)
+                    phase = a.get("phase")
+                    if phase and phase != last_phase:
+                        err("… " + phase)
+                        last_phase = phase
+            if ch.expired():
+                err("Вызов %s ещё идёт (срок --timeout): nexus-fs result %s" % (call_id, call_id))
+                finish(5)
+            ch.check_alive(beat, call_id)
+            time.sleep(0.15)
+
+        if data.get("id") not in (None, call_id):
+            err("Ответ с чужим id — пропущен.")
+            finish(4)
+        if not request.get("keep"):
+            try_remove(done)
+
+        output = data.get("output") or ""
+        code = int(data.get("exitCode", 1))
+        if output.startswith("Неверный токен"):
+            ch.say_wait("Устаревший токен — перечитываю экземпляр…")
+            time.sleep(0.5)
+            continue
+        if code == 6:
+            ch.say_wait("Редактор занят — жду…")
+            if ch.expired():
+                finish(5)
+            time.sleep(1.0)
+            continue
+        out(data)
+        finish(code)
+
+
+def run_task_file(ch, definition, no_wait, out):
+    beat = {}
+    while True:
+        inst = ch.ready_instance()
+        ch.check_alive(beat)
+        task_id = uuid.uuid4().hex
+        body = dict(definition)
+        body["id"] = task_id
+        body["token"] = inst.get("token")
+        req_dir = os.path.join(ch.cli, "tasks", "requests")
+        if not os.path.isdir(req_dir):
+            err("Файловый канал не запущен: CLI выключен или Nexus старее 1.0.")
+            finish(10)
+        write_atomic(os.path.join(req_dir, task_id + ".json"), body)
+        if no_wait:
+            print("задача %s принята: nexus-fs result %s" % (task_id, task_id))
+            finish(0)
+
+        done = os.path.join(ch.cli, "tasks", "done", task_id + ".json")
+        active = os.path.join(ch.cli, "tasks", "active", task_id + ".json")
+        last = None
+        while True:
+            data = read_json(done) if os.path.exists(done) else None
+            if data is not None:
+                break
+            a = read_json(active) if os.path.exists(active) else None
+            if a is not None:
+                phase = a.get("phase")
+                if phase and phase != last:
+                    err("… " + phase)
+                    last = phase
+            if ch.expired():
+                err("Задача %s ещё идёт (срок --timeout): nexus-fs result %s" % (task_id, task_id))
+                finish(5)
+            ch.check_alive(beat, task_id)
+            time.sleep(0.2)
+
+        if not definition.get("keep"):
+            try_remove(done)
+        summary = data.get("summary") or ""
+        if "Неверный токен" in summary:
+            ch.say_wait("Устаревший токен — перечитываю экземпляр…")
+            time.sleep(0.5)
+            continue
+        out(data, report=True)
+        finish(int(data.get("exitCode", 1)))
+
+
+def format_report(report, root):
+    lines = [report.get("summary") or ""]
+    for s in report.get("steps") or []:
+        status = s.get("status")
+        if status in ("ok", "skipped"):
+            continue
+        line = "  ✗ %s (%s): %s" % (s.get("id"), s.get("command"), status)
+        if s.get("expectFailed"):
+            line += " — " + s["expectFailed"]
+        lines.append(line)
+        for o in (s.get("output") or "").rstrip("\n").split("\n"):
+            if o:
+                lines.append("    " + o)
+    arts = report.get("artifacts") or []
+    if arts:
+        lines.append("артефакты:")
+        lines.extend("  " + os.path.join(root, a).replace("\\", "/") for a in arts)
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        finish(130)

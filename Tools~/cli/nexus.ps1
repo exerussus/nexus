@@ -1,12 +1,14 @@
 ﻿# Nexus CLI: команды в открытый редактор Unity с Nexus.
-# nexus-cli-version: 3
+# nexus-cli-version: 4
 #
 #   nexus list                                         открытые проекты
-#   nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] <команда> [аргументы]
+#   nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] [--force] <команда> [аргументы]
 #
 # Долгие команды (refresh, compile, play.start, tests.run, …) идут заданиями редактора: клиент ждёт их конца,
 # в том числе через перезагрузку домена (файл экземпляра в это время помечен reloading). --no-wait — не ждать,
-# только напечатать id задания (потом: nexus job.status <id>). --timeout — общий срок ожидания, с.
+# только напечатать id задания (потом: nexus job.status <id>). --timeout — общий срок ожидания, с (он же предел
+# срока задания команды). --force — пройти блокировку идущей задачи (вызов пометится в её отчёте).
+# Без сети до редактора (агент в VM, WSL) — python3 <проект>/NexusTemp/nexus-fs: те же команды через файлы.
 #
 # Проект выбирается явно: --project (имя папки проекта или путь, можно часть пути), иначе — проект,
 # в папке которого вы стоите. Если подходит несколько или ни одного — ошибка со списком.
@@ -87,12 +89,13 @@ function Resolve-Target($list, [string]$project) {
 # $script:Sent — запрос записан в сокет: дальше повторять нельзя (команда могла выполниться)
 function Send-Command($instance, [string]$command, [string[]]$arguments, [int]$timeout) {
     $script:Sent = $false
-    $request = @{ token = $instance.token; command = $command; args = @($arguments); cwd = (Get-Location).ProviderPath; timeout = $timeout } |
+    $request = @{ token = $instance.token; command = $command; args = @($arguments); cwd = (Get-Location).ProviderPath; timeout = $timeout; force = $script:Force } |
         ConvertTo-Json -Compress -Depth 4
     $client = New-Object System.Net.Sockets.TcpClient
     try {
         $client.Connect('127.0.0.1', [int]$instance.port)
-        $client.ReceiveTimeout = [Math]::Max(15, $timeout + 15) * 1000
+        $wait = if ($timeout -gt 0) { $timeout } else { 600 }
+        $client.ReceiveTimeout = [Math]::Max(15, $wait + 15) * 1000
         $stream = $client.GetStream()
         $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($request + "`n")
         $stream.Write($bytes, 0, $bytes.Length)
@@ -112,21 +115,24 @@ function Send-Command($instance, [string]$command, [string[]]$arguments, [int]$t
 $project = $null
 $json = $false
 $timeout = 600
+$timeoutSet = $false
 $noWait = $false
+$script:Force = $false
 $script:Sent = $false
 $rest = New-Object System.Collections.Generic.List[string]
 for ($k = 0; $k -lt $args.Count; $k++) {
     $a = [string]$args[$k]
     if ($rest.Count -eq 0 -and $a -eq '--project' -and $k + 1 -lt $args.Count) { $project = [string]$args[++$k]; continue }
     if ($rest.Count -eq 0 -and $a -eq '--json') { $json = $true; continue }
-    if ($rest.Count -eq 0 -and $a -eq '--timeout' -and $k + 1 -lt $args.Count) { $timeout = [Math]::Max(1, [int]$args[++$k]); continue }
+    if ($rest.Count -eq 0 -and $a -eq '--timeout' -and $k + 1 -lt $args.Count) { $timeout = [Math]::Max(1, [int]$args[++$k]); $timeoutSet = $true; continue }
+    if ($rest.Count -eq 0 -and $a -eq '--force') { $script:Force = $true; continue }
     if ($rest.Count -eq 0 -and $a -eq '--no-wait') { $noWait = $true; continue }
     $rest.Add($a)
 }
 
 if ($rest.Count -eq 0) {
     Write-Output 'nexus list'
-    Write-Output 'nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] <команда> [аргументы]'
+    Write-Output 'nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] [--force] <команда> [аргументы]'
     Write-Output 'nexus --project <имя> help       — команды проекта'
     Finish 2
 }
@@ -195,7 +201,9 @@ function Write-Response($r) {
 
 $script:target = $target
 $firstUntil = (Get-Date).AddSeconds([Math]::Min($timeout, 300))
-$response = Invoke-Editor $command $arguments $false $firstUntil $timeout
+# сервер получает срок, только если его задали: иначе у команды свой срок задания
+$serverTimeout = if ($timeoutSet) { $timeout } else { 0 }
+$response = Invoke-Editor $command $arguments $false $firstUntil $serverTimeout
 if ($null -eq $response) { Write-Err "Нет связи с редактором $($script:target.project)."; Finish 12 }
 
 if ($response.pending -and $response.job) {

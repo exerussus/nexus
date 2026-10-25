@@ -72,8 +72,69 @@ nexus assets.find "t:Prefab Ship" | asset.reimport <путь> | select <путь
 nexus jobs | job.status <id> | job.cancel <id>
 ```
 
-Команды AppCore (страница App, app-core 6.1+): `app.create page|popup|fragment <id>`, `app.delete`, `app.views`,
-`app.uxml`, `app.controller`, `app.page.set`, `app.generate`, `app.validate`, `app.runner*`, `app.deck` — см. README AppCore.
+### Файловый канал (агент без сети до редактора)
+
+Агенту в VM (или в WSL) порт редактора недоступен — для него тот же CLI идёт через файлы проекта:
+`<проект>/NexusTemp/` (Unity не импортирует и не чистит; внутри `.gitignore` со `*`).
+
+```
+python3 <проект>/NexusTemp/nexus-fs status
+python3 <проект>/NexusTemp/nexus-fs refresh
+python3 <проект>/NexusTemp/nexus-fs --no-wait tests.run   →  nexus-fs result <id>
+```
+
+- Вызов — файл: `cli/requests/<id>.json` → `cli/active/` (в работе, с фазой задания) → `cli/done/` (итог).
+  Сервер опрашивает папку из цикла редактора (5 раз в секунду), выполняет тем же путём, что TCP.
+- Сроки задаёт вызывающий: `--timeout` (предел выполнения), `--keep` (сколько хранить итог; без него клиент
+  удаляет итог сам после чтения).
+- Пульс `cli/alive.json` (`seq` раз в 2 с, `state: reloading` на перезагрузке домена, `busy` на синхронном
+  импорте, `phase` — чем занят редактор): клиент ждёт перезагрузку и импорт. Пульс замер до отправки вызова —
+  код 12; после отправки — код 5 и `nexus-fs result <id>` (вызов не потерян).
+- Редактор встал — `nexus-fs` сам печатает диагноз (`nexus-fs diag` — полный, работает и без ответа редактора):
+  - сторож (Windows) — отдельный процесс `Tools~/cli/nexus-watchdog.ps1`, один на сессию редактора, переживает
+    перезагрузки домена. Пульс стоит дольше 10 с — пишет `cli/stall.json`: фаза, отвечает ли окно Unity
+    (отвечает — почти наверняка модальное окно), окна процесса с заголовками, ошибки и хвост `Editor.log`;
+  - будильник: Unity в фоне не продолжает работу после перезагрузки домена, пока окно не в фокусе. Сторож будит
+    её, если окно отвечает, Unity в фоне и нет диалога: `soft` (по умолчанию) — сообщение «приложение активно»
+    без смены фокуса; `focus` — если мягкого мало, Unity на пару секунд на передний план, затем фокус возвращается;
+    `off` — только диагноз. Настройка — `cli.wake off|soft|focus` или список рядом с «CLI» в Manage; попытки —
+    в `cli/wake.json` и в `nexus-fs diag`;
+  - метки домена `cli/domain.json` (`reloading → loaded → ready`, `failed`) и `cli/startup-error.txt` — видно,
+    где оборвалась перезагрузка.
+- Пути проекта в выводе переводятся в локальные (`--no-map` — нет): путь скриншота открывается сразу.
+- Выключили CLI — `NexusTemp/cli` удаляется; `NexusTemp/screenshots` и `NexusTemp/tests` (артефакты) остаются.
+
+### Задачи
+
+Несколько команд одним вызовом: редактор ведёт шаги сам (и через перезагрузку домена), итог — отчёт по задаче
+и по каждому шагу.
+
+```
+nexus task.run --steps "refresh; play.start --clear-logs; wait --seconds 2; screenshot; play.stop"
+nexus task.run smoke --set scene=Main          сценарий ProjectSettings/Nexus/tasks/smoke.json
+nexus task.run --list | tasks | task.status <id> | task.cancel <id>
+```
+
+```json
+{
+  "name": "smoke", "timeout": 900, "onError": "stop",
+  "steps": [
+    { "id": "build",  "command": "refresh" },
+    { "id": "play",   "command": "play.start", "args": ["--clear-logs"] },
+    { "id": "shot",   "command": "screenshot" },
+    { "id": "errors", "command": "logs", "args": ["--errors", "--since", "${play.logSince}"],
+      "expect": { "data": { "rows": 0 } } },
+    { "id": "stop",   "command": "play.stop", "always": true }
+  ]
+}
+```
+
+- `onError` (задача или шаг): `stop` — после провала только шаги `always`; `continue` — дальше.
+- `expect`: `exit`, `output` / `notOutput` (подстрока), `data` (поля данных команды).
+- `${шаг.поле}` — из данных пройденного шага; `${args.ключ}` — из `--set`.
+- Пока идёт задача, меняющие команды извне получают отказ; `--force` проходит (пометка в отчёте), читающие
+  команды (`status`, `logs`, …) работают всегда. `"lock": false` — без блокировки.
+- `wait --seconds N | --frames N | --idle` — служебный шаг.
 
 **Задания.** Долгие команды (`refresh`, `compile`, `play.start/stop`, `tests.*`, `screenshot` Game) идут
 заданиями: клиент печатает этапы и ждёт итога, в том числе через перезагрузку домена — файл экземпляра в это

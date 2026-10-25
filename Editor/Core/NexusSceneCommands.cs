@@ -13,7 +13,7 @@ namespace Exerussus.Nexus.Core
     public static class NexusSceneCommands
     {
         [NexusCommand("scene.list", "Сцены: из Build Settings и открытые; --all — все сцены проекта",
-            Usage = "scene.list [--all] [--max 100]")]
+            Usage = "scene.list [--all] [--max 100]", ReadOnly = true)]
         private static int List(NexusCommandContext ctx)
         {
             var build = new List<object>();

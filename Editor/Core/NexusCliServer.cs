@@ -61,7 +61,7 @@ namespace Exerussus.Nexus.Core
         private const int MaxWaitSeconds = 3600;
 
         // протокол: camelCase, null не пишется (Newtonsoft потокобезопасен — разбор идёт в фоне)
-        private static readonly JsonSerializerSettings Wire = new JsonSerializerSettings
+        internal static readonly JsonSerializerSettings Wire = new JsonSerializerSettings
         {
             NullValueHandling = NullValueHandling.Ignore,
             ContractResolver = new Newtonsoft.Json.Serialization.DefaultContractResolver
@@ -71,18 +71,31 @@ namespace Exerussus.Nexus.Core
         };
 
 #pragma warning disable 0649 // поля заполняет Newtonsoft
-        private sealed class Request
+        /// <summary>Запрос — общий для TCP и файлового канала.</summary>
+        internal sealed class Request
         {
+            public string Id;
             public string Token;
             public string Command;
             public string[] Args;
             public string Cwd;
+
+            /// <summary>Срок, с: TCP — сколько ждать ответа; для команды с заданием — предел срока задания.</summary>
             public int Timeout;
+
+            /// <summary>Файловый канал: сколько секунд хранить итог (0 — до чтения клиентом).</summary>
+            public double Keep;
+
+            /// <summary>Пройти блокировку идущей задачи.</summary>
+            public bool Force;
         }
 #pragma warning restore 0649
 
-        private sealed class Response
+        /// <summary>Ответ — общий для TCP и файлового канала.</summary>
+        internal sealed class Response
         {
+            public string Id;
+            public string State;
             public bool Ok;
             public int ExitCode;
             public string Output;
@@ -92,16 +105,18 @@ namespace Exerussus.Nexus.Core
             /// <summary>Команда продолжается заданием: клиент ждёт его через <c>job.status</c>.</summary>
             public string Job;
             public bool Pending;
+            public double? Seconds;
+
+            /// <summary>Файловый канал: когда итог можно удалить (UTC, ISO 8601).</summary>
+            public string Expires;
         }
 
         private sealed class Pending
         {
+            public Request Request;
             public NexusCommandContext Context;
             public readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
-            public int ExitCode;
-            public string Result;
-            public string Job;
-            public bool JobRunning;
+            public Response Response;
         }
 
         // ---- состояние сервера: живёт, пока он запущен ----
@@ -133,6 +148,9 @@ namespace Exerussus.Nexus.Core
             {
                 SafeDeactivate(NexusLogBuffer.Activate);
                 SafeDeactivate(NexusCompileLog.Activate);
+                // метка «домен загружен»: застрянет до «ready» — видно, что сервер не дошёл до старта
+                NexusCliWatchdog.MarkDomain("loaded");
+                NexusCliWatchdog.Ensure(); // сторож нужен до delayCall: именно там застревает «loaded»
             }
 
             // старт — после загрузки домена, не в статическом конструкторе (там ещё рано трогать диск и настройки)
@@ -161,9 +179,15 @@ namespace Exerussus.Nexus.Core
             SafeDeactivate(() => NexusLogBuffer.Deactivate(false));
             SafeDeactivate(() => NexusCompileLog.Deactivate(false));
             SafeDeactivate(() => NexusCliJobs.Deactivate(false));
+            SafeDeactivate(() => NexusCliFileChannel.Deactivate(false));
         }
 
         public static bool Running => _running;
+
+        /// <summary>Текущий токен (null — сервер не запущен). Для файлового канала.</summary>
+        internal static string Token => _token;
+
+        internal static string ProjectName => _projectName;
 
         /// <summary>
         /// Процесс импорта ассетов или batch mode (сборка, CI): у него тот же путь проекта — его файл экземпляра
@@ -216,11 +240,16 @@ namespace Exerussus.Nexus.Core
                     NexusLogBuffer.Activate();
                     NexusCompileLog.Activate();
                     NexusCliJobs.Activate();
+                    NexusCliFileChannel.Activate();
+                    NexusCliWatchdog.ClearStartupError();
+                    NexusCliWatchdog.MarkDomain("ready");
+                    NexusCliWatchdog.Ensure();
                     NexusDiagnostics.Trace("CLI", $"сервер слушает 127.0.0.1:{_port}");
                 }
                 catch (Exception e)
                 {
                     NexusDiagnostics.Error("CLI: сервер не запустился", e);
+                    NexusCliWatchdog.MarkStartupError(e);
                     StopLocked("не запустился", false);
                 }
             }
@@ -258,7 +287,7 @@ namespace Exerussus.Nexus.Core
             while (Queue.TryDequeue(out var p))
             {
                 p.Context.Error("Редактор " + reason + " — повторите команду.");
-                p.ExitCode = NexusCommandContext.Exit.Busy;
+                p.Response = new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = p.Context.Output, Project = _projectName };
                 p.Done.Set();
             }
 
@@ -282,6 +311,8 @@ namespace Exerussus.Nexus.Core
 
             if (!reloading) SessionState.EraseBool(ActiveKey);
 
+            SafeDeactivate(() => NexusCliFileChannel.Deactivate(reloading));
+
             if (wasRunning)
             {
                 SafeDeactivate(() => NexusCliJobs.Deactivate(reloading));
@@ -294,6 +325,11 @@ namespace Exerussus.Nexus.Core
 
         private static void OnBeforeReload()
         {
+            if (_running)
+            {
+                NexusCliWatchdog.MarkDomain("reloading");
+                NexusCliWatchdog.Ensure(); // перезагрузку должен видеть живой сторож — запускаем ещё старым доменом
+            }
             lock (Gate) StopLocked("перезагружает домен", true);
         }
 
@@ -422,11 +458,42 @@ namespace Exerussus.Nexus.Core
 
         private static Response Handle(string line)
         {
-            var response = new Response { Project = _projectName };
-            Request request;
+            if (!TryParse(line, out var request, out var error)) return error;
+
+            var pending = new Pending { Request = request, Context = NewContext(request) };
+
+            // проверка и постановка — под тем же замком, что и остановка: иначе команда могла бы застрять в очереди
+            lock (Gate)
+            {
+                if (!_running)
+                    return new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = "Редактор занят — повторите.", Project = _projectName };
+                Queue.Enqueue(pending);
+            }
+
+            var wait = request.Timeout > 0 ? Math.Min(request.Timeout, MaxWaitSeconds) : DefaultWaitSeconds;
+            if (!pending.Done.Wait(TimeSpan.FromSeconds(wait)))
+            {
+                pending.Context.MarkCancelled();
+                return new Response
+                {
+                    ExitCode = NexusCommandContext.Exit.Timeout,
+                    Output = $"Нет ответа за {wait} с (редактор занят или команда долгая). Команда может завершиться позже.",
+                    Project = _projectName,
+                };
+            }
+
+            return pending.Response;
+        }
+
+        // ============================================================ общее для транспортов
+
+        /// <summary>Разобрать запрос и проверить токен. Можно звать с любого потока.</summary>
+        internal static bool TryParse(string json, out Request request, out Response error)
+        {
+            error = null;
             try
             {
-                request = string.IsNullOrEmpty(line) ? null : JsonConvert.DeserializeObject<Request>(line, Wire);
+                request = string.IsNullOrEmpty(json) ? null : JsonConvert.DeserializeObject<Request>(json, Wire);
             }
             catch
             {
@@ -435,50 +502,88 @@ namespace Exerussus.Nexus.Core
 
             if (request == null || string.IsNullOrEmpty(request.Command))
             {
-                response.ExitCode = NexusCommandContext.Exit.Usage;
-                response.Output = "Неверный запрос.";
-                return response;
+                error = new Response { Id = request?.Id, ExitCode = NexusCommandContext.Exit.Usage, Output = "Неверный запрос.", Project = _projectName };
+                return false;
             }
 
             var token = _token;
             if (token == null || !SameToken(token, request.Token))
             {
-                response.ExitCode = NexusCommandContext.Exit.Usage;
-                response.Output = "Неверный токен: клиент читает устаревший файл экземпляра — повторите.";
-                return response;
-            }
-
-            var pending = new Pending { Context = new NexusCommandContext(request.Command, request.Args ?? Array.Empty<string>(), request.Cwd) };
-
-            // проверка и постановка — под тем же замком, что и остановка: иначе команда могла бы застрять в очереди
-            lock (Gate)
-            {
-                if (!_running)
+                NexusDiagnostics.Trace("CLI", "отказ: неверный токен");
+                error = new Response
                 {
-                    response.ExitCode = NexusCommandContext.Exit.Busy;
-                    response.Output = "Редактор занят — повторите.";
-                    return response;
-                }
-
-                Queue.Enqueue(pending);
+                    Id = request.Id, ExitCode = NexusCommandContext.Exit.Usage, Project = _projectName,
+                    Output = "Неверный токен: клиент читает устаревший файл экземпляра — повторите.",
+                };
+                return false;
             }
 
-            var wait = request.Timeout > 0 ? Math.Min(request.Timeout, MaxWaitSeconds) : DefaultWaitSeconds;
-            if (!pending.Done.Wait(TimeSpan.FromSeconds(wait)))
+            return true;
+        }
+
+        private static NexusCommandContext NewContext(Request request) =>
+            new NexusCommandContext(request.Command, request.Args ?? Array.Empty<string>(), request.Cwd) { Force = request.Force };
+
+        /// <summary>
+        /// Выполнить команду в главном потоке: <see cref="NexusCommands.Execute"/> и ожидание редактора
+        /// (<see cref="NexusCommandContext.WaitForEditor"/>). Общий путь TCP, файлового канала и шагов задач.
+        /// </summary>
+        internal static int RunCommand(NexusCommandContext ctx)
+        {
+            var generation = NexusCompileLog.Generation;
+            NexusCliFileChannel.Note("команда " + ctx.Name);
+            int exit;
+            try
             {
-                pending.Context.MarkCancelled();
-                response.ExitCode = NexusCommandContext.Exit.Timeout;
-                response.Output = $"Нет ответа за {wait} с (редактор занят или команда долгая). Команда может завершиться позже.";
-                return response;
+                exit = NexusCommands.Execute(ctx);
+            }
+            finally
+            {
+                NexusCliFileChannel.Note(null);
             }
 
-            response.ExitCode = pending.ExitCode;
-            response.Ok = pending.ExitCode == NexusCommandContext.Exit.Ok;
-            response.Output = pending.Context.Output;
-            response.Result = pending.Result;
-            response.Job = pending.Job;
-            response.Pending = pending.JobRunning;
-            return response;
+            if (exit == NexusCommandContext.Exit.Ok && ctx.RetryReason != null && ctx.Job == null)
+            {
+                NexusCliRetry.Start(ctx);
+                return exit;
+            }
+
+            if (exit == NexusCommandContext.Exit.Ok && ctx.WaitForEditor && ctx.Job == null)
+                NexusEditorCommands.StartSettle(ctx, generation);
+            return exit;
+        }
+
+        /// <summary>Выполнить разобранный запрос в главном потоке и собрать ответ.</summary>
+        internal static Response ProcessRequest(Request request) => Complete(request, NewContext(request));
+
+        private static Response Complete(Request request, NexusCommandContext ctx)
+        {
+            var counter = NexusCliJobs.Counter;
+            var exit = RunCommand(ctx);
+            var result = Serialize(ctx.Data, ctx);
+            var running = ctx.Job != null && NexusCliJobs.IsRunning(ctx.Job);
+
+            // срок вызывающего — только заданию, начатому этим вызовом: job.status/task.status лишь смотрят на чужое
+            if (running && request.Timeout > 0)
+            {
+                var job = NexusCliJobs.Find(ctx.Job);
+                if (NexusCliJobs.CreatedAfter(job, counter))
+                {
+                    if (job.Kind == NexusCliTasks.Kind) NexusCliTasks.LimitTimeout(job, request.Timeout);
+                    else NexusCliJobs.LimitDeadline(job, request.Timeout);
+                }
+            }
+            return new Response
+            {
+                Id = request.Id,
+                ExitCode = exit,
+                Ok = exit == NexusCommandContext.Exit.Ok,
+                Output = ctx.Output,
+                Result = result,
+                Project = _projectName,
+                Job = ctx.Job,
+                Pending = running,
+            };
         }
 
         private static bool SameToken(string a, string b)
@@ -519,19 +624,25 @@ namespace Exerussus.Nexus.Core
             {
                 if (p.Context.Cancelled)
                 {
+                    p.Response = new Response { ExitCode = NexusCommandContext.Exit.Timeout, Project = _projectName };
                     p.Done.Set();
                     continue;
                 }
 
-                var generation = NexusCompileLog.Generation;
-                p.ExitCode = NexusCommands.Execute(p.Context);
-                if (p.ExitCode == NexusCommandContext.Exit.Ok && p.Context.WaitForEditor && p.Context.Job == null)
-                    NexusEditorCommands.StartSettle(p.Context, generation);
-                p.Result = Serialize(p.Context.Data, p.Context);
-                p.Job = p.Context.Job;
-                p.JobRunning = p.Job != null && NexusCliJobs.IsRunning(p.Job);
+                try
+                {
+                    p.Response = Complete(p.Request, p.Context);
+                }
+                catch (Exception e)
+                {
+                    NexusDiagnostics.Error("CLI: выполнение", e);
+                    p.Response = new Response { ExitCode = NexusCommandContext.Exit.Crashed, Output = "✗ " + e.Message, Project = _projectName };
+                }
+
                 p.Done.Set();
             }
+
+            NexusCliFileChannel.Tick();
         }
 
         private static string Serialize(object data, NexusCommandContext ctx)
@@ -558,9 +669,40 @@ namespace Exerussus.Nexus.Core
         private sealed class Config
         {
             public bool Enabled = true;
+
+            /// <summary>Будильник сторожа: off | soft | focus (см. <see cref="Wake"/>).</summary>
+            public string Wake = "soft";
         }
 
-        private static string ConfigPath => System.IO.Path.Combine(NexusPaths.UserRoot, "nexus-cli.json");
+        public static readonly string[] WakeModes = { "off", "soft", "focus" };
+
+        /// <summary>
+        /// Будить ли редактор, застрявший в фоне (Unity не продолжает работу после перезагрузки домена, пока окно
+        /// не в фокусе). Сторож читает настройку на каждом зависании.
+        /// <list type="bullet">
+        /// <item><c>off</c> — только диагноз;</item>
+        /// <item><c>soft</c> (по умолчанию) — сообщение окну «приложение активно» без смены фокуса;</item>
+        /// <item><c>focus</c> — если мягкого не хватило: Unity на передний план на пару секунд, затем фокус
+        /// возвращается окну, где вы работали. Без мыши и клавиатуры.</item>
+        /// </list>
+        /// </summary>
+        public static string Wake
+        {
+            get
+            {
+                var v = JsonIo.Load<Config>(ConfigPath)?.Wake;
+                return Array.IndexOf(WakeModes, v) >= 0 ? v : "soft";
+            }
+            set
+            {
+                if (Array.IndexOf(WakeModes, value) < 0) throw new ArgumentException("wake: off | soft | focus");
+                var config = JsonIo.Load<Config>(ConfigPath) ?? new Config();
+                config.Wake = value;
+                JsonIo.Save(ConfigPath, config);
+            }
+        }
+
+        internal static string ConfigPath => System.IO.Path.Combine(NexusPaths.UserRoot, "nexus-cli.json");
 
         /// <summary>Общий каталог экземпляров: %LOCALAPPDATA%\Exerussus\Nexus\instances.</summary>
         public static string InstancesRoot =>
@@ -645,7 +787,9 @@ namespace Exerussus.Nexus.Core
             get => JsonIo.Load<Config>(ConfigPath)?.Enabled ?? true;
             set
             {
-                JsonIo.Save(ConfigPath, new Config { Enabled = value });
+                var config = JsonIo.Load<Config>(ConfigPath) ?? new Config();
+                config.Enabled = value;
+                JsonIo.Save(ConfigPath, config);
                 if (value) NexusCliServer.Start();
                 else NexusCliServer.Stop();
             }

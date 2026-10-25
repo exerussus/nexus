@@ -25,7 +25,7 @@ namespace Exerussus.Nexus.Core
             NexusCliJobs.Register("screenshot", Step);
         }
 
-        private static string DefaultDir => Path.Combine(NexusPaths.ProjectRoot, "Temp", "Nexus", "Screenshots");
+        private static string DefaultDir => NexusTempPaths.Screenshots;
 
         [NexusCommand("screenshot", "Скриншот: game (по умолчанию, с UI), scene или окно редактора; печатает путь к PNG",
             Usage = "screenshot [game|scene|window] [--window <заголовок окна>] [--out <файл.png>] [--max 1280|--full] [--super 1] [--timeout 10]")]
@@ -36,6 +36,7 @@ namespace Exerussus.Nexus.Core
             var custom = NexusCliText.ResolveOut(ctx.Get("out"), ctx.WorkingDirectory, NexusPaths.ProjectRoot);
             var path = custom ?? Path.Combine(DefaultDir, $"{target}-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png");
             if (!path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) path += ".png";
+            if (custom == null) NexusTempPaths.Ensure(DefaultDir);
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
             Prune();
 
@@ -44,7 +45,7 @@ namespace Exerussus.Nexus.Core
                 case "game":
                 {
                     // сырой кадр — всегда во временной папке: запоздалая запись Unity не мусорит рядом с --out
-                    Directory.CreateDirectory(DefaultDir);
+                    NexusTempPaths.Ensure(DefaultDir);
                     var raw = Path.Combine(DefaultDir, "raw-" + Guid.NewGuid().ToString("N") + ".png");
                     var super = Math.Max(1, Math.Min(4, ctx.GetInt("super", 1)));
                     var timeout = Math.Max(2, ctx.GetInt("timeout", 10));

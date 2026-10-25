@@ -59,6 +59,7 @@ namespace Exerussus.Nexus.Core
         private const double MissingHandlerGrace = 15.0;
 
         private static readonly Dictionary<string, Action<NexusCliJob>> Handlers = new Dictionary<string, Action<NexusCliJob>>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, Action<NexusCliJob, int, string>> Aborts = new Dictionary<string, Action<NexusCliJob, int, string>>(StringComparer.Ordinal);
         private static List<NexusCliJob> _jobs;
         private static bool _dirty;
         private static bool _ticking;
@@ -72,6 +73,24 @@ namespace Exerussus.Nexus.Core
             if (string.IsNullOrEmpty(kind) || step == null) return;
             Handlers[kind] = step;
         }
+
+        /// <summary>
+        /// Аварийный выход вида: вызывается вместо обычного <see cref="Finish"/>, когда задание снимается по сроку или
+        /// его обработчик бросил исключение. Должен сам завершить задание (иначе завершится текстом по умолчанию).
+        /// </summary>
+        public static void RegisterAbort(string kind, Action<NexusCliJob, int, string> abort)
+        {
+            if (string.IsNullOrEmpty(kind) || abort == null) return;
+            Aborts[kind] = abort;
+        }
+
+        /// <summary>Номер последнего начатого задания: до вызова команды — чтобы отличить «своё» задание от чужого.</summary>
+        public static int Counter => SessionState.GetInt(CounterKey, 0);
+
+        /// <summary>Задание начато после отметки <paramref name="counter"/> (то есть этим вызовом).</summary>
+        public static bool CreatedAfter(NexusCliJob job, int counter) =>
+            job != null && job.Id != null && job.Id.Length > 1 &&
+            int.TryParse(job.Id.Substring(1), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) && n > counter;
 
         /// <summary>Все задания (идущие и последние завершённые), новые в конце.</summary>
         public static IReadOnlyList<NexusCliJob> All => Jobs;
@@ -140,6 +159,26 @@ namespace Exerussus.Nexus.Core
             }
 
             return null;
+        }
+
+        /// <summary>Срок задания не позже чем через <paramref name="seconds"/> от начала (0 и меньше — не трогать).</summary>
+        public static void LimitDeadline(NexusCliJob job, double seconds)
+        {
+            if (job == null || job.Done || seconds <= 0) return;
+            var limit = job.StartedAt + seconds;
+            if (limit < job.Deadline)
+            {
+                job.Deadline = limit;
+                _dirty = true;
+            }
+        }
+
+        /// <summary>Поставить срок задания (от текущего момента).</summary>
+        public static void SetDeadline(NexusCliJob job, double secondsFromNow)
+        {
+            if (job == null || job.Done) return;
+            job.Deadline = Now + Math.Max(1.0, secondsFromNow);
+            _dirty = true;
         }
 
         public static void SetPhase(NexusCliJob job, string phase)
@@ -239,7 +278,7 @@ namespace Exerussus.Nexus.Core
 
                 if (now > job.Deadline)
                 {
-                    Finish(job, NexusCommandContext.Exit.Timeout, $"✗ Задание «{job.Kind}» не завершилось за {job.Deadline - job.StartedAt:0} с (на шаге «{job.Phase}»).\n");
+                    Abort(job, NexusCommandContext.Exit.Timeout, $"✗ Задание «{job.Kind}» не завершилось за {job.Deadline - job.StartedAt:0} с (на шаге «{job.Phase}»).\n");
                     continue;
                 }
 
@@ -258,7 +297,7 @@ namespace Exerussus.Nexus.Core
                 catch (Exception e)
                 {
                     NexusDiagnostics.Error("CLI задание " + job.Kind, e);
-                    Finish(job, NexusCommandContext.Exit.Crashed, $"✗ {job.Kind}: {e.GetType().Name}: {e.Message}\n");
+                    Abort(job, NexusCommandContext.Exit.Crashed, $"✗ {job.Kind}: {e.GetType().Name}: {e.Message}\n");
                 }
 
                 if (!job.Done) any = true;
@@ -266,6 +305,21 @@ namespace Exerussus.Nexus.Core
 
             if (_dirty) Save();
             if (!any && Running() == null) StopTicking();
+        }
+
+        private static void Abort(NexusCliJob job, int exitCode, string reason)
+        {
+            if (Aborts.TryGetValue(job.Kind, out var abort))
+                try
+                {
+                    abort(job, exitCode, reason);
+                }
+                catch (Exception e)
+                {
+                    NexusDiagnostics.Error("CLI: аварийный выход задания " + job.Kind, e);
+                }
+
+            Finish(job, exitCode, reason);
         }
 
         // ---------------------------------------------------------------- хранилище

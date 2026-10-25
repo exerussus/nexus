@@ -6,7 +6,7 @@
   "compilationOptions": {},
   "targets": {
     ".NETCoreApp,Version=v8.0": {
-      "nexusd/0.1.2": {
+      "nexusd/0.2.0": {
         "runtime": {
           "nexusd.dll": {}
         }
@@ -14,7 +14,7 @@
     }
   },
   "libraries": {
-    "nexusd/0.1.2": {
+    "nexusd/0.2.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

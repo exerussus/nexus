@@ -128,6 +128,33 @@ namespace Exerussus.Nexus.Daemon
         private static async Task Run(Call call)
         {
             var p = call.Project;
+
+            // команды демона (dialog.*) — без редактора: они нужны как раз когда его главный поток стоит
+            if (DaemonCommands.Owns(call.Command))
+            {
+                call.State = "running";
+                SetPhase(call, "выполняет демон");
+                try
+                {
+                    // предел — timeout вызова: Win32-вызов к зависшему окну не держит вызов вечно (поток пула останется ждать)
+                    var work = Task.Run(() => DaemonCommands.Run(call));
+                    if (await Task.WhenAny(work, Task.Delay(TimeSpan.FromSeconds(call.Timeout))) != work)
+                        Finish(call, 5, $"✗ Команда демона не завершилась за {call.Timeout} с (окно не отвечает?).\n");
+                    else
+                    {
+                        var (exit, output, result) = await work;
+                        Finish(call, exit, output, result);
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log.Error("команда демона " + call.Command, e);
+                    Finish(call, 4, $"✗ Демон: {e.GetType().Name}: {e.Message}\n");
+                }
+
+                return;
+            }
+
             var deadline = DateTime.UtcNow.AddSeconds(call.Timeout);
             p.Enter();
             try

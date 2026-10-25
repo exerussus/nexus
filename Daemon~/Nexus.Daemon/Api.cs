@@ -50,9 +50,28 @@ namespace Exerussus.Nexus.Daemon
                             // список команд — от самого Bridge (bridge.hello), с ожиданием готовности редактора
                             var call = Calls.Start(p, "bridge.hello", null, p.Path, 30, 0, false, "http");
                             await Task.WhenAny(call.Done.Task, Task.Delay(TimeSpan.FromSeconds(30)));
-                            if (call.State != "done") return HttpResponse.Error(504, "редактор не ответил: " + call.Phase);
-                            var data = Json.TryParseObject(call.Result);
-                            return data != null ? Ok(data) : HttpResponse.Error(502, call.Output);
+                            var data = call.State == "done" ? Json.TryParseObject(call.Result) : null;
+                            var status = 200;
+                            if (data == null)
+                            {
+                                // редактор не ответил (модальное окно?) — команды демона всё равно доступны
+                                status = call.State != "done" ? 504 : 502;
+                                data = new JsonObject
+                                {
+                                    ["error"] = call.State != "done" ? "редактор не ответил: " + call.Phase : call.Output,
+                                    ["status"] = status,
+                                    ["editor"] = "unavailable",
+                                };
+                            }
+
+                            // команды самого демона (работают и при зависшем редакторе)
+                            data["daemonCommands"] = new JsonArray(DaemonCommands.All.Select(c => (JsonNode)new JsonObject
+                            {
+                                ["name"] = c.Name,
+                                ["usage"] = c.Usage,
+                                ["summary"] = c.Summary,
+                            }).ToArray());
+                            return HttpResponse.Json(status, Json.Write(data));
                         }
                     }
 

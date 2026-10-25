@@ -2,6 +2,12 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [0.9.1]
+
+### Исправлено
+- Плагин `app` 3.8.1: `app.runner` не компилировался — имя `AppPage` указывало на класс страницы Nexus, а не на
+  компонент AppCore.
+
 ## [0.9.0]
 
 ### Добавлено

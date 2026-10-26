@@ -27,6 +27,11 @@ part of AppCore (no separate deployment).
   - **Билд** — profile, version bump, output folder, run, history;
   - **Пайплайн** — per-profile pre/post steps (`BuildStep<T>` + `[BuildStep]` from app-core `Exerussus.AppCore.Editor.Build`; steps are discovered in every assembly, so a package can ship its own), incl. Zip (name template), version.json, S3 upload via rclone and PlayFlow Cloud upload (zip → build → optional server restart; personal keys in UserSettings);
   - **BuildInfo** — current values, stamp settings, version overlay, migration of the old deployment.
+  - **CLI** — the same build without the window: `app.build [--profile name|guid] [--dev] [--clean] [--allow-dirty] [--save]`
+    starts the selected (or named) profile with its pipeline and answers at once; `app.build.wait [--timeout 1800]` waits
+    for the result (version, hash, size, artifacts; failure — exit 1); `app.version [--bump patch|minor|major] [--set X.Y.Z]`
+    shows or changes the version in every carrier. `app.build` refuses on Play, compile errors, dirty scenes and an
+    uncommitted tree (`--allow-dirty`), never opens a dialog. One task: `task.run --steps "app.build; app.build.wait"`.
 
 ## Visual language
 

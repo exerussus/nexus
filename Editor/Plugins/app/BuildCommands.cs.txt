@@ -1,0 +1,257 @@
+// ============================================================
+//  BuildCommands.cs — сборка через CLI: то же, что кнопка «Собрать» вкладки «Сборка».
+//
+//  app.build        — проверки и запуск (сама сборка стартует через 0,5 с после ответа:
+//                     BuildPlayer держит главный поток, ответ не должен умереть вместе с ним);
+//  app.build.wait   — ждёт итога (RetryLater) и печатает запись истории;
+//  app.version      — показать / поднять / задать версию (все носители, как кнопки «+ patch»).
+//
+//  Состояние CLI-сборки — в SessionState (владелец — страница App): «идёт» и «итог».
+//  Подписка на BuildRunner.Finished нужна только пока идёт CLI-сборка; её флаг переживает
+//  перезагрузку домена (смена профиля), поэтому подписка восстанавливается в [InitializeOnLoad].
+//
+//  Личные файлы страницы (история, выбранный профиль) — в той же папке, что отдаёт странице
+//  Context.GetUserConfigPath: у команды нет Context, путь повторён здесь (UserDir).
+// ============================================================
+
+using System;
+using System.IO;
+using Exerussus.AppCore;
+using Exerussus.AppCore.Editor.Build;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    [InitializeOnLoad]
+    internal static class BuildCommands
+    {
+        private const string UserDir     = "UserSettings/Exerussus.Nexus/app";
+        private const string PrefsFile   = "build-prefs.json";
+        private const string HistoryFile = "build-history.json";
+
+        private const string RunningKey = "Exerussus.Nexus.Pages.App.Cli.BuildRunning";
+        private const string ResultKey  = "Exerussus.Nexus.Pages.App.Cli.BuildResult";
+        private const double StartDelay = 0.5;
+        private const string Untitled   = "(без имени)";
+
+        private static BuildRequest _queued;
+        private static double       _startAt;
+
+        static BuildCommands()
+        {
+            // После перезагрузки домена (смена профиля) CLI-сборка ещё идёт — ждём её итог.
+            if (!string.IsNullOrEmpty(SessionState.GetString(RunningKey, ""))) Listen(true);
+        }
+
+        private static string UserPath(string file) => Path.GetFullPath(Path.Combine(GitInfo.ProjectRoot, UserDir, file));
+
+        // ============================================================ app.build
+
+        [NexusCommand("app.build", "Собрать билд по профилю вкладки «Сборка» (с её конвейером: zip, version.json…); итог — app.build.wait",
+            Usage = "app.build [--profile имя|guid] [--dev] [--clean] [--allow-dirty] [--save]   затем: app.build.wait [--timeout 1800]")]
+        private static int Build(NexusCommandContext ctx)
+        {
+            if (BuildRunner.IsBusy || _queued != null || !string.IsNullOrEmpty(SessionState.GetString(RunningKey, "")))
+                throw new NexusCommandException("Сборка уже идёт — app.build.wait.", NexusCommandContext.Exit.Failed);
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+                throw new NexusCommandException("Идёт Play — сначала play.stop.", NexusCommandContext.Exit.Failed);
+            if (EditorApplication.isCompiling)
+                return ctx.RetryLater("идёт компиляция", 120);
+            if (EditorUtility.scriptCompilationFailed)
+                throw new NexusCommandException("В проекте ошибки компиляции — compile.errors.", NexusCommandContext.Exit.Failed);
+
+            // Несохранённые сцены: BuildRunner спросил бы диалогом — CLI диалогов не открывает.
+            var dirty = DirtyScenes();
+            if (dirty.Length > 0)
+            {
+                if (Array.Exists(dirty, d => d == Untitled))
+                    throw new NexusCommandException("Открыта несохранённая сцена без имени — сохраните её в редакторе (save из CLI открыл бы диалог).", NexusCommandContext.Exit.Failed);
+                if (!ctx.Flag("save"))
+                    throw new NexusCommandException("Несохранённые сцены: " + string.Join(", ", dirty) + " — сохраните (--save) или откатите.", NexusCommandContext.Exit.Failed);
+                if (!EditorSceneManager.SaveOpenScenes())
+                    throw new NexusCommandException("Не удалось сохранить сцены: " + string.Join(", ", dirty), NexusCommandContext.Exit.Failed);
+            }
+
+            var config = JsonStore.Load<BuildConfig>(AppCorePaths.BuildConfigPath);
+            config.Migrate();
+            var git = GitInfo.Read(config.hashLength, true);
+            if (git.DirtyKnown && git.IsDirty && !ctx.Flag("allow-dirty"))
+                throw new NexusCommandException("В рабочем дереве незакоммиченные изменения — сборка получит хеш с пометкой dirty. " +
+                                                "Закоммитьте или добавьте --allow-dirty.", NexusCommandContext.Exit.Failed);
+
+            var prefs    = JsonStore.Load<BuildPrefs>(UserPath(PrefsFile));
+            var profiles = BuildProfiles.List();
+            var wanted   = ctx.Get("profile");
+            var option   = string.IsNullOrEmpty(wanted) ? BuildProfiles.Find(profiles, prefs.selectedProfileKey) : FindProfile(profiles, wanted);
+            if (option == null && string.IsNullOrEmpty(wanted)) option = BuildProfiles.Find(profiles, ProfileOption.PlatformKey);
+            if (option == null)
+                throw new NexusCommandException("Нет профиля «" + wanted + "». Есть: " + string.Join(", ", profiles.ConvertAll(p => p.Name)));
+
+            var historyPath = UserPath(HistoryFile);
+            _queued = new BuildRequest
+            {
+                profileKey     = option.Key,
+                profilePath    = option.Path ?? "",
+                configPath     = AppCorePaths.BuildConfigPath,
+                historyPath    = historyPath,
+                userConfigDir  = Path.GetDirectoryName(historyPath) ?? "",
+                development    = ctx.Has("dev") ? ctx.Flag("dev") : prefs.development,
+                cleanBuild     = ctx.Has("clean") ? ctx.Flag("clean") : prefs.cleanBuild,
+                restoreProfile = config.restoreProfileAfterBuild,
+            };
+            _startAt = EditorApplication.timeSinceStartup + StartDelay;
+            SessionState.EraseString(ResultKey);
+            SessionState.SetString(RunningKey, option.Name);
+            Listen(true);
+            EditorApplication.update -= StartQueued;
+            EditorApplication.update += StartQueued;
+
+            var version = PlayerSettings.bundleVersion;
+            ctx.Print($"Сборка «{option.Name}» {version}{(string.IsNullOrEmpty(git.Hash) ? "" : " · " + git.Hash + (git.IsDirty ? "*" : ""))} запускается. Итог: app.build.wait");
+            ctx.Data = new { profile = option.Name, version, hash = git.Hash, dirty = git.IsDirty };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        private static void StartQueued()
+        {
+            if (_queued == null) { EditorApplication.update -= StartQueued; return; }
+            if (EditorApplication.timeSinceStartup < _startAt) return;
+            EditorApplication.update -= StartQueued;
+
+            var req = _queued;
+            _queued = null;
+            try
+            {
+                var result = BuildRunner.Start(req, out var message);
+                switch (result)
+                {
+                    case StartResult.Finished:  break;   // итог пришёл через Finished
+                    case StartResult.Scheduled: Debug.Log("[Build] " + message); break;   // продолжится после перезагрузки
+                    case StartResult.Cancelled: Done(false, "Сборка отменена (несохранённые сцены)."); break;
+                    default:                    Done(false, "Сборка не начата: " + message); break;
+                }
+            }
+            catch (Exception ex)
+            {
+                NexusDiagnostics.Error("Build: запуск из CLI", ex);
+                Done(false, "Исключение при запуске: " + ex.Message);
+            }
+        }
+
+        private static void Listen(bool on)
+        {
+            BuildRunner.Finished -= OnFinished;
+            if (on) BuildRunner.Finished += OnFinished;
+        }
+
+        private static void OnFinished(BuildHistoryEntry entry)
+        {
+            if (string.IsNullOrEmpty(SessionState.GetString(RunningKey, ""))) { Listen(false); return; }
+            SessionState.SetString(ResultKey, JsonUtility.ToJson(entry));
+            SessionState.EraseString(RunningKey);
+            Listen(false);
+        }
+
+        private static void Done(bool success, string message)
+        {
+            var entry = new BuildHistoryEntry { timeLocal = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), success = success, message = message };
+            SessionState.SetString(ResultKey, JsonUtility.ToJson(entry));
+            SessionState.EraseString(RunningKey);
+            Listen(false);
+        }
+
+        // ============================================================ app.build.wait
+
+        [NexusCommand("app.build.wait", "Дождаться итога сборки, запущенной app.build: версия, архивы, время; неудача — код 1",
+            Usage = "app.build.wait [--timeout 1800]")]
+        private static int Wait(NexusCommandContext ctx)
+        {
+            var running = SessionState.GetString(RunningKey, "");
+            if (_queued != null || !string.IsNullOrEmpty(running) || BuildRunner.IsBusy)
+                return ctx.RetryLater("идёт сборка «" + running + "»", ctx.GetInt("timeout", 1800));
+
+            var json = SessionState.GetString(ResultKey, "");
+            if (string.IsNullOrEmpty(json))
+                throw new NexusCommandException("Нет сборки, запущенной через app.build в этой сессии редактора.", NexusCommandContext.Exit.Failed);
+
+            var e = JsonUtility.FromJson<BuildHistoryEntry>(json);
+            var hash = string.IsNullOrEmpty(e.hash) ? "" : " · " + e.hash + (e.dirty ? "*" : "");
+            if (e.success) ctx.Print($"✓ {e.profile} {e.version}{hash} за {e.seconds} с: {e.message}");
+            else ctx.Error($"{e.profile} {e.version}{hash}: {e.message}");
+            if (e.sizeBytes > 0) ctx.Print($"  размер {ZipStep.FormatSize(e.sizeBytes)}{(e.zipBytes > 0 ? ", архив " + ZipStep.FormatSize(e.zipBytes) : "")}; ошибок {e.errors}, предупреждений {e.warnings}");
+            foreach (var a in e.artifacts) ctx.Print("  " + a);
+            ctx.Data = e;
+            return e.success ? NexusCommandContext.Exit.Ok : NexusCommandContext.Exit.Failed;
+        }
+
+        // ============================================================ app.version
+
+        [NexusCommand("app.version", "Версия игры: показать, поднять (--bump patch|minor|major) или задать (--set X.Y.Z) во всех носителях",
+            Usage = "app.version [--bump patch|minor|major] [--set X.Y.Z]")]
+        private static int Version(NexusCommandContext ctx)
+        {
+            var carriers = VersionBumper.Carriers();
+            var before = VersionBumper.Current(carriers);
+            VersionWriteResult result = null;
+            var bump = ctx.Get("bump");
+            var set = ctx.Get("set");
+            if (!string.IsNullOrEmpty(bump) && !string.IsNullOrEmpty(set))
+                throw new NexusCommandException("Либо --bump, либо --set.");
+
+            if (!string.IsNullOrEmpty(set))
+            {
+                if (!VersionBumper.TryParse(set, out _, out _, out _)) throw new NexusCommandException($"«{set}» — не версия X.Y.Z.");
+                result = VersionBumper.Set(set);
+            }
+            else if (!string.IsNullOrEmpty(bump))
+            {
+                BumpKind kind;
+                switch (bump)
+                {
+                    case "patch": kind = BumpKind.Patch; break;
+                    case "minor": kind = BumpKind.Minor; break;
+                    case "major": kind = BumpKind.Major; break;
+                    default: throw new NexusCommandException("--bump: patch, minor или major.");
+                }
+
+                var config = JsonStore.Load<BuildConfig>(AppCorePaths.BuildConfigPath);
+                result = VersionBumper.Apply(kind, config.bumpBuildNumbers);
+            }
+
+            if (result == null)
+            {
+                ctx.Print($"Версия {before}{(VersionBumper.InSync(carriers) ? "" : " (носители расходятся — app.version --set " + before + ")")}");
+                ctx.Data = new { version = before, inSync = VersionBumper.InSync(carriers) };
+                return NexusCommandContext.Exit.Ok;
+            }
+
+            ctx.Print($"Версия {before} → {result.Version} (носителей: {result.Written})");
+            foreach (var w in result.Warnings) ctx.Warn(w);
+            ctx.Data = new { before, version = result.Version, written = result.Written, warnings = result.Warnings };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        // ============================================================ помощники
+
+        private static ProfileOption FindProfile(System.Collections.Generic.List<ProfileOption> list, string wanted)
+        {
+            foreach (var p in list)
+                if (p.Key == wanted || string.Equals(p.Name, wanted, StringComparison.OrdinalIgnoreCase)) return p;
+            return null;
+        }
+
+        private static string[] DirtyScenes()
+        {
+            var names = new System.Collections.Generic.List<string>();
+            for (var i = 0; i < EditorSceneManager.sceneCount; i++)
+            {
+                var s = EditorSceneManager.GetSceneAt(i);
+                if (s.isDirty) names.Add(string.IsNullOrEmpty(s.path) ? Untitled : s.name);
+            }
+            return names.ToArray();
+        }
+    }
+}

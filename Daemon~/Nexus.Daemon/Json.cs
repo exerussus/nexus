@@ -118,7 +118,8 @@ namespace Exerussus.Nexus.Daemon
         /// <summary>Запись через .tmp с заменой; файл может держать открытым клиент — несколько повторов.</summary>
         public static bool WriteAtomic(string path, string content)
         {
-            var temp = path + ".tmp";
+            // своё имя временного файла на каждую запись: два потока не сталкиваются на одном .tmp
+            var temp = path + ".tmp-" + Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
             for (var attempt = 0; ; attempt++)
             {
                 try

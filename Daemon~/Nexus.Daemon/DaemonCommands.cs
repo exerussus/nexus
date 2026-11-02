@@ -8,25 +8,113 @@ namespace Exerussus.Nexus.Daemon
 {
     /// <summary>
     /// Команды, которые выполняет сам демон, не обращаясь к редактору: они нужны именно тогда, когда главный
-    /// поток Unity стоит (модальное окно). Пространство имён — <c>dialog.*</c>; остальное уходит в Bridge.
+    /// поток Unity стоит (модальное окно). <c>dialog.*</c>, <c>trash.clean</c> (корзина файлового канала, efc) и
+    /// <c>ping</c> файлового канала; остальное уходит в Bridge (<c>ping</c> по HTTP — тоже: он про главный поток Unity).
     /// </summary>
     internal static class DaemonCommands
     {
         public static readonly (string Name, string Usage, string Summary)[] All =
         {
             ("dialog.list", "dialog.list [--raw] [--no-shot]", "системные диалоги Windows редактора: заголовок, текст, кнопки, снимок (только чтение)"),
+            ("trash.clean", "trash.clean [--dry]", "очистить корзину файлового канала NexusTemp/cli/trash (клиенту в ВМ удалять нельзя)"),
+            ("ping", "ping", "в файловом канале — ответ демона без редактора (по HTTP — пинг главного потока Unity)"),
         };
 
-        public static bool Owns(string command) => command != null && command.StartsWith("dialog.", StringComparison.Ordinal);
+        public static bool Owns(Call call)
+        {
+            var c = call.Command;
+            if (c == null) return false;
+            if (c.StartsWith("dialog.", StringComparison.Ordinal) || c == "trash.clean") return true;
+            // ping демона — только клиентам efc (и шагам их пакетов); nexus-fs и HTTP пингуют главный поток Unity, как раньше
+            return c == "ping" && (call.Source == "file-efc" || call.Source == "file-batch");
+        }
+
+        /// <summary>Раздел «команды демона» к выводу help редактора.</summary>
+        public static string HelpSection()
+        {
+            var sb = new StringBuilder("\nКоманды демона (работают и при зависшем редакторе):\n");
+            var w = All.Max(c => c.Name.Length);
+            foreach (var c in All) sb.Append("  ").Append(c.Name.PadRight(w)).Append("  ").Append(c.Summary).Append('\n');
+            return sb.ToString();
+        }
 
         public static (int Exit, string Output, string Result) Run(Call call)
         {
             switch (call.Command)
             {
                 case "dialog.list": return DialogList(call);
+                case "trash.clean": return TrashClean(call);
+                case "ping": return Ping(call);
                 default:
                     return (3, $"✗ Нет команды демона «{call.Command}». Есть: {string.Join(", ", All.Select(c => c.Name))}\n", null);
             }
+        }
+
+        // ------------------------------------------------------------------ trash.clean, ping
+
+        /// <summary>Удалить файлы корзины канала (только обычные файлы прямо в trash/). <c>--dry</c> — только посчитать.</summary>
+        public static (int, string, string) TrashClean(Call call, double olderThan = 0)
+        {
+            var dry = false;
+            foreach (var a in call?.Args ?? Array.Empty<string>())
+            {
+                if (a == "--dry") dry = true;
+                else return (2, $"✗ Неизвестный аргумент «{a}». Использование: trash.clean [--dry]\n", null);
+            }
+
+            var (files, bytes) = CleanTrash(System.IO.Path.Combine(call.Project.CliDir, "trash"), dry, olderThan);
+            var size = bytes < 1024 ? $"{bytes} Б" : bytes < 1024 * 1024 ? $"{(bytes + 512) / 1024} КБ" : $"{bytes / 1048576.0:0.0} МБ";
+            var text = dry ? $"Корзина: {files} {Plural(files)}, {size} — ничего не удалено\n" : $"Корзина: удалено {files} {Plural(files)}, {size}\n";
+            return (0, text, Json.Write(new JsonObject { ["files"] = files, ["bytes"] = bytes, ["dry"] = dry }));
+        }
+
+        /// <summary>Очистка корзины: обычные файлы (не папки, не ссылки) старше olderThan секунд.</summary>
+        public static (long Files, long Bytes) CleanTrash(string dir, bool dry, double olderThan)
+        {
+            long files = 0, bytes = 0;
+            if (!System.IO.Directory.Exists(dir)) return (0, 0);
+            var now = DateTime.UtcNow;
+            foreach (var path in System.IO.Directory.GetFiles(dir))
+            {
+                try
+                {
+                    var info = new System.IO.FileInfo(path);
+                    if (info.LinkTarget != null || (info.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) continue;
+                    if (olderThan > 0 && (now - info.LastWriteTimeUtc).TotalSeconds <= olderThan) continue;
+                    var len = info.Length;
+                    if (!dry) info.Delete();
+                    files++;
+                    bytes += len;
+                }
+                catch (Exception e)
+                {
+                    Log.Warn($"корзина {path}: {e.Message}");
+                }
+            }
+
+            return (files, bytes);
+        }
+
+        private static string Plural(long n)
+        {
+            var d = n % 10;
+            var h = n % 100;
+            if (d == 1 && h != 11) return "файл";
+            if (d >= 2 && d <= 4 && (h < 12 || h > 14)) return "файла";
+            return "файлов";
+        }
+
+        private static (int, string, string) Ping(Call call)
+        {
+            var p = call.Project;
+            var data = new JsonObject
+            {
+                ["server"] = "nexusd",
+                ["version"] = DaemonInfo.Version,
+                ["editor"] = p.State,
+                ["phase"] = p.Phase,
+            };
+            return (0, "pong\n", Json.Write(data));
         }
 
         // ------------------------------------------------------------------ dialog.list

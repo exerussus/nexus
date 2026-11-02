@@ -25,6 +25,16 @@ namespace Exerussus.Nexus.Daemon
         public volatile string State = "queued"; // queued | running | done
         public volatile string Phase = "в очереди";
         public volatile string Job;
+        /// <summary>Клиент попросил отменить (файл cancel/ канала efc).</summary>
+        public volatile bool CancelRequested;
+        /// <summary>Редактору отправлен job.cancel.</summary>
+        public volatile bool CancelSent;
+        /// <summary>Пакет, от имени которого идёт шаг: проходит блокировку своего пакета.</summary>
+        public string LockOwner;
+        /// <summary>Отказ из-за чужой блокировки: id держателя.</summary>
+        public string BusyWith;
+        /// <summary>Вышел срок вызова: редактору отправлена просьба отменить задание, итог — код 5.</summary>
+        public volatile bool TimedOut;
         public int ExitCode;
         public string Output = string.Empty;
         public string Result;
@@ -129,8 +139,23 @@ namespace Exerussus.Nexus.Daemon
         {
             var p = call.Project;
 
-            // команды демона (dialog.*) — без редактора: они нужны как раз когда его главный поток стоит
-            if (DaemonCommands.Owns(call.Command))
+            // блокировка пакета efc: чужие меняющие вызовы — отказ (--force проходит, читающие — тоже)
+            var holder = p.LockHolder;
+            if (holder != null && call.LockOwner != holder && call.Id != holder && !call.Force && !p.ReadOnly(call.Command))
+            {
+                call.BusyWith = holder;
+                Finish(call, 1, $"✗ Идёт пакет {holder} с блокировкой — дождитесь его, отмените или повторите с --force.\n");
+                return;
+            }
+
+            if (call.CancelRequested)
+            {
+                Finish(call, 7, "✗ Отменено до начала выполнения.\n");
+                return;
+            }
+
+            // команды демона (dialog.*, trash.clean, ping канала) — без редактора: они нужны как раз когда его главный поток стоит
+            if (DaemonCommands.Owns(call))
             {
                 call.State = "running";
                 SetPhase(call, "выполняет демон");
@@ -163,6 +188,7 @@ namespace Exerussus.Nexus.Daemon
                 JsonObject response = null;
                 while (response == null)
                 {
+                    if (call.CancelRequested) { Finish(call, 7, "✗ Отменено до отправки в редактор.\n"); return; }
                     if (p.Removed) { Finish(call, 10, "✗ CLI в проекте выключен.\n"); return; }
                     if (p.State == "closed") { Finish(call, 10, "✗ Редактор проекта закрыт.\n"); return; }
                     if (DateTime.UtcNow > deadline) { Finish(call, 5, $"✗ Редактор не принял команду за {call.Timeout} с (фаза: {p.Phase}).\n"); return; }
@@ -235,7 +261,10 @@ namespace Exerussus.Nexus.Daemon
                 var job = Json.Str(response, "job");
                 if (!Json.Bool(response, "pending") || string.IsNullOrEmpty(job))
                 {
-                    Finish(call, (int)Json.Num(response, "exitCode", 1), first, Json.Str(response, "result"));
+                    var code = (int)Json.Num(response, "exitCode", 1);
+                    // help без аргументов: дописать команды демона (работают и при зависшем редакторе)
+                    if (call.Command == "help" && call.Args.Length == 0 && code == 0) first += DaemonCommands.HelpSection();
+                    Finish(call, code, first, Json.Str(response, "result"));
                     return;
                 }
 
@@ -248,9 +277,26 @@ namespace Exerussus.Nexus.Daemon
                     if (p.Removed) { Finish(call, 10, first + "✗ CLI в проекте выключен.\n"); return; }
                     if (p.State == "closed") { Finish(call, 4, first + "✗ Редактор закрылся во время задания — результат неизвестен.\n"); return; }
                     if (DateTime.UtcNow > hardStop) { Finish(call, 5, first + $"✗ Задание {job} не завершилось за {call.Timeout} с (фаза: {call.Phase}).\n"); return; }
+                    // срок вызова: попросить редактор отменить задание (efc, SPEC 6); через 30 с — итог 5 в любом случае
+                    if (DateTime.UtcNow > deadline && !call.CancelRequested)
+                    {
+                        call.TimedOut = true;
+                        call.CancelRequested = true;
+                    }
 
                     await Task.Delay(300);
                     if (!p.Ready) { SetPhase(call, $"задание {job}: редактор перезагружает домен"); continue; }
+
+                    // отмена: попросить редактор отменить задание (один раз), итог — когда задание закончится
+                    if (call.CancelRequested && !call.CancelSent)
+                    {
+                        var (cs, _, _) = await Bridge.Send(p, Bridge.Request("job.cancel", new[] { job }, p.Path, 10), 10, CancellationToken.None);
+                        if (cs == BridgeStatus.Ok)
+                        {
+                            call.CancelSent = true;
+                            SetPhase(call, $"задание {job}: отменяется");
+                        }
+                    }
 
                     var (status, r, _) = await Bridge.Send(p, Bridge.Request("job.status", new[] { job }, p.Path, 10), 10, CancellationToken.None);
                     if (status != BridgeStatus.Ok) continue; // перезагрузка домена — задание живёт в SessionState
@@ -280,6 +326,8 @@ namespace Exerussus.Nexus.Daemon
                         return;
                     }
 
+                    // отменённое по просьбе задание — код 7, если оно не успело закончиться успешно
+                    if (call.CancelSent && exit != 0) exit = call.TimedOut ? 5 : 7;
                     Finish(call, exit, first + (output.Length > 0 && !output.EndsWith("\n") ? output + "\n" : output), Json.Str(r, "result"));
                     return;
                 }

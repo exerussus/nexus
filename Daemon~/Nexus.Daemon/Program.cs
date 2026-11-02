@@ -57,7 +57,7 @@ namespace Exerussus.Nexus.Daemon
             var loops = new[]
             {
                 Loop("реестр", 1000, Registry.Refresh),
-                Loop("файлы", 200, FileAdapter.Tick),
+                Loop("файлы", 50, FileAdapter.Tick),
                 Loop("сторож", 500, Watchdog.Tick),
                 Loop("уборка", 10000, Calls.Sweep),
                 Loop("простой", 5000, CheckIdle),

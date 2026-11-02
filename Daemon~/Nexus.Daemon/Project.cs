@@ -61,6 +61,25 @@ namespace Exerussus.Nexus.Daemon
         /// <summary>Фаза последнего идущего вызова (для пульса и сторожа).</summary>
         public volatile string CallPhase;
 
+        /// <summary>Вызов (пакет efc с lock), который держит блокировку проекта: чужие меняющие вызовы получают отказ.</summary>
+        public volatile string LockHolder;
+
+        /// <summary>Команды редактора из bridge.hello (name, summary, usage, readOnly) — для паспорта канала и блокировки.</summary>
+        public volatile System.Text.Json.Nodes.JsonArray Commands;
+
+        /// <summary>Команда только читает и проходит чужую блокировку. trash.clean проходит любые блокировки (efc, SPEC 7).</summary>
+        public bool ReadOnly(string command)
+        {
+            if (command == "trash.clean" || command == "ping" || command == "help" || command == "dialog.list") return true;
+            // служебные: демону и клиентам нужны всегда (список команд, задания, состояние демона)
+            if (command == "bridge.hello" || command == "daemon.status" || command == "jobs" || command.StartsWith("job.", StringComparison.Ordinal)) return true;
+            var list = Commands;
+            if (list == null) return false;
+            foreach (var c in list)
+                if (Json.Str(c, "name") == command) return Json.Bool(c, "readOnly");
+            return false;
+        }
+
         public string CliDir => System.IO.Path.Combine(Path, "NexusTemp", "cli");
         public string TempDir => System.IO.Path.Combine(Path, "NexusTemp");
 

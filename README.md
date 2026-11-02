@@ -108,21 +108,50 @@ nexus jobs | job.status <id> | job.cancel <id>
 ### Файловый канал (агент без сети до редактора)
 
 Агенту в VM (или в WSL) localhost недоступен — для него тот же CLI идёт через файлы проекта:
-`<проект>/NexusTemp/` (Unity не импортирует и не чистит; внутри `.gitignore` со `*`). Канал ведёт демон.
+`<проект>/NexusTemp/` (Unity не импортирует и не чистит; внутри `.gitignore` со `*`). Канал `NexusTemp/cli` ведёт
+демон по стандарту **efc/1** (файловый канал: репозиторий efc, `SPEC.md`). Клиенты демон кладёт рядом:
 
 ```
-python3 <проект>/NexusTemp/nexus-fs status
-python3 <проект>/NexusTemp/nexus-fs refresh
-python3 <проект>/NexusTemp/nexus-fs --no-wait tests.run   →  nexus-fs result <id>
+<проект>/NexusTemp/efc --channel <проект>/NexusTemp/cli call refresh      клиент efc (Linux, статический)
+<проект>/NexusTemp/efc --channel <проект>/NexusTemp/cli --no-wait call tests.run   →  efc wait <id>
+<проект>/NexusTemp/efc --channel <проект>/NexusTemp/cli batch steps.json  пакет с шагами (ниже)
+python3 <проект>/NexusTemp/nexus-fs status                                  прежний клиент, тоже работает
 ```
 
-- Вызов — файл: `cli/requests/<id>.json` → `cli/active/` (в работе, с фазой задания) → `cli/done/` (итог).
-  Демон забирает вызов сразу (5 раз в секунду), выполняет тем же путём, что HTTP API.
-- Сроки задаёт вызывающий: `--timeout` (предел выполнения), `--keep` (сколько хранить итог; без него клиент
-  удаляет итог сам после чтения).
-- Пульс `cli/alive.json` пишет демон раз в 2 с (`daemon: true`, `state` редактора: `ready`, `reloading`,
-  `stalled`, `closed`; `phase`; `silent` — сколько молчит главный поток). Замер — не отвечает сам демон (код 13).
-- Редактор встал — `nexus-fs` сам печатает диагноз (`nexus-fs diag` — полный, работает и без ответа редактора):
+- Вызов — файл: `cli/requests/<id>.json` → `cli/active/` (принят, фаза задания) → `cli/done/` (итог).
+  Демон забирает вызов сразу (опрос 20 раз в секунду, по порядку id), выполняет тем же путём, что HTTP API.
+  Повтор id не выполняется (и после перезапуска демона), брошенный запрос (старше своего срока + 60 с) — тоже.
+- Паспорт `cli/channel.json`: команды редактора (из `bridge.hello`) и демона, лимиты, `howToStart`, контрольная
+  сумма клиента `efc`, `instance` = `nexusd@<машина>:<путь проекта>`. Чужой паспорт (проект скопирован с другой
+  машины) — канал не обслуживается, пульс `degraded`; удалите `NexusTemp/cli/channel.json` — демон подхватит канал.
+- Итог по efc: `ok`, `exitCode`, `error`, `reason` (`expired`, `cancelled`, `server-restarted`, `busy`, `unknown-command`,
+  …), `data` (данные команды), `expires`; для nexus-fs 5 — прежние `result`, `project`, `job`.
+- **Корзина вместо удаления.** Агенту в VM удалять в подключённой папке часто нельзя. Прочитанный итог клиент
+  удаляет, а если нельзя — переносит в `cli/trash/`; невзятый запрос отзывает только переносом (тот же rename, что
+  у демона, — гонки нет). Корзину чистит демон: команда `trash.clean [--dry]` (без редактора, агенту можно без
+  вопросов; клиенты шлют её сами при 50+ файлах) и раз в сутки — файлы старше суток.
+- **Отмена** — `efc cancel <id>` (`cli/cancel/<id>.json`): ещё в очереди или ждёт редактор — итог 7; идёт задание —
+  демон шлёт `job.cancel`, итог 7 по его завершении; команда уже выполнилась — обычный итог с `cancelIgnored`.
+- **Пакеты с шагами** ведёт сам демон: каждый шаг — обычный вызов (ждёт задание, переживает перезагрузку домена).
+  `${шаг.путь}` — из `data` прошлых шагов (и `exitCode`, `output`, `ok`), `expect` (`exit`, `output`, `notOutput`,
+  `data`), `always` (уборка после ошибки или отмены), `onError` и `timeout` у шага; итог — `items[]` по шагам.
+  `lock: true` (`efc --lock`) — пока пакет идёт, чужие меняющие команды получают отказ (efc — код 6 и `busyWith`,
+  nexus-fs и HTTP — код 1, как от задачи); читающие команды, `trash.clean` и `--force` проходят. Задачи
+  (`task.run`, ниже) — как прежде, их ведёт Unity.
+
+```json
+{ "batch": [
+  { "id": "build", "command": "refresh" },
+  { "id": "play",  "command": "play.start", "args": ["--clear-logs"] },
+  { "id": "errs",  "command": "logs", "args": ["--errors", "--since", "${play.logSince}"], "expect": { "data": { "rows": 0 } } },
+  { "id": "stop",  "command": "play.stop", "always": true } ] }
+```
+
+- Пульс `cli/alive.json` пишет демон раз в 2 с: `state` по efc (`ready`; `busy` — редактор перезагружает домен,
+  вызовы принимаются; `degraded` — редактор завис или закрыт, канал чужой), в `detail` — `editor` (`ready`,
+  `reloading`, `stalled`, `closed`), `phase`, `silent`, `lockedBy`. Замер — не отвечает сам демон (код 13).
+- `ping` в файловом канале отвечает демон (без редактора); `help` — команды редактора и демона.
+- Редактор встал — клиент печатает диагноз (`nexus-fs diag`, `efc diag` — работают и без ответа редактора):
   - сторож — часть демона (окна и фокус — Windows). Пульс главного потока — `ping` раз в 2 с; молчит дольше 10 с —
     `cli/stall.json`: фаза, отвечает ли окно Unity (отвечает — почти наверняка модальное окно), на переднем ли
     оно плане, окна процесса с заголовками, ошибки и хвост `Editor.log`;
@@ -133,9 +162,10 @@ python3 <проект>/NexusTemp/nexus-fs --no-wait tests.run   →  nexus-fs re
     в `cli/wake.json` и в `nexus-fs diag`;
   - метки домена `cli/domain.json` (`reloading → loaded → ready`, `failed`) и `cli/startup-error.txt` — видно,
     где оборвалась перезагрузка.
-- Пути проекта в выводе переводятся в локальные (`--no-map` — нет): путь скриншота открывается сразу.
+- nexus-fs переводит пути проекта в выводе в локальные (`--no-map` — нет); efc — артефакты по корням паспорта.
 - Выключили CLI — `NexusTemp/cli` удаляется; `NexusTemp/screenshots` и `NexusTemp/tests` (артефакты) остаются.
-- Клиент `nexus-fs` 1.0 работает и с демоном; `nexus-fs` 5 не ждёт перезагрузку сам — это делает демон.
+- Клиенты `nexus-fs` 1.0 и 5 работают и с этим демоном (5 удаляет прочитанное сам — в VM без права удаления
+  итоги остаются до `expires`); `nexus-fs` 6 — корзина вместо удаления.
 
 ### Задачи
 

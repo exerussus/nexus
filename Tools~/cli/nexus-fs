@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# nexus-cli-version: 5
+# nexus-cli-version: 6
 #
 # Nexus CLI через файловый канал проекта (NexusTemp/cli) — для сред без сети до редактора (агент в VM, WSL).
 # Тот же набор команд и коды выхода, что у nexus; ходит не через TCP, а через файлы папки проекта.
@@ -20,6 +20,11 @@
 # Коды выхода: код команды (0 — успех, 1 — ошибка, 2 — аргументы, 3 — нет команды, 4 — исключение/прервано,
 # 5 — истёк --timeout или редактор замолчал посреди вызова: итог — nexus-fs result <id>), 10 — нет открытого
 # редактора, 12 — редактор не отвечает (вызов не отправлен), 13 — демон не отвечает. Код 6 наружу не отдаётся.
+#
+# Удалять файлы в общей папке агенту в ВМ часто нельзя: прочитанное nexus-fs удаляет, а если нельзя — переносит в
+# корзину канала (NexusTemp/cli/trash), её чистит демон (trash.clean; nexus-fs сам просит об этом при 50+ файлах).
+# Невзятый запрос, уходя, nexus-fs отзывает переносом в корзину. Канал — по стандарту efc/1; полноценный клиент
+# лежит рядом: NexusTemp/efc --channel NexusTemp/cli help (пакеты с шагами, отмена, ожидание долгого).
 
 import json
 import os
@@ -44,17 +49,33 @@ def err(text):
     sys.stderr.flush()
 
 
-# запросы, которые этот клиент положил в requests/ и ещё не увидел забранными: уходя — убрать, чтобы
+# запросы, которые этот клиент положил в requests/ и ещё не увидел забранными: уходя — отозвать, чтобы
 # демон, запущенный позже, не выполнил их задним числом (забранный запрос уже лежит в active/)
 PENDING = []
+TRASH_AUTO_CLEAN = 50
+
+
+def trash_dir(path):
+    """Корзина канала для файла канала: NexusTemp/cli/trash."""
+    d = os.path.dirname(os.path.abspath(path))
+    while os.path.basename(d) and os.path.basename(d) != "cli":
+        d = os.path.dirname(d)
+    return os.path.join(d, "trash")
+
+
+def withdraw(path):
+    """Отозвать запрос только переносом в корзину: тот же rename, что у демона при приёме, — гонки нет."""
+    try:
+        os.makedirs(trash_dir(path), exist_ok=True)
+        os.replace(path, os.path.join(trash_dir(path), "req-" + os.path.basename(path)))
+        return True
+    except OSError:
+        return False
 
 
 def finish(code):
     for path in PENDING:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        withdraw(path)
     sys.stdout.flush()
     sys.exit(code)
 
@@ -163,7 +184,7 @@ class Channel:
                 for line in diagnose(self.cli):
                     err("  " + line)
                 finish(13)
-            editor = alive.get("state")
+            editor = editor_state(alive)
             if editor == "reloading":
                 self.say_wait("Редактор перезагружает домен — демон дождётся…")
             elif editor == "stalled":
@@ -224,9 +245,21 @@ def diagnose(cli, full=False):
         if alive.get("daemon"):
             names = {"ready": "готов", "reloading": "перезагружает домен", "stalled": "не отвечает", "closed": "закрыт"}
             lines.append("демон nexusd %s (pid %s): пульс %s назад" % (alive.get("daemonVersion") or "?", alive.get("daemonPid"), "%d с" % age if age is not None else "?"))
-            lines.append("редактор: %s, молчит %s с, фаза: %s" % (names.get(alive.get("state"), alive.get("state")), alive.get("silent"), alive.get("phase") or "?"))
+            ed = editor_state(alive)
+            lines.append("редактор: %s, молчит %s с, фаза: %s" % (names.get(ed, ed), alive.get("silent"), alive.get("phase") or "?"))
+            if alive.get("detail", {}).get("foreignInstance"):
+                lines.append("! канал чужой (%s): демон его не обслуживает — удалите NexusTemp/cli/channel.json, если это копия проекта"
+                             % alive["detail"]["foreignInstance"])
+            if alive.get("detail", {}).get("lockedBy"):
+                lines.append("блокировка: пакет %s — меняющие команды получат отказ" % alive["detail"]["lockedBy"])
         else:
             lines.append("пульс: %s, %s назад, фаза: %s" % (alive.get("state"), "%d с" % age if age is not None else "?", alive.get("phase") or "?"))
+        trash = os.path.join(cli, "trash")
+        try:
+            n = len([f for f in os.listdir(trash) if os.path.isfile(os.path.join(trash, f))])
+            lines.append("корзина: %d файлов%s" % (n, " — nexus-fs trash.clean" if n > TRASH_AUTO_CLEAN else ""))
+        except OSError:
+            pass
 
     domain = read_json(os.path.join(cli, "domain.json"))
     if domain:
@@ -391,7 +424,7 @@ def main(argv):
                 ch.load_instance()
                 out(data, report=sub != "done")
                 if not keep:
-                    try_remove(path)
+                    try_remove(path, ("task-done-" if sub != "done" else "done-") + os.path.basename(path))
                 finish(int(data.get("exitCode", 1)))
         for sub in ("active", os.path.join("tasks", "active")):
             data = read_json(os.path.join(ch.cli, sub, args[0] + ".json"))
@@ -441,9 +474,45 @@ def apply_task_flags(definition, extra, timeout, keep):
         j += 1
 
 
-def try_remove(path):
+def editor_state(alive):
+    """Состояние редактора: nexusd 0.3+ пишет его в detail.editor (state — состояние демона по efc), 0.2 — в state."""
+    return (alive.get("detail") or {}).get("editor") or alive.get("state")
+
+
+def try_remove(path, trash_name=None):
+    """Убрать прочитанный файл: удалить, а если в общей папке удалять нельзя — перенести в корзину канала."""
     try:
         os.remove(path)
+        return
+    except FileNotFoundError:
+        return
+    except OSError:
+        pass
+    trash = trash_dir(path)
+    try:
+        os.makedirs(trash, exist_ok=True)
+        os.replace(path, os.path.join(trash, trash_name or ("done-" + os.path.basename(path))))
+    except OSError:
+        return
+    auto_clean(os.path.dirname(trash))
+
+
+def auto_clean(cli):
+    """Корзина переполнена — попросить демон очистить её (trash.clean), итог не ждать."""
+    trash = os.path.join(cli, "trash")
+    try:
+        n = len([f for f in os.listdir(trash) if os.path.isfile(os.path.join(trash, f))])
+    except OSError:
+        return
+    if n <= TRASH_AUTO_CLEAN:
+        return
+    req_dir = os.path.join(cli, "requests")
+    for f in os.listdir(req_dir) if os.path.isdir(req_dir) else []:
+        if (read_json(os.path.join(req_dir, f)) or {}).get("command") == "trash.clean":
+            return
+    rid = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-000-" + uuid.uuid4().hex[:6]
+    try:
+        write_atomic(os.path.join(req_dir, rid + ".json"), {"v": 1, "id": rid, "command": "trash.clean", "args": [], "from": "nexus-fs", "timeout": 60, "keep": 60})
     except OSError:
         pass
 
@@ -554,7 +623,7 @@ def run_task_file(ch, definition, no_wait, out):
         if task_path in PENDING:
             PENDING.remove(task_path)
         if not definition.get("keep"):
-            try_remove(done)
+            try_remove(done, "task-done-" + os.path.basename(done))
         summary = data.get("summary") or ""
         if "Неверный токен" in summary:
             ch.say_wait("Устаревший токен — перечитываю экземпляр…")

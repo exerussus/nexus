@@ -672,11 +672,13 @@ namespace Exerussus.Nexus.Core
 
         private static void Pump()
         {
-            // демон мог упасть или выйти по простою, пока редактор открыт: проверка раз в 30 с (дешёвая — файл и pid)
+            // демон мог упасть или выйти по простою, пока редактор открыт: проверка раз в 30 с (дешёвая — файл и pid);
+            // там же — обновление пакета, которое Unity в фоне не применила
             var now = EditorApplication.timeSinceStartup;
             if (now >= _nextDaemonCheck)
             {
                 _nextDaemonCheck = now + 30;
+                NexusPackageWatch.Check();
                 NexusCliDaemon.Ensure();
             }
 

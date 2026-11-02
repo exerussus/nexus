@@ -268,12 +268,12 @@ namespace Exerussus.Nexus.Daemon
                     // случайные нажатия в это время уходят в пустое окно, а не в сцену
                     var h = WinApi.WakeWindow(windows);
                     if (h == 0) return "нет окна-пробудителя (пакет старше 2.0.0-pre.5 или CLI выключен)";
-                    return WinApi.Focus(h, false, false) ? null : "Windows не дал фокус";
+                    return WinApi.Focus(h, false) ? null : "Windows не дал фокус";
                 }
                 case "quiet":
                 {
                     // без разворачивания: свёрнутое остаётся свёрнутым, развёрнутое тут же уходит под остальные окна
-                    if (!WinApi.Focus(wake.Main, false, false)) return "Windows не дал фокус";
+                    if (!WinApi.Focus(wake.Main, false)) return "Windows не дал фокус";
                     if (!wake.WasIconic) WinApi.SendToBottom(wake.Main);
                     return null;
                 }

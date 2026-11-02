@@ -168,8 +168,9 @@ namespace Exerussus.Nexus.Daemon
 
         /// <summary>
         /// Передний план без мыши и клавиатуры: на время привязать ввод к потоку текущего переднего окна.
-        /// <paramref name="restore"/> — развернуть свёрнутое; <paramref name="raise"/> — поднять поверх остальных
-        /// (без него окно всё равно становится активным, Windows поднимает его сам — тихий шаг сразу опускает обратно).
+        /// <paramref name="restore"/> — развернуть свёрнутое; <paramref name="raise"/> — BringWindowToTop.
+        /// Проверено на Windows: без него SetForegroundWindow из демона отклоняется даже с привязанным вводом —
+        /// активирует именно подъём. Тихие шаги поднимают окно за экраном или сразу опускают главное обратно.
         /// </summary>
         public static bool Focus(long handle, bool restore, bool raise = true)
         {

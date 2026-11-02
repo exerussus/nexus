@@ -2,6 +2,15 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.0.0-pre.6]
+
+Nexus Daemon 0.3.2.
+
+### Исправлено
+- Тихие шаги будильника (`window`, `quiet`) всегда получали «Windows не дал фокус» и сразу уступали `focus`:
+  без `BringWindowToTop` Windows отклоняет `SetForegroundWindow` из демона даже с привязанным вводом. Подъём
+  возвращён: окно-пробудитель поднимается за пределами экрана, главное окно на шаге `quiet` сразу опускается обратно.
+
 ## [2.0.0-pre.5]
 
 Тихий будильник. Nexus Daemon 0.3.1, nexus-fs 7.

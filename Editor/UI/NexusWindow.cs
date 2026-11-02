@@ -17,7 +17,7 @@ namespace Exerussus.Nexus.UI
     /// </summary>
     public sealed class NexusWindow : EditorWindow
     {
-        private const string HealthId = "::health";
+        private const string HealthId = NexusNavigation.HealthId;
 
         private static Color BgHard  => NexusTheme.Get(NexusToken.BgHard);
         private static Color BgSoft  => NexusTheme.Get(NexusToken.BgSoft);
@@ -45,12 +45,32 @@ namespace Exerussus.Nexus.UI
         private string _selectedId = NexusSelectionStore.ActiveId ?? HealthId;
 
         [MenuItem("Exerussus/Nexus/Open")]
-        public static void Open()
+        public static void Open() => Open(true);
+
+        /// <summary>Открыть окно; focus=false — не отнимать фокус у окна, где работает человек.</summary>
+        private static void Open(bool focus)
         {
-            var window = GetWindow<NexusWindow>();
+            var window = GetWindow<NexusWindow>("Nexus", focus);
             window.titleContent = new GUIContent("Nexus");
             window.minSize = new Vector2(460f, 300f);
             window.Show();
+        }
+
+        // навигация ядра (page.open, IPageContext.OpenPage) открывает окно через эту ссылку
+        [InitializeOnLoadMethod]
+        private static void RegisterNavigation() => NexusNavigation.RegisterWindow(Open);
+
+        // просьба показать страницу: после текущего обработчика (страница могла попросить из своего OnEnter)
+        private void OnNavigate(string id, bool focus)
+        {
+            EditorApplication.delayCall += () =>
+            {
+                if (this == null) return;   // окно закрыли, пока ждали
+                if (_sidebar == null) NexusSelectionStore.ActiveId = id;   // ещё не построено — возьмёт при сборке
+                else Select(id);
+                if (focus) Focus();
+                else Repaint();
+            };
         }
 
         private void OnEnable()
@@ -61,6 +81,8 @@ namespace Exerussus.Nexus.UI
             NexusTheme.Changed += OnThemeChanged;
             NexusStatusLog.Changed -= ShowStatus;
             NexusStatusLog.Changed += ShowStatus;
+            NexusNavigation.Requested -= OnNavigate;
+            NexusNavigation.Requested += OnNavigate;
             if (_sidebar != null) RebuildSidebar();
         }
 
@@ -69,6 +91,7 @@ namespace Exerussus.Nexus.UI
             NexusView.Changed -= RebuildSidebar;
             NexusTheme.Changed -= OnThemeChanged;
             NexusStatusLog.Changed -= ShowStatus;
+            NexusNavigation.Requested -= OnNavigate;
             _host?.Dispose();
             _host = null;
         }

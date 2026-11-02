@@ -96,6 +96,7 @@ nexus logs.clear [--console]
 nexus play.start [--scene Main] [--clear-logs] [--fail-on-errors]
 nexus play.stop | play.pause [on|off] | play.step [--frames 10]
 nexus scene.list [--all] | scene.open Main [--save|--discard] | scene.save [--as …]
+nexus page.list | page.open world [--focus]     страницы окна Nexus; показать (по id или имени, без фокуса)
 nexus screenshot                               Game с UI → путь к PNG (по умолчанию ≤1280 px, --full — как есть)
 nexus screenshot scene | screenshot window --window Inspector
 nexus tests.run [--mode edit|play|all] [--filter Analytics] → итог и упавшие тесты (код 1)

@@ -47,5 +47,12 @@ namespace Exerussus.Nexus.Core
 
         public string GetSessionKey(string sub)
             => $"Exerussus.Nexus.page.{_id}.{sub}";
+
+        public bool OpenPage(string pageId)
+        {
+            if (NexusNavigation.Open(pageId, false, out _, out var error)) return true;
+            SetStatus("Не открыть страницу: " + error, StatusKind.Warning);
+            return false;
+        }
     }
 }

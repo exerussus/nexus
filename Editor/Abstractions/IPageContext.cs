@@ -40,5 +40,13 @@ namespace Exerussus.Nexus.Abstractions
 
         /// <summary>Ключ для SessionState/EditorPrefs, заскоупленный на эту страницу.</summary>
         string GetSessionKey(string sub);
+
+        /// <summary>
+        /// Попросить хаб показать другую страницу в рабочем окне (по id или имени; «health» — Nexus Health).
+        /// Переключает хаб: объект той страницы сюда не попадает, она получает обычные OnEnter/OnFocus; данные —
+        /// через <see cref="Bus"/>. Фокус окно не забирает. Переключение — после текущего обработчика.
+        /// false — страница не развёрнута, скрыта или не найдена (причина — в статусе).
+        /// </summary>
+        bool OpenPage(string pageId);
     }
 }

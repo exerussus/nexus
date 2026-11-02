@@ -376,20 +376,22 @@ namespace Exerussus.Nexus.Core
             return NexusCommandContext.Exit.Ok;
         }
 
-        [NexusCommand("cli.wake", "Будильник сторожа для редактора, застрявшего в фоне: off, soft (по умолчанию), focus",
-            Usage = "cli.wake [off|soft|focus]")]
+        [NexusCommand("cli.wake", "Будильник сторожа для редактора, застрявшего в фоне: off, soft, quiet (по умолчанию), focus",
+            Usage = "cli.wake [off|soft|quiet|focus]")]
         private static int CliWake(NexusCommandContext ctx)
         {
             var mode = ctx.Arg(0);
             if (mode != null)
             {
-                if (System.Array.IndexOf(NexusCliStore.WakeModes, mode) < 0) throw new NexusCommandException("cli.wake off|soft|focus");
+                if (System.Array.IndexOf(NexusCliStore.WakeModes, mode) < 0) throw new NexusCommandException("cli.wake off|soft|quiet|focus");
                 NexusCliStore.Wake = mode;
             }
 
             var now = NexusCliStore.Wake;
-            ctx.Print($"будильник: {now}" + (now == "focus" ? " (при застревании Unity на пару секунд выходит на передний план)" : now == "soft" ? " (без смены фокуса)" : " (только диагноз)"));
-            ctx.Data = new { wake = now };
+            ctx.Print($"будильник: {now}" + (now == "focus" ? " (при застревании Unity на пару секунд выходит на передний план)"
+                : now == "quiet" ? " (окно-пробудитель, затем главное окно без разворачивания, крайний случай — focus)"
+                : now == "soft" ? " (без смены фокуса)" : " (только диагноз)"));
+            ctx.Data = new { wake = now, wakeWindow = NexusWakeWindow.Exists };
             return NexusCommandContext.Exit.Ok;
         }
 

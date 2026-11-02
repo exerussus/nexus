@@ -728,8 +728,8 @@ namespace Exerussus.Nexus.Core
         {
             public bool Enabled = true;
 
-            /// <summary>Будильник сторожа: off | soft | focus (см. <see cref="Wake"/>).</summary>
-            public string Wake = "soft";
+            /// <summary>Будильник сторожа: off | soft | quiet | focus (см. <see cref="Wake"/>).</summary>
+            public string Wake = "quiet";
 
             /// <summary>Пускать TCP-запросы мимо демона (отладка, клиенты 1.x). По умолчанию выключено.</summary>
             public bool DirectTcp;
@@ -741,15 +741,18 @@ namespace Exerussus.Nexus.Core
         /// </summary>
         public static bool DirectTcp => JsonIo.Load<Config>(ConfigPath)?.DirectTcp ?? false;
 
-        public static readonly string[] WakeModes = { "off", "soft", "focus" };
+        public static readonly string[] WakeModes = { "off", "soft", "quiet", "focus" };
 
         /// <summary>
         /// Будить ли редактор, застрявший в фоне (Unity не продолжает работу после перезагрузки домена, пока окно
         /// не в фокусе). Сторож читает настройку на каждом зависании.
         /// <list type="bullet">
         /// <item><c>off</c> — только диагноз;</item>
-        /// <item><c>soft</c> (по умолчанию) — сообщение окну «приложение активно» без смены фокуса;</item>
-        /// <item><c>focus</c> — если мягкого не хватило: Unity на передний план на пару секунд, затем фокус
+        /// <item><c>soft</c> — сообщение окну «приложение активно» без смены фокуса (проверено: Unity этого мало);</item>
+        /// <item><c>quiet</c> (по умолчанию) — по шагам, от незаметного к жёсткому: окно-пробудитель
+        /// (<see cref="NexusWakeWindow"/>) → главное окно без разворачивания, под остальными → focus. Ожил — фокус
+        /// сразу обратно. Будит, только когда вы ≥ 1,5 с не трогаете мышь и клавиатуру; тронули — фокус вам сразу;</item>
+        /// <item><c>focus</c> — сразу жёстко: Unity развёрнута на передний план на пару секунд, затем фокус
         /// возвращается окну, где вы работали. Без мыши и клавиатуры.</item>
         /// </list>
         /// </summary>
@@ -758,14 +761,15 @@ namespace Exerussus.Nexus.Core
             get
             {
                 var v = JsonIo.Load<Config>(ConfigPath)?.Wake;
-                return Array.IndexOf(WakeModes, v) >= 0 ? v : "soft";
+                return Array.IndexOf(WakeModes, v) >= 0 ? v : "quiet";
             }
             set
             {
-                if (Array.IndexOf(WakeModes, value) < 0) throw new ArgumentException("wake: off | soft | focus");
+                if (Array.IndexOf(WakeModes, value) < 0) throw new ArgumentException("wake: off | soft | quiet | focus");
                 var config = JsonIo.Load<Config>(ConfigPath) ?? new Config();
                 config.Wake = value;
                 JsonIo.Save(ConfigPath, config);
+                NexusWakeWindow.Sync();
             }
         }
 
@@ -859,6 +863,7 @@ namespace Exerussus.Nexus.Core
                 JsonIo.Save(ConfigPath, config);
                 if (value) NexusCliServer.Start();
                 else NexusCliServer.Stop();
+                NexusWakeWindow.Sync();
             }
         }
 

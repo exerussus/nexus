@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# nexus-cli-version: 6
+# nexus-cli-version: 7
 #
 # Nexus CLI через файловый канал проекта (NexusTemp/cli) — для сред без сети до редактора (агент в VM, WSL).
 # Тот же набор команд и коды выхода, что у nexus; ходит не через TCP, а через файлы папки проекта.
@@ -306,13 +306,13 @@ def diagnose(cli, full=False):
     if isinstance(wakes, dict):
         wakes = [wakes]
     if wakes:
-        names = {"soft": "мягко", "focus": "фокусом"}
+        names = {"soft": "мягко", "window": "окном-пробудителем", "quiet": "тихо", "focus": "фокусом"}
         lines.append("будильник (последние):")
         for w in wakes[-(10 if full else 3):]:
             lines.append("  %s %s: %s за %s с (%s)" % ((w.get("at") or "")[11:19], names.get(w.get("step"), w.get("step")),
                          "ожил" if w.get("ok") else "не помогло", w.get("seconds"), w.get("phase") or "?"))
     if stall and stall.get("wake") == "off":
-        lines.append("  будильник выключен: cli.wake soft|focus")
+        lines.append("  будильник выключен: cli.wake quiet|focus")
     if not stall and full:
         watchdog = read_json(os.path.join(cli, "watchdog.json"))
         lines.append("сторож: %s" % ("работает, зависаний нет" if watchdog else "не запущен (не Windows или Nexus старее 1.0)"))

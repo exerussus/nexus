@@ -30,7 +30,16 @@ namespace Exerussus.Nexus.Daemon
         [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint to, bool on);
         [DllImport("user32.dll")] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] private static extern bool GetLastInputInfo(ref LastInputInfo info);
         [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LastInputInfo
+        {
+            public uint Size;
+            public uint Time;
+        }
 
         private const uint WM_NULL = 0x0000;
         private const uint WM_ACTIVATEAPP = 0x001C;
@@ -41,6 +50,13 @@ namespace Exerussus.Nexus.Daemon
         private const uint SMTO_ABORTIFHUNG = 0x0002;
         private const int SW_RESTORE = 9;
         private const int SW_MINIMIZE = 6;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
+
+        /// <summary>Класс окна-пробудителя, которое держит Nexus внутри редактора (заголовок — <c>NexusWake:&lt;pid&gt;</c>).</summary>
+        public const string WakeClass = "NexusWakeWnd";
 
         public sealed class Window
         {
@@ -89,6 +105,30 @@ namespace Exerussus.Nexus.Daemon
             return 0;
         }
 
+        /// <summary>Окно-пробудитель Nexus: 1×1 за пределами экрана, без панели задач. 0 — нет (старый пакет, режим не quiet).</summary>
+        public static long WakeWindow(List<Window> windows)
+        {
+            foreach (var w in windows)
+                if (w.Class == WakeClass)
+                    return w.Handle;
+            return 0;
+        }
+
+        /// <summary>Сколько секунд человек не трогал мышь и клавиатуру (null — неизвестно).</summary>
+        public static double? IdleSeconds()
+        {
+            if (!Supported) return null;
+            var info = new LastInputInfo { Size = (uint)Marshal.SizeOf<LastInputInfo>() };
+            if (!GetLastInputInfo(ref info)) return null;
+            return unchecked((uint)Environment.TickCount - info.Time) / 1000.0;
+        }
+
+        /// <summary>Опустить окно под остальные, не меняя активное: активно, но не заслоняет работу.</summary>
+        public static void SendToBottom(long handle)
+        {
+            if (Supported && handle != 0) SetWindowPos(new IntPtr(handle), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
         public static bool Foreground(int pid)
         {
             if (!Supported) return false;
@@ -126,8 +166,12 @@ namespace Exerussus.Nexus.Daemon
             PostMessage(hwnd, active ? WM_SETFOCUS : WM_KILLFOCUS, IntPtr.Zero, IntPtr.Zero);
         }
 
-        /// <summary>Передний план без мыши и клавиатуры: на время привязать ввод к потоку текущего переднего окна.</summary>
-        public static bool Focus(long handle, bool restore)
+        /// <summary>
+        /// Передний план без мыши и клавиатуры: на время привязать ввод к потоку текущего переднего окна.
+        /// <paramref name="restore"/> — развернуть свёрнутое; <paramref name="raise"/> — поднять поверх остальных
+        /// (без него окно всё равно становится активным, Windows поднимает его сам — тихий шаг сразу опускает обратно).
+        /// </summary>
+        public static bool Focus(long handle, bool restore, bool raise = true)
         {
             if (!Supported || handle == 0) return false;
             var hwnd = new IntPtr(handle);
@@ -138,7 +182,7 @@ namespace Exerussus.Nexus.Daemon
             var attached = fgThread != 0 && fgThread != self && AttachThreadInput(self, fgThread, true);
             try
             {
-                BringWindowToTop(hwnd);
+                if (raise) BringWindowToTop(hwnd);
                 return SetForegroundWindow(hwnd);
             }
             finally

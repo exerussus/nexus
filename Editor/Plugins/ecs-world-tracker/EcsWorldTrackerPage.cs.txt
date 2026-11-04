@@ -19,6 +19,8 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         const string CoreDirRel = "Plugins/Exerussus.EcsLite";
         const string CoreFile = "Exerussus.EcsLite.cs";
         const string CoreSrcAsset = "Exerussus.EcsLite.cs.txt";
+        const string AsmdefFile = "Exerussus.EcsLite.asmdef";
+        const string AsmdefAsset = "Exerussus.EcsLite.asmdef.txt";
         const string LicenseFile = "LICENSE";
         const string LicenseAsset = "LICENSE.txt";
         const int MaxRows = 5000;
@@ -584,10 +586,13 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         // ── core deploy (servicing external footprint) ───────────────────────────────
         string CoreDirAbs => Path.Combine(Application.dataPath, CoreDirRel);
         string CoreFileAbs => Path.Combine(CoreDirAbs, CoreFile);
+        // Любой asmdef в папке ядра — свой (как «EcsLite» в RPG) или развёрнутый нами.
+        bool HasAsmdef => Directory.Exists(CoreDirAbs) && Directory.GetFiles(CoreDirAbs, "*.asmdef").Length > 0;
 
         void RefreshCoreStatus() {
             if (_statusCore == null) return;
-            if (File.Exists(CoreFileAbs)) { _statusCore.text = "развёрнуто · Assets/" + CoreDirRel + "/" + CoreFile; NexusClass.SetFg(_statusCore, NexusToken.Ok); }
+            if (File.Exists(CoreFileAbs) && !HasAsmdef) { _statusCore.text = "развёрнуто без asmdef — сборки игры не смогут сослаться на ECS. Нажми «Развернуть ядро»"; NexusClass.SetFg(_statusCore, NexusToken.Warning); }
+            else if (File.Exists(CoreFileAbs)) { _statusCore.text = "развёрнуто · Assets/" + CoreDirRel + "/" + CoreFile; NexusClass.SetFg(_statusCore, NexusToken.Ok); }
             else { _statusCore.text = "не развёрнуто — нужен форк ECS в проекте"; NexusClass.SetFg(_statusCore, NexusToken.Warning); }
         }
 
@@ -599,9 +604,15 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
                 File.WriteAllText(CoreFileAbs, srcCs);
                 var lic = ReadCompanion(LicenseAsset);
                 if (lic != null) File.WriteAllText(Path.Combine(CoreDirAbs, LicenseFile), lic);
+                // Сборка ядра. Свой asmdef в папке (любой) не трогаем — у проекта могут быть ссылки на его имя.
+                if (!HasAsmdef) {
+                    var asmdef = ReadCompanion(AsmdefAsset);
+                    if (asmdef != null) File.WriteAllText(Path.Combine(CoreDirAbs, AsmdefFile), asmdef);
+                }
                 AssetDatabase.Refresh();
                 RefreshCoreStatus(); UpdateToolInfo();
-                Context.SetStatus("ECS-ядро развёрнуто в Assets/" + CoreDirRel + "/. Войди в play mode для обзора.", StatusKind.Ok);
+                if (HasAsmdef) Context.SetStatus("ECS-ядро развёрнуто в Assets/" + CoreDirRel + "/. Войди в play mode для обзора.", StatusKind.Ok);
+                else Context.SetStatus("Ядро развёрнуто без asmdef: компаньон " + AsmdefAsset + " не найден в развёртке страницы.", StatusKind.Warning);
             } catch (Exception e) { Context.SetStatus("Не удалось развернуть ядро: " + e.Message, StatusKind.Error); }
         }
 

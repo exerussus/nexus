@@ -2,6 +2,14 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.0.0-pre.10]
+
+### Исправлено
+- ECS Worlds (страница 1.2): «Развернуть ядро» кладёт рядом с `Exerussus.EcsLite.cs` сборку `Exerussus.EcsLite.asmdef`.
+  Раньше ядро падало в Assembly-CSharp, и игровые asmdef не могли на него сослаться. Свой asmdef в папке ядра
+  (под любым именем) не перезаписывается; ядро без asmdef страница показывает предупреждением.
+- README страницы: верный путь развёртки (`Assets/Plugins/Exerussus.EcsLite/`) и имя сборки.
+
 ## [2.0.0-pre.9]
 
 ### Добавлено

@@ -238,7 +238,8 @@ namespace Exerussus.Nexus.Pages.App
             var list = Usages.Of(_usageKey);
             if (list.Count == 0)
             {
-                _usageOutput.Add(_kit.Faint(LocKeyScanner.IsDynamic(_usageKey, LocSettings.Current) ? "Ключ собирается кодом (динамический префикс)." : "Употреблений нет."));
+                _usageOutput.Add(_kit.Faint(LocKeyScanner.IsDynamic(_usageKey, LocSettings.Current) || Usages.IsPrefixed(_usageKey)
+                                                ? "Ключ собирается кодом (динамический или найденный префикс)." : "Употреблений нет."));
                 return;
             }
 
@@ -316,11 +317,12 @@ namespace Exerussus.Nexus.Pages.App
         private VisualElement UnusedKeysCard(LocSettings settings)
         {
             var unused = Table == null ? new List<LocEntry>()
-                : Table.Entries.Where(e => !Usages.Contains(e.Key) && !LocKeyScanner.IsDynamic(e.Key, settings))
+                : Table.Entries.Where(e => !Usages.Contains(e.Key) && !Usages.IsPrefixed(e.Key) && !LocKeyScanner.IsDynamic(e.Key, settings))
                        .OrderBy(e => e.Key, StringComparer.Ordinal).ToList();
 
             var card = _kit.Card($"Нигде не употребляются: {unused.Count}",
-                                 "С учётом динамических префиксов (Настройки → Dynamic Prefixes). Ключи, которые код собирает из частей, так не найти.");
+                                 $"С учётом динамических префиксов (Настройки → Dynamic Prefixes) и найденных в коде ({Usages.Prefixes.Count}: " +
+                                 "Tr(\"alchemy.why.\" + id)). Ключ, собранный кодом без такого префикса, так не найти.");
             foreach (var entry in unused.Take(150))
             {
                 var key = entry.Key;

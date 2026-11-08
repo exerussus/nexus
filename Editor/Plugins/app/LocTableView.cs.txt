@@ -139,7 +139,7 @@ namespace Exerussus.Nexus.Pages.App
         }
 
         private bool IsUsed(string key) =>
-            LocKeyScanner.IsDynamic(key, LocSettings.Current) || (Usages != null && Usages.Contains(key));
+            LocKeyScanner.IsDynamic(key, LocSettings.Current) || (Usages != null && (Usages.Contains(key) || Usages.IsPrefixed(key)));
 
         private int UsageCount(string key) => Usages != null ? Usages.FileCount(key) : 0;
 
@@ -697,7 +697,7 @@ namespace Exerussus.Nexus.Pages.App
             var uses = UsageCount(entry.Key);
             var usage = Usages == null ? "употребления не считали"
                 : uses > 0 ? $"используется в {uses} файл(ах)"
-                : LocKeyScanner.IsDynamic(entry.Key, LocSettings.Current) ? "собирается кодом"
+                : LocKeyScanner.IsDynamic(entry.Key, LocSettings.Current) || Usages.IsPrefixed(entry.Key) ? "собирается кодом"
                 : "нигде не используется";
             var tag = _kit.Tag(uses > 0 ? NexusTagColor.Blue : NexusTagColor.Amber, usage);
             if (uses > 0)

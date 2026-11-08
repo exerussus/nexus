@@ -1,0 +1,189 @@
+// ============================================================
+//  LocCommands.cs — команды CLI локализации AppCore (app-core 6.2+): база и пакеты модулей.
+//    loc.packages — каталог таблиц: порядок, кто нашёл, ключи, ошибки, только чтение;
+//    loc.find     — ключи по ключу или тексту на любом языке (с пакетом);
+//    loc.usages   — где употреблён ключ («^KEY», L.KEY, шаблоны без «^», провайдеры);
+//    loc.check    — сверка проекта с таблицами: нет в таблицах, не употребляются, ошибки файлов;
+//    loc.rename   — переименовать ключ в таблицах и в употреблениях (--dry — только план).
+//
+//  Логика — в редакторе AppCore (LocWorkspace, LocUsages): команда разбирает аргументы и печатает.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Exerussus.AppCore.Editor.Localization;
+using Exerussus.AppCore.Localization;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal static class LocCommands
+    {
+        [NexusCommand("loc.packages", "Таблицы локализации: база и пакеты по порядку применения", Usage = "loc.packages", ReadOnly = true)]
+        private static int Packages(NexusCommandContext ctx)
+        {
+            var settings = LocSettings.Current;
+            if (settings == null) throw new NexusCommandException("нет LocalizationSettings", NexusCommandContext.Exit.Failed);
+
+            var workspace = LocWorkspace.Load(settings);
+            ctx.Print(LocPackageCatalog.UsesProviders
+                          ? "источник: провайдер " + string.Join(", ", LocPackageCatalog.Providers.Select(p => p.Name))
+                          : "источник: маски " + (settings.PackageMasks.Length == 0 ? "(нет)" : string.Join(" · ", settings.PackageMasks)));
+            ctx.Print($"в игре: {settings.PackageLoading}" + (settings.PackageLoading == LocPackageLoading.Auto ? $", запечено {settings.Packages.Count}" : string.Empty));
+
+            var data = new List<object>();
+            for (var i = 0; i < workspace.Files.Count; i++)
+            {
+                var file = workspace.Files[i];
+                var flags = new List<string> { $"ключей {file.Table.Count}" };
+                if (!file.Writable) flags.Add("только чтение");
+                if (file.Info.Source == LocSource.Mod) flags.Add("мод");
+                if (!file.Exists) flags.Add("нет файла");
+                if (file.Errors.Count > 0) flags.Add($"ошибок {file.Errors.Count}");
+                ctx.Print($"{i + 1,3}. {LocalizationTab.PackageLabel(file),-28} {file.Info.Path}  {string.Join(", ", flags)}");
+                foreach (var error in file.Errors.Take(5)) ctx.Warn($"      {error}");
+
+                data.Add(new
+                {
+                    order = i + 1, id = file.Info.Id, name = LocalizationTab.PackageLabel(file), path = file.Info.Path, provider = file.Info.Provider,
+                    keys = file.Table.Count, readOnly = !file.Writable, mod = file.Info.Source == LocSource.Mod, isBase = file.Info.IsBase,
+                    errors = file.Errors.Select(e => e.ToString()).ToList(),
+                });
+            }
+
+            ctx.Print($"ключей в сводке: {workspace.Merged.Count}, языки: {string.Join(", ", workspace.Merged.Languages.Select(l => l.Code))}");
+            ctx.Data = new { source = LocPackageCatalog.UsesProviders ? "provider" : "masks", loading = settings.PackageLoading.ToString(), files = data };
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("loc.find", "Найти ключи по ключу или тексту (любой язык)", Usage = "loc.find <текст> [--lang ru] [--limit 50]", ReadOnly = true)]
+        private static int Find(NexusCommandContext ctx)
+        {
+            var query = string.Join(" ", ctx.Positional).Trim().TrimStart('^');
+            if (query.Length == 0) throw new NexusCommandException("нужен текст: loc.find ui.menu");
+
+            var language = ctx.Get("lang");
+            var limit = Math.Max(1, ctx.GetInt("limit", 50));
+            var workspace = LocWorkspace.Load();
+            var found = new List<object>();
+
+            foreach (var entry in workspace.Merged.Entries.OrderBy(e => e.Key, StringComparer.Ordinal))
+            {
+                var byKey = entry.Key.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
+                var byText = entry.Values.Any(v => v.Text != null && (language == null || LocSlots.Same(v.Language, language)) &&
+                                                   v.Text.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (!byKey && !byText) continue;
+
+                var package = LocalizationTab.PackageLabel(workspace.HomeOf(entry.Key));
+                var shown = entry.Find(language ?? workspace.Merged.Languages.FirstOrDefault()?.Code)?.Text ?? "—";
+                ctx.Print($"{entry.Key,-40} [{package}] {shown.Replace('\n', ' ')}");
+                found.Add(new
+                {
+                    key = entry.Key, package, files = workspace.FilesOf(entry.Key).Select(LocalizationTab.PackageLabel).ToList(),
+                    values = entry.Values.ToDictionary(v => v.Slot, v => v.Text),
+                });
+
+                if (found.Count >= limit)
+                {
+                    ctx.Print($"… показано {limit}, уточните запрос или --limit");
+                    break;
+                }
+            }
+
+            if (found.Count == 0) ctx.Print("Ничего не найдено.");
+            ctx.Data = found;
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("loc.usages", "Где употреблён ключ", Usage = "loc.usages <ключ>", ReadOnly = true)]
+        private static int Usages(NexusCommandContext ctx)
+        {
+            var key = Loc.KeyOf(ctx.Arg(0) ?? throw new NexusCommandException("нужен ключ: loc.usages ui.menu.play"));
+            var errors = new List<string>();
+            var index = LocUsages.Scan(LocSettings.Current, null, null, errors);
+            foreach (var error in errors) ctx.Warn(error);
+
+            var list = index.Of(key);
+            foreach (var usage in list) ctx.Print($"{usage.File}:{usage.Line}  [{usage.Kind}]  {usage.Snippet}");
+            ctx.Print(list.Count == 0 ? "Употреблений нет." : $"употреблений {list.Count} в {index.FileCount(key)} файл(ах); обход {index.FilesScanned} файлов, {index.Seconds:0.0} с");
+            ctx.Data = list.Select(u => new { file = u.File, line = u.Line, column = u.Column, kind = u.Kind, snippet = u.Snippet }).ToList();
+            return NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("loc.check", "Сверить проект с таблицами: нет в таблицах, не употребляются, ошибки файлов",
+            Usage = "loc.check [--unused] [--limit 50]", ReadOnly = true)]
+        private static int Check(NexusCommandContext ctx)
+        {
+            var settings = LocSettings.Current;
+            if (settings == null) throw new NexusCommandException("нет LocalizationSettings", NexusCommandContext.Exit.Failed);
+
+            var limit = Math.Max(1, ctx.GetInt("limit", 50));
+            var parseErrors = new List<string>();
+            var merged = LocEditor.ReadMerged(parseErrors);
+            foreach (var error in parseErrors.Take(limit)) ctx.Warn(error);
+
+            var report = LocKeyScanner.Check(merged, settings);
+            ctx.Print($"ключей: {merged.Count} · нет в таблицах: {report.Unknown.Count} · не употребляются: {report.Unused.Count} · ошибок разбора: {parseErrors.Count}");
+
+            foreach (var pair in report.Unknown.Take(limit)) ctx.Error($"нет в таблицах: {pair.Key} — {string.Join(", ", pair.Value.Take(3))}");
+            if (ctx.Flag("unused"))
+                foreach (var key in report.Unused.Take(limit)) ctx.Print($"не употребляется: {key}");
+
+            ctx.Data = new
+            {
+                keys = merged.Count, unknown = report.Unknown.ToDictionary(p => p.Key, p => p.Value), unused = report.Unused, parseErrors,
+            };
+            return report.Unknown.Count > 0 || parseErrors.Count > 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
+        }
+
+        [NexusCommand("loc.rename", "Переименовать ключ в таблицах и употреблениях",
+            Usage = "loc.rename <старый> <новый> [--dry] [--keys-only]")]
+        private static int Rename(NexusCommandContext ctx)
+        {
+            var from = Loc.KeyOf(ctx.Arg(0) ?? throw new NexusCommandException("нужно: loc.rename старый новый"));
+            var to = Loc.KeyOf(ctx.Arg(1) ?? throw new NexusCommandException("нужно: loc.rename старый новый"));
+            if (!LocSlots.IsValidKey(to)) throw new NexusCommandException($"«{to}» — недопустимый ключ (латиница, цифры, _ . -)");
+
+            var workspace = LocWorkspace.Load();
+            if (!workspace.Merged.Contains(from)) throw new NexusCommandException($"ключа {from} нет в таблицах", NexusCommandContext.Exit.Failed);
+            if (workspace.Merged.Contains(to)) throw new NexusCommandException($"ключ {to} уже есть", NexusCommandContext.Exit.Failed);
+
+            var keys = new HashSet<string>(LocEditor.BuiltinKeys, StringComparer.Ordinal);
+            foreach (var entry in workspace.Merged.Entries) keys.Add(entry.Key);
+
+            var errors = new List<string>();
+            var plan = ctx.Flag("keys-only") ? new List<LocUsages.RenameChange>() : LocUsages.PlanRename(from, to, LocSettings.Current, keys, errors);
+            ctx.Print($"таблицы: {string.Join(", ", workspace.FilesOf(from).Select(LocalizationTab.PackageLabel))}");
+            foreach (var change in plan) ctx.Print($"{change.File}:{change.Line}  {change.After}");
+            foreach (var error in errors) ctx.Warn(error);
+
+            if (ctx.Flag("dry"))
+            {
+                ctx.Print($"план: замен {plan.Count} (ничего не записано — уберите --dry)");
+                ctx.Data = new { dry = true, changes = plan.Select(c => new { file = c.File, line = c.Line, before = c.Before, after = c.After }).ToList() };
+                return NexusCommandContext.Exit.Ok;
+            }
+
+            workspace.RenameKey(from, to);
+            var result = workspace.Save();
+            foreach (var warning in result.Warnings) ctx.Warn(warning);
+            if (!result.Ok)
+            {
+                foreach (var conflict in result.Conflicts) ctx.Error("изменён на диске: " + conflict);
+                foreach (var error in result.Errors) ctx.Error(error);
+                return NexusCommandContext.Exit.Failed;
+            }
+
+            var changed = new List<string>();
+            var count = ctx.Flag("keys-only") ? 0 : LocUsages.ApplyRename(from, to, changed, errors, LocSettings.Current, keys);
+            LocEditor.GenerateKeys();
+
+            ctx.Print($"{from} → {to}: таблиц записано {result.Written.Count}, замен {count} в {changed.Count} файл(ах)");
+            ctx.Data = new { tables = result.Written, files = changed, replacements = count, errors };
+            ctx.WaitForEditor = changed.Exists(p => p.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) || result.Written.Count > 0;
+            return errors.Count > 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
+        }
+    }
+}

@@ -17,11 +17,14 @@ part of AppCore (no separate deployment).
 - **Nav classes** — standard navigation classes (`to-back-page__navigation`) and the full class list.
 - **External** — footprint status with full paths; cleanup limited to regenerable outputs.
 - **Text** — character sets, source scanning, font chain, bake + coverage report (logic in AppCore).
-- **Локализация** — app-core 4.4+, sub-tabs:
-  - **Таблица** — base `.loc` table: keys × languages, plural forms per row (±), project scan (usages, keys missing from the table, unused keys), add/rename/delete;
-  - **Языки и окончания** — language names, plural rule, fallback, order (first = primary), add/remove, plural preview;
-  - **Патчи** — Play Mode: layers in apply order (with rejected counts), overridden values, history of any key (`Loc.History`); outside Play Mode: check a patch file against the base;
-  - **Настройки** — `LocalizationSettings` inspector, generate `L` constants, project key check, import of the old positional JSON.
+- **Локализация** — app-core 6.2+ (base table + module packages), sub-tabs:
+  - **Таблица** — all tables as one list (`LocWorkspace`): keys × languages, plural forms, package column and filter, overridden keys (⇅ with the chain per slot), usage counts; a new key goes to the chosen package, an edit — to the file of the effective value, «Пакет» moves a key; rename shows the usages and replaces them (tables saved at once), delete lists them; «Сохранить» writes only changed files and refuses files changed on disk;
+  - **Пакеты** — catalog in apply order (base, masks or the project's `ILocPackageProvider`), keys and language coverage per file, parse errors with lines, read-only and mod flags, runtime loading mode (`Auto` / `Project`), new package;
+  - **Языки и окончания** — language names, plural rule, fallback, order (first = primary), add/remove, plural preview — across all files;
+  - **Употребления** — one project pass (`LocUsages`: `^KEY`, `L.X`, usage patterns without `^`, providers): where a key is used (click opens file:line), keys used but missing from the tables (add to a package), unused keys, overridden keys;
+  - **Патчи** — Play Mode: layers in apply order (packages marked), overridden values, history of any key (`Loc.History`); outside Play Mode: check a patch file against the tables;
+  - **Настройки** — `LocalizationSettings` inspector, generate `L` constants, bake the runtime package list, project key check, import of the old positional JSON.
+  - **CLI** — `loc.packages`, `loc.find <text> [--lang]`, `loc.usages <key>`, `loc.check [--unused]` (exit 1 on unknown keys or parse errors), `loc.rename <old> <new> [--dry] [--keys-only]`.
 - **Консоль** — AppDeck settings (app-core 4.1+): activation, hotkey, window, log capacity, metrics and mini-HUD, Preloaded Assets status, player-prefs reset. No compile reference to the Deck assembly — fields go through `SerializedObject`, so the plugin still builds with app-core 4.0.
 - **Сборка** — sub-tabs:
   - **Билд** — profile, version bump, output folder, run, history;

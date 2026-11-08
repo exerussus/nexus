@@ -1,10 +1,11 @@
 // ============================================================
 //  LocalizationTab.cs — вкладка «Локализация»: таблица ключей, языки и окончания, патчи, настройки.
 //
-//  Локализация — часть app-core 4.4 (Exerussus.AppCore.Localization). Таблица — один файл .loc
-//  (LocalizationSettings → Base Table, обычно Assets/App/Localization/base.loc). Правки копятся
-//  в памяти и пишутся кнопкой «Сохранить»; запись идёт через LocEditor — он же перегенерирует
-//  константы L и, если идёт игра, перечитывает таблицу.
+//  Локализация — часть app-core (Exerussus.AppCore.Localization). Таблицы — база
+//  (LocalizationSettings → Base Table) и пакеты модулей (маски в настройках или провайдер проекта,
+//  app-core 6.2+). Вкладка правит их сводку (LocWorkspace) одним списком: правка ложится в файл,
+//  откуда пришло действующее значение, новый ключ — в выбранный пакет. Правки копятся в памяти
+//  и пишутся кнопкой «Сохранить» — только изменённые файлы; файл, изменённый на диске, не затирается.
 //
 //  «Патчи» — слои, которые проект и моды добавляют в рантайме (Loc.AddLayer). Их видно только
 //  в Play Mode: порядок слоёв, перекрытые значения и история любого ключа — кто поставил,
@@ -14,6 +15,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Exerussus.AppCore;
 using Exerussus.AppCore.Editor.Localization;
 using Exerussus.AppCore.Localization;
@@ -25,10 +27,12 @@ using UnityEngine.UIElements;
 
 namespace Exerussus.Nexus.Pages.App
 {
-    internal sealed class LocalizationTab : IAppTab
+    internal sealed partial class LocalizationTab : IAppTab
     {
-        private const string SubtabKey = "loc.subtab";
-        private static readonly string[] Subtabs = { "Таблица", "Языки и окончания", "Патчи", "Настройки", "Справка" };
+        private const string SubtabKey = "loc.subtab2";
+        private static readonly string[] Subtabs = { "Таблица", "Пакеты", "Языки и окончания", "Употребления", "Патчи", "Настройки", "Справка" };
+
+        private const int TableTab = 0, PackagesTab = 1, LanguagesTab = 2, UsagesTab = 3, PatchesTab = 4, SettingsTab = 5, HelpTab = 6;
 
         private readonly AppKit _kit;
         private readonly LocTableView _tableView;
@@ -38,11 +42,14 @@ namespace Exerussus.Nexus.Pages.App
         private int _subtab;
         private bool _renderedEnabled;
 
-        // общая с таблицей модель базового файла
-        internal LocTable Table;
-        internal string TablePath;
+        // рабочая копия всех таблиц (база + пакеты); Table — их сводка, её правит таблица
+        internal LocWorkspace Workspace;
+        internal LocTable Table => Workspace != null && Workspace.Files.Count > 0 ? Workspace.Merged : null;
         internal bool Dirty;
-        internal List<LocError> ParseErrors = new();
+        internal readonly List<string> ParseErrors = new();
+
+        // употребления ключей — один обход проекта по кнопке; null — не считали
+        internal LocUsageIndex Usages;
 
         // проверка патча вне игры
         private string _patchPath = string.Empty;
@@ -89,7 +96,7 @@ namespace Exerussus.Nexus.Pages.App
                 return;
 
             Load();
-            _tableView.Rescan();
+            _tableView.CollectUnknown();
             Render();
         }
 
@@ -109,16 +116,55 @@ namespace Exerussus.Nexus.Pages.App
 
         internal void Load()
         {
-            Table = null;
-            TablePath = LocEditor.BaseTablePath;
             Dirty = false;
+            Workspace = LocWorkspace.Load();
+            CollectErrors();
+        }
+
+        private void CollectErrors()
+        {
             ParseErrors.Clear();
+            if (Workspace == null) return;
 
-            var parsed = LocEditor.ReadBaseTable();
-            if (parsed == null) return;
+            foreach (var file in Workspace.FilesWithErrors)
+                foreach (var error in file.Errors)
+                    ParseErrors.Add($"{file.Info.Path}, {error}");
+        }
 
-            Table = parsed.Table;
-            ParseErrors.AddRange(parsed.Errors);
+        /// <summary>Все ключи таблиц и встроенные — для констант L в поиске употреблений.</summary>
+        internal HashSet<string> AllKeys()
+        {
+            var keys = new HashSet<string>(LocEditor.BuiltinKeys, StringComparer.Ordinal);
+            if (Table != null)
+                foreach (var entry in Table.Entries) keys.Add(entry.Key);
+            return keys;
+        }
+
+        /// <summary>Посчитать употребления всех ключей одним обходом (с прогрессом, можно прервать).</summary>
+        internal void ScanUsages()
+        {
+            var errors = new List<string>();
+            try
+            {
+                Usages = LocUsages.Scan(LocSettings.Current, AllKeys(),
+                                        p => EditorUtility.DisplayCancelableProgressBar("Локализация", "Ищу употребления ключей…", p), errors);
+            }
+            catch (Exception e)
+            {
+                Debug.LogException(e);
+                Context.SetStatus("Поиск употреблений не удался — подробности в консоли.", StatusKind.Error);
+                Usages = null;
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+
+            if (errors.Count > 0) Debug.LogWarning("[Loc] Поиск употреблений:\n" + string.Join("\n", errors));
+            if (Usages != null)
+                Context.SetStatus($"Употребления посчитаны: файлов {Usages.FilesScanned}, {Usages.Seconds:0.0} с" +
+                                  (errors.Count > 0 ? $" · замечаний {errors.Count} — в консоли" : string.Empty),
+                                  errors.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
         }
 
         internal void MarkDirty()
@@ -127,19 +173,60 @@ namespace Exerussus.Nexus.Pages.App
             _tableView.UpdateSummary();
         }
 
-        internal void Save()
+        internal bool Save()
         {
-            if (Table == null) return;
+            if (Workspace == null) return false;
 
-            if (ParseErrors.Count > 0 &&
-                !EditorUtility.DisplayDialog("Локализация", $"Файл читался с ошибками ({ParseErrors.Count}): строки с ошибками при сохранении пропадут. Сохранить?", "Сохранить", "Отмена"))
-                return;
+            var lossy = new List<string>();
+            foreach (var file in Workspace.FilesWithErrors)
+                if (file.Writable) lossy.Add(file.Info.Path);
 
-            LocEditor.WriteBaseTable(Table);
+            if (lossy.Count > 0 &&
+                !EditorUtility.DisplayDialog("Локализация",
+                                             $"Читались с ошибками: {string.Join(", ", lossy.Take(5))}{(lossy.Count > 5 ? " …" : string.Empty)}. " +
+                                             "Строки с ошибками пропадут, если эти файлы перезапишутся. Сохранить?", "Сохранить", "Отмена"))
+                return false;
+
+            var result = Workspace.Save();
+
+            if (result.Conflicts.Count > 0)
+            {
+                var reload = EditorUtility.DisplayDialog("Локализация",
+                                                         "Файлы изменились на диске после чтения — ничего не записано:\n" +
+                                                         string.Join("\n", result.Conflicts.Take(10)) +
+                                                         "\n\nПеречитать? Несохранённые правки пропадут.", "Перечитать", "Оставить");
+                if (reload)
+                {
+                    Load();
+                    Render();
+                }
+
+                Context.SetStatus("Не сохранено: файлы изменились на диске.", StatusKind.Error);
+                return false;
+            }
+
+            if (result.Errors.Count > 0)
+            {
+                Debug.LogError("[Loc] Сохранение не удалось:\n" + string.Join("\n", result.Errors));
+                Context.SetStatus($"Не сохранено: ошибок {result.Errors.Count} — подробности в консоли.", StatusKind.Error);
+                return false;
+            }
+
             Dirty = false;
-            ParseErrors.Clear();
-            Context.SetStatus($"Сохранено: {TablePath}" + (EditorApplication.isPlaying ? " · игра перечитала таблицу" : string.Empty), StatusKind.Ok);
-            _tableView.UpdateSummary();
+            CollectErrors();
+            LocEditor.GenerateKeys();
+
+            if (result.Warnings.Count > 0) Debug.LogWarning("[Loc] Сохранено с замечаниями:\n" + string.Join("\n", result.Warnings));
+
+            var written = result.Written.Count == 0 ? "изменений нет"
+                : result.Written.Count == 1 ? result.Written[0]
+                : $"файлов {result.Written.Count}";
+            Context.SetStatus($"Сохранено: {written}" + (EditorApplication.isPlaying && result.Written.Count > 0 ? " · игра перечитала таблицы" : string.Empty) +
+                              (result.Warnings.Count > 0 ? $" · замечаний {result.Warnings.Count} — в консоли" : string.Empty),
+                              result.Warnings.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
+
+            Render();
+            return true;
         }
 
         // ============================================================ рендер
@@ -215,10 +302,10 @@ namespace Exerussus.Nexus.Pages.App
 
             var settings = LocSettings.Current;
 
-            if ((_subtab == 0 || _subtab == 1) && Table == null)
+            if ((_subtab == TableTab || _subtab == LanguagesTab) && Table == null)
             {
-                var card = _kit.Card("Базовая таблица", "Один файл .loc со всеми ключами проекта.");
-                card.Add(_kit.Status(StatusKind.Warning, "Таблица не назначена в настройках."));
+                var card = _kit.Card("Базовая таблица", "Файл .loc с ключами проекта; ключи модулей — в пакетах (маски в настройках).");
+                card.Add(_kit.Status(StatusKind.Warning, "Таблица не назначена в настройках, пакетов нет."));
                 var create = _kit.Btn(NexusRole.Primary, $"Создать {AppCorePaths.BaseLocTablePath}", () =>
                 {
                     LocEditor.EnsureBaseTable(settings);
@@ -235,10 +322,12 @@ namespace Exerussus.Nexus.Pages.App
 
             switch (_subtab)
             {
-                case 0: _body.Add(_tableView.Build()); break;
-                case 1: _body.Add(LanguagesView()); break;
-                case 2: _body.Add(PatchesView()); break;
-                case 4: _body.Add(HelpView()); break;
+                case TableTab: _body.Add(_tableView.Build()); break;
+                case PackagesTab: _body.Add(PackagesView()); break;
+                case LanguagesTab: _body.Add(LanguagesView()); break;
+                case UsagesTab: _body.Add(UsagesView()); break;
+                case PatchesTab: _body.Add(PatchesView()); break;
+                case HelpTab: _body.Add(HelpView()); break;
                 default:
                     _body.Add(SettingsCard(settings));
                     _body.Add(ToolsCard());
@@ -409,7 +498,7 @@ namespace Exerussus.Nexus.Pages.App
                 var info = _kit.Card("Слои в игре",
                                      "Патчи добавляются в рантайме (Loc.AddLayer, AddLayerFromFile): порядок задаёт загрузчик модов проекта, " +
                                      "поздний слой главнее. Список слоёв, перекрытия и история ключей видны в Play Mode.");
-                info.Add(_kit.Status(StatusKind.Info, "Запустите игру, чтобы увидеть слои."));
+                info.Add(_kit.Status(StatusKind.Info, "Запустите игру, чтобы увидеть слои. Пакеты модулей (Loc.SetPackages) — тоже слои, отмечены «пакет»."));
                 root.Add(info);
                 root.Add(PatchCheckCard());
                 return root;
@@ -430,7 +519,7 @@ namespace Exerussus.Nexus.Pages.App
                 row.Add(_kit.Gap(6f));
                 row.Add(_kit.Text(layer.Id));
                 row.Add(_kit.Gap(8f));
-                row.Add(_kit.Faint($"{layer.Source} · ключей {layer.Keys}"));
+                row.Add(_kit.Faint($"{layer.Source}{(layer.IsPackage ? " · пакет" : string.Empty)} · ключей {layer.Keys}"));
                 if (layer.Rejected > 0)
                 {
                     row.Add(_kit.Gap(8f));
@@ -659,7 +748,8 @@ namespace Exerussus.Nexus.Pages.App
             new()
             {
                 Id = "code", Name = "Ключ в коде",
-                Intro = "Константы L.* генерируются сами при сохранении таблицы — опечатка в ключе ловится компилятором.",
+                Intro = "Константы L.* генерируются сами при сохранении таблиц (база и пакеты) — опечатка в ключе ловится компилятором. " +
+                        "Ключ с точками (ui.save.count) даёт константу L.ui_save_count. Вызовы без «^» (Loc.Tr(\"key\")) поиск находит по шаблонам из настроек.",
                 Cards = new[]
                 {
                     new HelpCard
@@ -675,6 +765,34 @@ namespace Exerussus.Nexus.Pages.App
             {
                 Id = "langs", Name = "Новый язык",
                 Intro = "«Языки и окончания» → код и название на самом языке → «+ Язык». Правило окончаний подберётся по коду, его можно сменить. В таблице у ключей появится поле языка; непереведённое подсвечено и видно в фильтре «С пропусками».",
+            },
+            new()
+            {
+                Id = "packages", Name = "Пакеты модулей",
+                Intro = "Пакет — .loc модуля поверх базы: свои ключи, свои языки. В редакторе пакеты находят маски (Настройки → Package Masks) " +
+                        "или провайдер проекта (ILocPackageProvider) — тогда порядок и моды задаёт он. Таблица показывает все пакеты одним списком: " +
+                        "правка ложится в файл, откуда пришло действующее значение, новый ключ — в пакет, выбранный у «+ Ключ».",
+                Cards = new[]
+                {
+                    new HelpCard
+                    {
+                        Title = "Пакеты грузит AppCore", When = "Package Loading = Auto: пакеты каталога запекаются в настройки, игра кладёт их сама.",
+                        Steps = "1. Настройки → Package Masks: Assets/**/Localization/*.loc.\n2. «Пакеты» → «+ Пакет» или положите .loc в папку модуля.\n3. Готово — в игре пакеты встанут поверх базы в порядке путей.",
+                        Code = "Assets/Game/Inventory/Localization/inventory.loc",
+                    },
+                    new HelpCard
+                    {
+                        Title = "Пакеты грузит игра", When = "Package Loading = Project: порядок паков и моды решает свой загрузчик.",
+                        Steps = "Соберите пакеты в порядке загрузки и отдайте одним вызовом — прежние пакеты владельца заменятся одной пересборкой.",
+                        Code = "var list = new List<LocPackage>();\nforeach (var pack in packs)\n    list.Add(LocPackage.FromFile(\"pack:\" + pack.Id, pack.LocPath, pack.IsMod ? LocSource.Mod : LocSource.Project));\nLoc.SetPackages(this, list);",
+                    },
+                    new HelpCard
+                    {
+                        Title = "Свой порядок в редакторе", When = "Маски не знают порядка загрузки и модов вне проекта — их знает провайдер.",
+                        Steps = "Класс в редакторской сборке с конструктором без параметров находится сам; маски тогда не используются.",
+                        Code = "public sealed class PackLocProvider : ILocPackageProvider\n{\n    public string Name => \"паки\";\n    public void Collect(LocSettings s, List<LocPackageFile> into)\n    {\n        foreach (var pack in Packs.InLoadOrder())\n            into.Add(LocPackageFile.Create(pack.LocPath, \"pack:\" + pack.Id, readOnly: pack.IsDownloaded));\n    }\n}",
+                    },
+                },
             },
             new()
             {
@@ -707,7 +825,8 @@ namespace Exerussus.Nexus.Pages.App
             new()
             {
                 Id = "debug", Name = "Отладка",
-                Intro = "Консоль AppDeck (`): loc.lang — язык и список; loc.where KEY — значение и слой; loc.history KEY — кто что менял; loc.missing — непереведённое; loc.layers — слои; loc.reload — перечитать.",
+                Intro = "Консоль AppDeck (`): loc.lang — язык и список; loc.where KEY — значение и слой; loc.history KEY — кто что менял; loc.missing — непереведённое; loc.layers — слои; loc.reload — перечитать. " +
+                        "CLI Nexus: loc.packages, loc.find, loc.usages KEY, loc.check, loc.rename A B [--dry].",
             },
         };
 
@@ -777,8 +896,8 @@ namespace Exerussus.Nexus.Pages.App
                     buttons.Add(_kit.Btn(NexusRole.Primary, "Открыть " + key, () =>
                     {
                         _tableView.Preselect(key);
-                        _subtab = 0;
-                        SessionState.SetInt(Context.GetSessionKey(SubtabKey), 0);
+                        _subtab = TableTab;
+                        SessionState.SetInt(Context.GetSessionKey(SubtabKey), TableTab);
                         Render();
                     }, small: true));
                 }
@@ -817,10 +936,18 @@ namespace Exerussus.Nexus.Pages.App
                 var written = LocEditor.GenerateKeys();
                 Context.SetStatus(written ? $"Константы записаны: {AppCorePaths.LocKeysPath}" : "Константы уже актуальны.", StatusKind.Ok);
             }, small: true));
+            row.Add(_kit.Btn(NexusRole.Common, "Запечь пакеты", () =>
+            {
+                var changed = LocPackageCatalog.BakeRuntimeList();
+                var count = LocSettings.Current != null ? LocSettings.Current.Packages.Count : 0;
+                Context.SetStatus(changed ? $"Список пакетов для игры обновлён: {count}." : $"Список пакетов для игры актуален: {count}.", StatusKind.Ok);
+            }, small: true));
             row.Add(_kit.Btn(NexusRole.Info, "Проверить ключи проекта", () =>
             {
                 if (Table == null) return;
-                var report = LocKeyScanner.Check(Table, LocSettings.Current);
+                ScanUsages();
+                if (Usages == null) return;
+                var report = LocKeyScanner.Check(Table, LocSettings.Current, Usages);
                 if (report.Unknown.Count == 0)
                     Context.SetStatus($"Все ключи проекта есть в таблице. Без использования: {report.Unused.Count}.", StatusKind.Ok);
                 else
@@ -832,7 +959,8 @@ namespace Exerussus.Nexus.Pages.App
             row.Add(_kit.Btn(NexusRole.Common, "Импорт из JSON…", ImportJson, small: true));
             card.Add(row);
             card.Add(_kit.Hint("Импорт JSON — старый позиционный формат { languages: [{code, name}], entries: [{key, values: [...]}] }: " +
-                               "ключи и языки добавляются в базовую таблицу, существующие значения заменяются."));
+                               "ключи и языки добавляются в базовую таблицу, существующие значения заменяются. " +
+                               "«Запечь пакеты» — обновить список пакетов, которые игра кладёт сама (Package Loading = Auto); перед сборкой это делается само."));
             return card;
         }
 
@@ -878,7 +1006,7 @@ namespace Exerussus.Nexus.Pages.App
 
             MarkDirty();
             Context.SetStatus($"Импортировано ключей: {keys}. Проверьте и сохраните.", StatusKind.Ok);
-            _tableView.Rescan();
+            _tableView.CollectUnknown();
             RenderBody();
         }
     }

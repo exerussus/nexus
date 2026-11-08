@@ -1,0 +1,390 @@
+// ============================================================
+//  LocalizationTab.Packages.cs — подвкладки «Пакеты» и «Употребления» вкладки «Локализация».
+//
+//  «Пакеты» — каталог таблиц: база и пакеты модулей в порядке применения (поздний главнее), кто их
+//  нашёл (маски или провайдер проекта), покрытие языков, ошибки разбора, только чтение; новый пакет.
+//  «Употребления» — один обход проекта: «^KEY», L.KEY, шаблоны вызовов без «^» из настроек и провайдеры;
+//  ключи без таблицы, ключи без употреблений, перекрытые ключи и места употребления любого ключа.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Exerussus.AppCore.Editor.Localization;
+using Exerussus.AppCore.Localization;
+using Exerussus.Nexus.Abstractions;
+using UnityEditor;
+using UnityEditorInternal;
+using UnityEngine;
+using UnityEngine.UIElements;
+
+namespace Exerussus.Nexus.Pages.App
+{
+    internal sealed partial class LocalizationTab
+    {
+        private string _newPackagePath = string.Empty;
+        private string _usageKey = string.Empty;
+        private int _unknownTarget = -1;
+
+        /// <summary>Записываемые файлы для выбора «куда»: подписи и сами файлы.</summary>
+        internal List<LocWorkspace.File> WritableFiles()
+        {
+            var list = new List<LocWorkspace.File>();
+            if (Workspace == null) return list;
+            foreach (var file in Workspace.Files)
+                if (file.Writable) list.Add(file);
+            return list;
+        }
+
+        internal static string PackageLabel(LocWorkspace.File file) =>
+            file == null ? "—" : file.Info.IsBase ? "base" : file.Name;
+
+        // ============================================================ пакеты
+
+        private VisualElement PackagesView()
+        {
+            var root = new VisualElement();
+            var settings = LocSettings.Current;
+            if (Workspace == null) Load();
+
+            var mode = LocPackageCatalog.UsesProviders
+                ? "Пакеты задаёт провайдер проекта: " + string.Join(", ", LocPackageCatalog.Providers.Select(p => p.Name)) + " (маски не используются)."
+                : settings != null && settings.PackageMasks.Length > 0
+                    ? "Пакеты находят маски: " + string.Join(" · ", settings.PackageMasks)
+                    : "Масок нет — кроме базы пакетов нет. Задайте Package Masks в «Настройках» или напишите ILocPackageProvider.";
+
+            var loading = settings == null ? string.Empty
+                : settings.PackageLoading == LocPackageLoading.Auto
+                    ? $"В игре пакеты кладёт AppCore (Auto): запечено {settings.Packages.Count}."
+                    : "В игре пакеты кладёт проект (Project): Loc.SetPackages.";
+
+            var card = _kit.Card($"Пакеты: {Math.Max(0, Workspace.Files.Count - 1)}", mode + " " + loading,
+                                 _kit.Btn(NexusRole.Common, "Перечитать", Refresh, small: true));
+
+            for (var i = 0; i < Workspace.Files.Count; i++) card.Add(PackageRow(Workspace.Files[i], i));
+            root.Add(card);
+
+            root.Add(NewPackageCard(settings));
+            return root;
+        }
+
+        private VisualElement PackageRow(LocWorkspace.File file, int index)
+        {
+            var box = new VisualElement();
+            box.style.marginBottom = 6f;
+
+            var row = _kit.ListRow(() => ShowPackageInTable(file));
+            row.style.flexWrap = Wrap.NoWrap;
+            row.Add(_kit.Mono($"{index + 1}."));
+            row.Add(_kit.Gap(6f));
+
+            var name = _kit.Text(PackageLabel(file));
+            name.style.unityFontStyleAndWeight = FontStyle.Bold;
+            name.style.width = 170f;
+            name.style.flexShrink = 0;
+            row.Add(name);
+
+            row.Add(_kit.Faint($"ключей {file.Table.Count}"));
+            row.Add(_kit.Gap(8f));
+
+            var languages = Table != null ? Table.Languages : file.Table.Languages;
+            foreach (var language in languages)
+            {
+                var filled = file.Table.Entries.Count(e => e.Find(language.Code) != null);
+                if (filled == 0 && file.Table.GetLanguage(language.Code) == null) continue;
+                var full = file.Table.Count > 0 && filled == file.Table.Count;
+                row.Add(_kit.Tag(full ? NexusTagColor.Green : NexusTagColor.Amber, $"{language.Code} {filled}/{file.Table.Count}"));
+                row.Add(_kit.Gap(4f));
+            }
+
+            if (file.Info.Source == LocSource.Mod) row.Add(_kit.Tag(NexusTagColor.Blue, "мод"));
+            if (!file.Writable) row.Add(_kit.Tag(NexusTagColor.Violet, "только чтение"));
+            if (!file.Exists) row.Add(_kit.Tag(NexusTagColor.Amber, "новый — запишется при сохранении"));
+            if (file.Errors.Count > 0) row.Add(_kit.Badge(StatusKind.Error, $"ошибок {file.Errors.Count}"));
+
+            row.Add(_kit.Spacer());
+            row.Add(_kit.Faint(file.Info.Provider ?? string.Empty));
+            row.Add(_kit.Gap(6f));
+            row.Add(_kit.Btn(NexusRole.Ghost, "Файл", () => OpenFile(file.Info.Path, 1), small: true));
+            box.Add(row);
+
+            var path = _kit.Faint(file.Info.Path + (file.Info.Id != file.Info.Path ? "  ·  id " + file.Info.Id : string.Empty));
+            path.style.marginLeft = 28f;
+            box.Add(path);
+
+            if (file.Errors.Count > 0)
+                box.Add(_kit.Status(StatusKind.Error, $"{file.Info.Path}: строки с ошибкой пропущены",
+                                    string.Join("\n", file.Errors.Take(12).Select(e => e.ToString())) +
+                                    (file.Errors.Count > 12 ? $"\n… и ещё {file.Errors.Count - 12}" : string.Empty)));
+            return box;
+        }
+
+        private void ShowPackageInTable(LocWorkspace.File file)
+        {
+            _tableView.FilterByPackage(file);
+            _subtab = TableTab;
+            SessionState.SetInt(Context.GetSessionKey(SubtabKey), TableTab);
+            Render();
+        }
+
+        private VisualElement NewPackageCard(LocSettings settings)
+        {
+            var card = _kit.Card("Новый пакет", "Пустой .loc с языками таблицы. Путь должен подходить под маски — иначе редактор его не увидит.");
+
+            if (string.IsNullOrEmpty(_newPackagePath)) _newPackagePath = SuggestPackagePath(settings);
+
+            var row = _kit.Row();
+            var path = _kit.Input(_newPackagePath, v => _newPackagePath = v);
+            path.tooltip = "Путь от корня проекта: Assets/Game/Inventory/Localization/inventory.loc";
+            path.style.flexGrow = 1;
+            row.Add(path);
+            row.Add(_kit.Gap(6f));
+            row.Add(_kit.Btn(NexusRole.Success, "+ Пакет", () =>
+            {
+                var value = (_newPackagePath ?? string.Empty).Trim().Replace('\\', '/');
+                if (!value.EndsWith(LocFormat.Extension, StringComparison.OrdinalIgnoreCase)) value += LocFormat.Extension;
+
+                var file = Workspace.CreatePackage(value);
+                if (file == null)
+                {
+                    Context.SetStatus($"Пакет «{value}» не создать: путь вне проекта, уже есть или не .loc.", StatusKind.Error);
+                    return;
+                }
+
+                MarkDirty();
+                _newPackagePath = string.Empty;
+                Context.SetStatus(LocPackageCatalog.UsesProviders || LocPackageCatalog.MatchesMasks(value)
+                                      ? $"Пакет {value} добавлен — запишется при сохранении."
+                                      : $"Пакет {value} добавлен, но не подходит под маски — добавьте маску, иначе после перечитывания его не будет.",
+                                  LocPackageCatalog.UsesProviders || LocPackageCatalog.MatchesMasks(value) ? StatusKind.Ok : StatusKind.Warning);
+                RenderBody();
+            }, small: true));
+            card.Add(row);
+
+            if (LocPackageCatalog.UsesProviders)
+                card.Add(_kit.Hint("Пакеты задаёт провайдер проекта: новый файл появится в каталоге, только если провайдер его вернёт."));
+            return card;
+        }
+
+        /// <summary>Путь нового пакета по первой маске: Assets/**/Localization/*.loc → Assets/Localization/new.loc.</summary>
+        private static string SuggestPackagePath(LocSettings settings)
+        {
+            var mask = settings != null && settings.PackageMasks.Length > 0 ? settings.PackageMasks[0] : "Assets/Localization/*.loc";
+            var path = mask.Replace("**/", string.Empty).Replace("**", string.Empty).Replace("*.loc", "new.loc").Replace("*", "new");
+            return path.Replace("//", "/");
+        }
+
+        // ============================================================ употребления
+
+        private VisualElement UsagesView()
+        {
+            var root = new VisualElement();
+            var settings = LocSettings.Current;
+
+            var patterns = settings != null ? settings.UsagePatterns.Count(p => p != null && !string.IsNullOrWhiteSpace(p.regex)) : 0;
+            var hint = $"«^KEY» и L.KEY — всегда; шаблонов без «^»: {patterns} (Настройки → Usage Patterns); провайдеров: {LocUsages.Providers.Count}.";
+            var head = _kit.Card("Употребления ключей", hint, _kit.Btn(NexusRole.Primary, Usages == null ? "Посчитать" : "Пересчитать", () =>
+            {
+                ScanUsages();
+                _tableView.CollectUnknown();
+                RenderBody();
+            }, small: true));
+
+            if (Usages == null)
+            {
+                head.Add(_kit.Status(StatusKind.Info, "Употребления ещё не считали — один обход проекта по кнопке. Таблица использует этот же подсчёт."));
+                root.Add(head);
+                return root;
+            }
+
+            head.Add(_kit.Faint($"Посчитано {Usages.Time:HH:mm:ss}: файлов {Usages.FilesScanned}, {Usages.Seconds:0.0} с. Правки .cs и вёрстки подсчёт не обновляют — пересчитайте."));
+            root.Add(head);
+
+            root.Add(KeyUsagesCard());
+            root.Add(UnknownKeysCard(settings));
+            root.Add(UnusedKeysCard(settings));
+            root.Add(OverriddenCard());
+            return root;
+        }
+
+        private VisualElement _usageOutput;
+
+        private VisualElement KeyUsagesCard()
+        {
+            var card = _kit.Card("Где употреблён ключ", "Клик по месту открывает файл на строке.");
+            var row = _kit.Row();
+            var input = _kit.Input(_usageKey, v => _usageKey = v);
+            input.tooltip = "Ключ, с ^ или без";
+            input.style.width = 280f;
+            row.Add(input);
+            row.Add(_kit.Gap(6f));
+            row.Add(_kit.Btn(NexusRole.Info, "Показать", () => ShowUsages(_usageKey), small: true));
+            card.Add(row);
+
+            _usageOutput = new VisualElement();
+            _usageOutput.style.marginTop = 6f;
+            card.Add(_usageOutput);
+            if (!string.IsNullOrWhiteSpace(_usageKey)) ShowUsages(_usageKey);
+            return card;
+        }
+
+        internal void ShowUsages(string key)
+        {
+            _usageKey = Loc.KeyOf((key ?? string.Empty).Trim());
+            if (_usageOutput == null || Usages == null) return;
+
+            _usageOutput.Clear();
+            var list = Usages.Of(_usageKey);
+            if (list.Count == 0)
+            {
+                _usageOutput.Add(_kit.Faint(LocKeyScanner.IsDynamic(_usageKey, LocSettings.Current) ? "Ключ собирается кодом (динамический префикс)." : "Употреблений нет."));
+                return;
+            }
+
+            foreach (var usage in list.Take(200)) _usageOutput.Add(UsageRow(usage));
+            if (list.Count > 200) _usageOutput.Add(_kit.Faint($"… и ещё {list.Count - 200}"));
+        }
+
+        internal VisualElement UsageRow(LocUsage usage)
+        {
+            var row = _kit.ListRow(() => OpenFile(usage.File, usage.Line));
+            row.style.flexWrap = Wrap.NoWrap;
+            var place = _kit.Mono($"{usage.File}:{usage.Line}");
+            place.style.flexShrink = 0;
+            row.Add(place);
+            row.Add(_kit.Gap(8f));
+            row.Add(_kit.Tag(NexusTagColor.Violet, usage.Kind));
+            row.Add(_kit.Gap(8f));
+            var snippet = _kit.Faint(usage.Snippet ?? string.Empty);
+            snippet.enableRichText = false;
+            snippet.style.overflow = Overflow.Hidden;
+            snippet.style.textOverflow = TextOverflow.Ellipsis;
+            snippet.style.whiteSpace = WhiteSpace.NoWrap;
+            snippet.style.flexShrink = 1;
+            row.Add(snippet);
+            return row;
+        }
+
+        private VisualElement UnknownKeysCard(LocSettings settings)
+        {
+            var unknown = Usages.Keys
+                                .Where(k => Table == null || !Table.Contains(k))
+                                .Where(k => !LocKeyScanner.IsBuiltin(k) && !LocKeyScanner.IsDynamic(k, settings))
+                                .OrderBy(k => k, StringComparer.Ordinal).ToList();
+
+            var targets = WritableFiles();
+            if (_unknownTarget < 0 || _unknownTarget >= targets.Count)
+                _unknownTarget = Math.Max(0, targets.IndexOf(Workspace?.DefaultFile));
+
+            VisualElement right = null;
+            if (unknown.Count > 0 && targets.Count > 0)
+            {
+                right = _kit.Row();
+                right.Add(_kit.Faint("в пакет"));
+                right.Add(_kit.Gap(4f));
+                var target = _kit.Dropdown(null, targets.Select(PackageLabel).ToList(), _unknownTarget, i => _unknownTarget = i);
+                target.style.width = 150f;
+                right.Add(target);
+                right.Add(_kit.Gap(4f));
+                right.Add(_kit.Btn(NexusRole.Warning, "Добавить все", () =>
+                {
+                    var file = targets[Mathf.Clamp(_unknownTarget, 0, targets.Count - 1)];
+                    foreach (var key in unknown) Workspace.AddKey(key, file);
+                    MarkDirty();
+                    _tableView.CollectUnknown();
+                    RenderBody();
+                    Context.SetStatus($"Ключей добавлено в {PackageLabel(file)}: {unknown.Count} — без переводов, заполните и сохраните.", StatusKind.Warning);
+                }, small: true));
+            }
+
+            var card = _kit.Card($"Употребляются, а в таблицах нет: {unknown.Count}", "Там сейчас заглушка вместо текста.", right);
+            foreach (var key in unknown.Take(100))
+            {
+                var first = Usages.Of(key)[0];
+                var row = _kit.ListRow(() => OpenFile(first.File, first.Line));
+                row.Add(_kit.Text(key));
+                row.Add(_kit.Spacer());
+                row.Add(_kit.Faint($"{first.File}:{first.Line}" + (Usages.Of(key).Count > 1 ? $" и ещё {Usages.Of(key).Count - 1}" : string.Empty)));
+                card.Add(row);
+            }
+
+            if (unknown.Count > 100) card.Add(_kit.Faint($"… и ещё {unknown.Count - 100}"));
+            return card;
+        }
+
+        private VisualElement UnusedKeysCard(LocSettings settings)
+        {
+            var unused = Table == null ? new List<LocEntry>()
+                : Table.Entries.Where(e => !Usages.Contains(e.Key) && !LocKeyScanner.IsDynamic(e.Key, settings))
+                       .OrderBy(e => e.Key, StringComparer.Ordinal).ToList();
+
+            var card = _kit.Card($"Нигде не употребляются: {unused.Count}",
+                                 "С учётом динамических префиксов (Настройки → Dynamic Prefixes). Ключи, которые код собирает из частей, так не найти.");
+            foreach (var entry in unused.Take(150))
+            {
+                var key = entry.Key;
+                var row = _kit.ListRow(() => OpenInTable(key));
+                row.Add(_kit.Text(key));
+                row.Add(_kit.Spacer());
+                row.Add(_kit.Faint(PackageLabel(Workspace.HomeOf(key))));
+                card.Add(row);
+            }
+
+            if (unused.Count > 150) card.Add(_kit.Faint($"… и ещё {unused.Count - 150}"));
+            return card;
+        }
+
+        private VisualElement OverriddenCard()
+        {
+            var keys = Table == null ? new List<string>()
+                : Table.Entries.Select(e => e.Key).Where(Workspace.IsOverridden).OrderBy(k => k, StringComparer.Ordinal).ToList();
+
+            var card = _kit.Card($"Перекрытые ключи: {keys.Count}", "Значение пишут несколько файлов — действует последний по порядку пакетов.");
+            foreach (var key in keys.Take(150))
+            {
+                var k = key;
+                var row = _kit.ListRow(() => OpenInTable(k));
+                row.Add(_kit.Text(key));
+                row.Add(_kit.Spacer());
+                row.Add(_kit.Faint(string.Join(" → ", Workspace.FilesOf(key).Select(PackageLabel))));
+                card.Add(row);
+            }
+
+            if (keys.Count > 150) card.Add(_kit.Faint($"… и ещё {keys.Count - 150}"));
+            return card;
+        }
+
+        /// <summary>Перейти в «Употребления» с местами ключа.</summary>
+        internal void OpenUsages(string key)
+        {
+            _usageKey = Loc.KeyOf(key);
+            _subtab = UsagesTab;
+            SessionState.SetInt(Context.GetSessionKey(SubtabKey), UsagesTab);
+            Render();
+        }
+
+        private void OpenInTable(string key)
+        {
+            _tableView.Preselect(key);
+            _subtab = TableTab;
+            SessionState.SetInt(Context.GetSessionKey(SubtabKey), TableTab);
+            Render();
+        }
+
+        /// <summary>Открыть файл на строке: ассет — редактором Unity, остальное — внешним редактором.</summary>
+        internal static void OpenFile(string path, int line)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+
+            if (path.StartsWith("Assets/", StringComparison.Ordinal) || path.StartsWith("Packages/", StringComparison.Ordinal))
+            {
+                var asset = AssetDatabase.LoadMainAssetAtPath(path);
+                if (asset != null && AssetDatabase.OpenAsset(asset, Math.Max(1, line))) return;
+            }
+
+            var full = LocPackageCatalog.ToFullPath(path);
+            if (File.Exists(full)) InternalEditorUtility.OpenFileAtLineExternal(full, Math.Max(1, line));
+        }
+    }
+}

@@ -7,6 +7,10 @@
 //  комментарием над ключом в .loc: «# {0}: описание = пример»), поля языков или формы окончаний
 //  с подсказками чисел, панель вставки (аргументы, живые значения, жирный, цвет, перенос),
 //  проверки с исправлением в один клик, предпросмотр и готовый код.
+//
+//  Таблица — сводка всех файлов (база + пакеты, LocWorkspace): у ключа видно его пакет и цепочку
+//  перекрытий, новый ключ кладётся в выбранный пакет, ключ можно перенести в другой пакет;
+//  переименование и удаление показывают употребления, переименование заменяет их в проекте.
 // ============================================================
 
 using System;
@@ -25,6 +29,8 @@ namespace Exerussus.Nexus.Pages.App
     internal sealed class LocTableView
     {
         private const string AllGroups = "Все группы";
+        private const string AllPackages = "Все пакеты";
+        private const float PackageWidth = 120f;
         private const float KeyWidth = 210f;
         private const float TypeWidth = 46f;
         private const float PanelWidth = 560f;
@@ -38,13 +44,14 @@ namespace Exerussus.Nexus.Pages.App
         private readonly List<string> _unknown = new();
         private readonly Dictionary<string, Mode> _modeOverride = new(StringComparer.Ordinal);
 
-        private Dictionary<string, List<string>> _usage;
-
         private string _search = string.Empty;
         private string _group = AllGroups;
+        private string _package = AllPackages;
         private bool _onlyMissing;
         private bool _onlyUnused;
+        private bool _onlyOverridden;
         private string _newKey = string.Empty;
+        private string _newKeyPackage;
 
         private string _selected;
         private string _activeLanguage;
@@ -69,6 +76,8 @@ namespace Exerussus.Nexus.Pages.App
 
         private IPageContext Context => _kit.Context;
         private LocTable Table => _owner.Table;
+        private LocWorkspace Workspace => _owner.Workspace;
+        private LocUsageIndex Usages => _owner.Usages;
         private IReadOnlyList<LocLanguage> Languages => Table.Languages;
         private string Primary => Languages.Count > 0 ? Languages[0].Code : "ru";
 
@@ -112,27 +121,17 @@ namespace Exerussus.Nexus.Pages.App
 
         public void Rescan()
         {
-            try
-            {
-                _usage = LocKeyScanner.Scan();
-            }
-            catch (Exception e)
-            {
-                Debug.LogException(e);
-                Context.SetStatus("Скан проекта не удался — подробности в консоли.", StatusKind.Error);
-                _usage = null;
-            }
-
+            _owner.ScanUsages();
             CollectUnknown();
         }
 
-        private void CollectUnknown()
+        internal void CollectUnknown()
         {
             _unknown.Clear();
-            if (_usage == null || Table == null) return;
+            if (Usages == null || Table == null) return;
 
             var settings = LocSettings.Current;
-            foreach (var key in _usage.Keys)
+            foreach (var key in Usages.Keys)
                 if (!Table.Contains(key) && !LocKeyScanner.IsBuiltin(key) && !LocKeyScanner.IsDynamic(key, settings))
                     _unknown.Add(key);
 
@@ -140,22 +139,48 @@ namespace Exerussus.Nexus.Pages.App
         }
 
         private bool IsUsed(string key) =>
-            LocKeyScanner.IsDynamic(key, LocSettings.Current) || (_usage != null && _usage.ContainsKey(key));
+            LocKeyScanner.IsDynamic(key, LocSettings.Current) || (Usages != null && Usages.Contains(key));
 
-        private int UsageCount(string key) => _usage != null && _usage.TryGetValue(key, out var files) ? files.Count : 0;
+        private int UsageCount(string key) => Usages != null ? Usages.FileCount(key) : 0;
+
+        private List<string> UsageFiles(string key) =>
+            Usages == null ? new List<string>() : Usages.Of(key).Select(u => u.File).Distinct().ToList();
+
+        /// <summary>Пакет ключа для подписи: дом (куда пишутся правки).</summary>
+        private string PackageOf(string key) => LocalizationTab.PackageLabel(Workspace?.HomeOf(key));
+
+        /// <summary>Показать в таблице только ключи пакета (из «Пакетов»).</summary>
+        public void FilterByPackage(LocWorkspace.File file)
+        {
+            _package = file != null ? LocalizationTab.PackageLabel(file) : AllPackages;
+            if (file != null && file.Writable) _newKeyPackage = LocalizationTab.PackageLabel(file);
+            _search = string.Empty;
+            _group = AllGroups;
+            _onlyMissing = false;
+            _onlyUnused = false;
+            _onlyOverridden = false;
+        }
+
+        private LocWorkspace.File PackageByLabel(string label)
+        {
+            if (Workspace == null || string.IsNullOrEmpty(label)) return null;
+            foreach (var file in Workspace.Files)
+                if (LocalizationTab.PackageLabel(file) == label) return file;
+            return null;
+        }
 
         // ============================================================ разметка
 
         public VisualElement Build()
         {
-            if (_usage == null) Rescan();
+            CollectUnknown();
 
             var root = new VisualElement();
 
             if (_owner.ParseErrors.Count > 0)
             {
                 var errors = string.Join("\n", _owner.ParseErrors.Take(12).Select(e => e.ToString()));
-                root.Add(_kit.Status(StatusKind.Error, $"Файл таблицы читается с ошибками: {_owner.ParseErrors.Count}", errors));
+                root.Add(_kit.Status(StatusKind.Error, $"Таблицы читаются с ошибками: {_owner.ParseErrors.Count} (строки пропущены) — подробности в «Пакетах»", errors));
             }
 
             var columns = _kit.Row();
@@ -194,7 +219,7 @@ namespace Exerussus.Nexus.Pages.App
             _summary = _kit.Faint(string.Empty);
             _summary.style.marginTop = 6f;
             left.Add(_summary);
-            left.Add(_kit.Faint("«Тип»: Aa — простой текст · {0} — аргументы из кода · N — зависит от числа · live — живое значение игры. " +
+            left.Add(_kit.Faint("«Тип»: Aa — простой текст · {0} — аргументы из кода · N — зависит от числа · live — живое значение игры · ⇅ — перекрыт другим пакетом. " +
                                 "Клик по строке открывает конструктор справа."));
 
             _panel = new VisualElement();
@@ -219,7 +244,7 @@ namespace Exerussus.Nexus.Pages.App
             });
             bar.Add(_save);
             bar.Add(_kit.Btn(NexusRole.Common, "Перечитать", _owner.Refresh, small: true));
-            bar.Add(_kit.Btn(NexusRole.Common, "Сканировать проект", () =>
+            bar.Add(_kit.Btn(NexusRole.Common, Usages == null ? "Посчитать употребления" : "Пересчитать употребления", () =>
             {
                 Rescan();
                 _owner.Render();
@@ -228,10 +253,29 @@ namespace Exerussus.Nexus.Pages.App
             bar.Add(_kit.Gap(12f));
 
             var key = _kit.Input(_newKey, v => _newKey = v);
-            key.tooltip = "Новый ключ: ГРУППА_СМЫСЛ, например MENU_SETTINGS";
+            key.tooltip = "Новый ключ: в стиле проекта — MENU_SETTINGS или ui.menu.settings";
             key.style.width = 190f;
             bar.Add(key);
             bar.Add(_kit.Gap(6f));
+
+            var targets = _owner.WritableFiles();
+            if (targets.Count > 1)
+            {
+                var labels = targets.Select(LocalizationTab.PackageLabel).ToList();
+                var current = labels.IndexOf(_newKeyPackage);
+                if (current < 0)
+                {
+                    current = Math.Max(0, targets.IndexOf(Workspace.DefaultFile));
+                    _newKeyPackage = labels[current];
+                }
+
+                var target = _kit.Dropdown(null, labels, current, i => _newKeyPackage = labels[i]);
+                target.tooltip = "В какой пакет положить новый ключ";
+                target.style.width = 140f;
+                bar.Add(target);
+                bar.Add(_kit.Gap(6f));
+            }
+
             bar.Add(_kit.Btn(NexusRole.Success, "+ Ключ", () => AddKey(key), small: true));
             return bar;
         }
@@ -264,6 +308,23 @@ namespace Exerussus.Nexus.Pages.App
             bar.Add(group);
             bar.Add(_kit.Gap(8f));
 
+            if (Workspace != null && Workspace.Files.Count > 1)
+            {
+                var packages = new List<string> { AllPackages };
+                packages.AddRange(Workspace.Files.Select(LocalizationTab.PackageLabel));
+                if (!packages.Contains(_package)) _package = AllPackages;
+
+                var package = _kit.Dropdown(null, packages, packages.IndexOf(_package), i =>
+                {
+                    _package = packages[i];
+                    ApplyFilter();
+                });
+                package.tooltip = "Только ключи, которые есть в пакете";
+                package.style.width = 150f;
+                bar.Add(package);
+                bar.Add(_kit.Gap(8f));
+            }
+
             bar.Add(_kit.Check("С пропусками", _onlyMissing, v =>
             {
                 _onlyMissing = v;
@@ -275,25 +336,34 @@ namespace Exerussus.Nexus.Pages.App
                 _onlyUnused = v;
                 ApplyFilter();
             });
-            unused.SetEnabled(_usage != null);
+            unused.SetEnabled(Usages != null);
+            unused.tooltip = Usages == null ? "Сначала посчитайте употребления" : null;
             bar.Add(unused);
+
+            if (Workspace != null && Workspace.Files.Count > 1)
+                bar.Add(_kit.Check("Перекрытые", _onlyOverridden, v =>
+                {
+                    _onlyOverridden = v;
+                    ApplyFilter();
+                }));
             return bar;
         }
 
         private VisualElement UnknownCard()
         {
-            var card = _kit.Card($"Нет в таблице: {_unknown.Count}", "Ключи из кода, вёрстки, префабов и сцен, которых нет в таблице — там сейчас «???».",
+            var card = _kit.Card($"Нет в таблицах: {_unknown.Count}", "Ключи из кода, вёрстки, префабов и сцен, которых нет ни в базе, ни в пакетах — там сейчас заглушка.",
                                  _kit.Btn(NexusRole.Warning, "Добавить все", () =>
                                  {
-                                     foreach (var key in _unknown) Table.GetOrAdd(key);
+                                     var file = PackageByLabel(_newKeyPackage) ?? Workspace.DefaultFile;
+                                     foreach (var key in _unknown) Workspace.AddKey(key, file);
                                      _owner.MarkDirty();
                                      CollectUnknown();
                                      _owner.Render();
-                                     Context.SetStatus("Ключи добавлены без переводов — заполните и сохраните.", StatusKind.Warning);
+                                     Context.SetStatus($"Ключи добавлены в {LocalizationTab.PackageLabel(file)} без переводов — заполните и сохраните.", StatusKind.Warning);
                                  }, small: true));
 
             foreach (var key in _unknown.Take(8))
-                card.Add(_kit.Mono($"^{key} — {string.Join(", ", _usage[key].Take(2))}", NexusToken.TextDim));
+                card.Add(_kit.Mono($"{key} — {string.Join(", ", UsageFiles(key).Take(2))}", NexusToken.TextDim));
             if (_unknown.Count > 8) card.Add(_kit.Faint($"… и ещё {_unknown.Count - 8}"));
             return card;
         }
@@ -312,6 +382,7 @@ namespace Exerussus.Nexus.Pages.App
             var preview = HeaderCell($"Как видит игрок ({Primary})", 0f);
             preview.style.flexGrow = 1;
             header.Add(preview);
+            if (ShowPackages) header.Add(HeaderCell("Пакет", PackageWidth));
             header.Add(HeaderCell("Тип", TypeWidth));
             return header;
         }
@@ -353,6 +424,15 @@ namespace Exerussus.Nexus.Pages.App
             preview.enableRichText = false;
             row.Add(preview);
 
+            var package = _kit.Text(string.Empty, NexusToken.TextFaint, 11);
+            package.style.width = PackageWidth;
+            package.style.flexShrink = 0;
+            package.style.whiteSpace = WhiteSpace.NoWrap;
+            package.style.overflow = Overflow.Hidden;
+            package.style.textOverflow = TextOverflow.Ellipsis;
+            package.style.display = ShowPackages ? DisplayStyle.Flex : DisplayStyle.None;
+            row.Add(package);
+
             var type = _kit.Text(string.Empty, NexusToken.TextFaint, 12);
             type.style.width = TypeWidth;
             type.style.flexShrink = 0;
@@ -369,10 +449,18 @@ namespace Exerussus.Nexus.Pages.App
             var entry = _view[index];
             var key = (Label)element[0];
             var preview = (Label)element[1];
-            var type = (Label)element[2];
+            var package = (Label)element[2];
+            var type = (Label)element[3];
 
             key.text = entry.Key;
             preview.text = RowPreview(entry);
+
+            if (ShowPackages)
+            {
+                var overridden = Workspace.IsOverridden(entry.Key);
+                package.text = (overridden ? "⇅ " : string.Empty) + PackageOf(entry.Key);
+                package.tooltip = string.Join(" → ", Workspace.FilesOf(entry.Key).Select(LocalizationTab.PackageLabel));
+            }
 
             var mode = ModeOf(entry);
             var live = HasLiveTokens(entry);
@@ -387,6 +475,8 @@ namespace Exerussus.Nexus.Pages.App
             var missingPrimary = entry.Find(Primary) == null;
             NexusClass.SetFg(key, missingPrimary ? NexusToken.Error : NexusToken.TextNormal);
         }
+
+        private bool ShowPackages => Workspace != null && Workspace.Files.Count > 1;
 
         private string RowPreview(LocEntry entry)
         {
@@ -605,12 +695,18 @@ namespace Exerussus.Nexus.Pages.App
             head.Add(_kit.Gap(8f));
 
             var uses = UsageCount(entry.Key);
-            var usage = _usage == null ? "проект не сканировали"
+            var usage = Usages == null ? "употребления не считали"
                 : uses > 0 ? $"используется в {uses} файл(ах)"
                 : LocKeyScanner.IsDynamic(entry.Key, LocSettings.Current) ? "собирается кодом"
                 : "нигде не используется";
             var tag = _kit.Tag(uses > 0 ? NexusTagColor.Blue : NexusTagColor.Amber, usage);
-            if (uses > 0) tag.tooltip = string.Join("\n", _usage[entry.Key].Take(15));
+            if (uses > 0)
+            {
+                tag.tooltip = string.Join("\n", Usages.Of(entry.Key).Take(15).Select(u => $"{u.File}:{u.Line}")) + "\n\nклик — все места в «Употреблениях»";
+                var key2 = entry.Key;
+                tag.RegisterCallback<ClickEvent>(_ => _owner.OpenUsages(key2));
+            }
+
             head.Add(tag);
             head.Add(_kit.Gap(6f));
 
@@ -621,7 +717,84 @@ namespace Exerussus.Nexus.Pages.App
                 _list.ClearSelection();
                 RenderPanel();
             }, small: true));
-            return head;
+
+            if (!ShowPackages) return head;
+
+            var root = new VisualElement();
+            root.Add(head);
+            root.Add(PackageLine(entry));
+            return root;
+        }
+
+        /// <summary>Пакет ключа: дом (куда пишутся правки) с переносом, цепочка файлов, только чтение.</summary>
+        private VisualElement PackageLine(LocEntry entry)
+        {
+            var line = _kit.Row();
+            line.style.marginTop = -4f;
+            line.style.marginBottom = 10f;
+
+            var home = Workspace.HomeOf(entry.Key);
+            var targets = _owner.WritableFiles();
+            var labels = targets.Select(LocalizationTab.PackageLabel).ToList();
+
+            line.Add(_kit.Faint("Пакет"));
+            line.Add(_kit.Gap(6f));
+
+            if (targets.Count > 0)
+            {
+                var index = Math.Max(0, targets.IndexOf(home));
+                var move = _kit.Dropdown(null, labels, index, i =>
+                {
+                    if (targets[i] == home) return;
+                    if (!Workspace.MoveKey(entry.Key, targets[i])) return;
+                    _owner.MarkDirty();
+                    Context.SetStatus($"Ключ {entry.Key} переедет в {labels[i]} при сохранении: ляжет туда целиком и уйдёт из остальных записываемых пакетов.", StatusKind.Ok);
+                    _list.RefreshItems();
+                    RenderPanel();
+                });
+                move.tooltip = "Куда пишутся правки ключа. Выбор другого пакета — перенос ключа целиком";
+                move.style.width = 160f;
+                line.Add(move);
+                line.Add(_kit.Gap(8f));
+            }
+
+            var files = Workspace.FilesOf(entry.Key);
+            if (files.Count > 1)
+            {
+                var chain = _kit.Tag(NexusTagColor.Violet, "⇅ " + string.Join(" → ", files.Select(LocalizationTab.PackageLabel)));
+                chain.tooltip = ChainTooltip(entry);
+                line.Add(chain);
+                line.Add(_kit.Gap(6f));
+            }
+
+            if (Workspace.IsReadOnlyKey(entry.Key))
+            {
+                var ro = _kit.Tag(NexusTagColor.Amber, "только чтение");
+                ro.tooltip = $"Ключ только в пакетах для чтения: правки лягут перекрытием в {LocalizationTab.PackageLabel(home)}";
+                line.Add(ro);
+            }
+
+            return line;
+        }
+
+        /// <summary>По каждому слоту, который писали несколько файлов: кто писал и что (последний действует).</summary>
+        private string ChainTooltip(LocEntry entry)
+        {
+            var lines = new List<string>();
+            foreach (var value in entry.Values)
+            {
+                var chain = Workspace.ChainOf(entry.Key, value.Language, value.Form);
+                if (chain.Count < 2) continue;
+                lines.Add(value.Slot + ": " + string.Join(" → ", chain.Select(c => $"{LocalizationTab.PackageLabel(c.file)} «{Short(c.text)}»")));
+            }
+
+            return lines.Count == 0 ? "Ключ есть в нескольких пакетах, значения не перекрываются." : string.Join("\n", lines);
+        }
+
+        private static string Short(string text)
+        {
+            text = (text ?? string.Empty).Replace('\n', ' ');
+            return text.Length > 40 ? text.Substring(0, 40) + "…" : text;
         }
 
         private VisualElement ModeSwitch(LocEntry entry, Mode mode)
@@ -853,6 +1026,7 @@ namespace Exerussus.Nexus.Pages.App
                 name.style.flexShrink = 0;
                 name.style.paddingTop = 4f;
                 name.style.unityFontStyleAndWeight = FontStyle.Bold;
+                OriginHint(name, entry, language.Code, null);
                 row.Add(name);
 
                 var field = ValueField(entry, language, null);
@@ -919,6 +1093,27 @@ namespace Exerussus.Nexus.Pages.App
             field.style.flexGrow = 1;
             row.Add(field);
             return row;
+        }
+
+        /// <summary>Подсказка над подписью языка: из какого пакета значение и куда ляжет правка.</summary>
+        private void OriginHint(VisualElement label, LocEntry entry, string language, string form)
+        {
+            if (!ShowPackages) return;
+
+            var origin = Workspace.OriginOf(entry.Key, language, form);
+            var home = Workspace.HomeOf(entry.Key);
+            var target = Workspace.TargetFor(entry.Key, language, form, out var shadowed);
+
+            label.tooltip = origin == null
+                ? $"Значения нет — правка ляжет в {LocalizationTab.PackageLabel(target)}"
+                : origin.Writable
+                    ? $"Значение из {LocalizationTab.PackageLabel(origin)} — правка туда же"
+                    : shadowed
+                        ? $"Значение из {LocalizationTab.PackageLabel(origin)} (только чтение, последний по порядку) — правка ляжет в {LocalizationTab.PackageLabel(target)}, но в игре видна не будет"
+                        : $"Значение из {LocalizationTab.PackageLabel(origin)} (только чтение) — правка ляжет перекрытием в {LocalizationTab.PackageLabel(target)}";
+
+            if (origin != null && origin != home && label is Label text)
+                text.text += "\n← " + LocalizationTab.PackageLabel(origin);
         }
 
         private TextField ValueField(LocEntry entry, LocLanguage language, string form)
@@ -1375,33 +1570,69 @@ namespace Exerussus.Nexus.Pages.App
 
         private void AddKey(TextField input)
         {
-            var key = (_newKey ?? string.Empty).Trim().TrimStart('^').ToUpperInvariant().Replace(' ', '_');
+            var key = (_newKey ?? string.Empty).Trim().TrimStart('^').Replace(' ', '_');
             if (!LocSlots.IsValidKey(key) || Table.Contains(key))
             {
                 Context.SetStatus(Table.Contains(key) ? $"Ключ {key} уже есть." : $"Ключ «{key}» не подходит: латиница, цифры, _ . -", StatusKind.Error);
                 return;
             }
 
-            Table.GetOrAdd(key);
+            var file = PackageByLabel(_newKeyPackage) ?? Workspace.DefaultFile;
+            if (!Workspace.AddKey(key, file))
+            {
+                Context.SetStatus($"Ключ {key} не добавить: нет записываемого пакета.", StatusKind.Error);
+                return;
+            }
             _newKey = string.Empty;
             input.SetValueWithoutNotify(string.Empty);
             _owner.MarkDirty();
             CollectUnknown();
             ApplyFilter();
             Reveal(key);
-            Context.SetStatus($"Ключ ^{key} добавлен. В вёрстке — «^{key}», в коде — L.{key}.", StatusKind.Ok);
+            Context.SetStatus($"Ключ {key} добавлен в {LocalizationTab.PackageLabel(file)}. В вёрстке — «^{key}», в коде — L.{LocEditor.IdentifierOf(key)}.", StatusKind.Ok);
         }
 
         private void RenameKey(LocEntry entry, TextField field, string previous, string next)
         {
             if (previous == next) return;
 
-            next = (next ?? string.Empty).Trim().TrimStart('^').ToUpperInvariant();
+            next = (next ?? string.Empty).Trim().TrimStart('^').Replace(' ', '_');
             var old = entry.Key;
-            if (!Table.Rename(old, next))
+            if (next == old) return;
+
+            if (!LocSlots.IsValidKey(next) || Table.Contains(next))
             {
                 field.SetValueWithoutNotify(old);
                 Context.SetStatus($"Переименовать в «{next}» нельзя: ключ занят или недопустим.", StatusKind.Error);
+                return;
+            }
+
+            // Употребления: план замены (если считали) — заменить сразу вместе с сохранением таблиц.
+            var errors = new List<string>();
+            var plan = LocUsages.PlanRename(old, next, LocSettings.Current, _owner.AllKeys(), errors);
+            var replace = false;
+            if (plan.Count > 0)
+            {
+                var files = plan.Select(c => c.File).Distinct().ToList();
+                var sample = string.Join("\n", plan.Take(6).Select(c => $"{c.File}:{c.Line}  {c.After}"));
+                var choice = EditorUtility.DisplayDialogComplex("Переименовать ключ",
+                                                                $"{old} → {next}\n\nУпотреблений: {plan.Count} в {files.Count} файл(ах):\n{sample}" +
+                                                                (plan.Count > 6 ? "\n…" : string.Empty) +
+                                                                "\n\nЗаменить их? Таблицы при этом сохранятся сразу.",
+                                                                "Заменить и сохранить", "Отмена", "Только ключ");
+                if (choice == 1)
+                {
+                    field.SetValueWithoutNotify(old);
+                    return;
+                }
+
+                replace = choice == 0;
+            }
+
+            if (!Workspace.RenameKey(old, next))
+            {
+                field.SetValueWithoutNotify(old);
+                Context.SetStatus($"Переименовать в «{next}» нельзя.", StatusKind.Error);
                 return;
             }
 
@@ -1409,10 +1640,25 @@ namespace Exerussus.Nexus.Pages.App
             _selected = next;
             _owner.MarkDirty();
 
-            var used = UsageCount(old);
+            if (replace)
+            {
+                if (!_owner.Save()) return;
+
+                var changed = new List<string>();
+                var count = LocUsages.ApplyRename(old, next, changed, errors, LocSettings.Current, _owner.AllKeys());
+                if (errors.Count > 0) Debug.LogWarning("[Loc] Переименование употреблений:\n" + string.Join("\n", errors));
+                if (_owner.Usages != null) _owner.ScanUsages();
+                Context.SetStatus($"Ключ {old} → {next}: таблицы сохранены, замен {count} в {changed.Count} файл(ах)" +
+                                  (errors.Count > 0 ? $" · замечаний {errors.Count} — в консоли" : string.Empty),
+                                  errors.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
+                _owner.Render();
+                return;
+            }
+
+            var used = plan.Count > 0 ? plan.Select(c => c.File).Distinct().Count() : UsageCount(old);
             Context.SetStatus(used > 0
-                    ? $"Ключ ^{old} → ^{next}. Он используется в {used} файл(ах) — замените там тоже, иначе там будет «???»."
-                    : $"Ключ ^{old} → ^{next}.",
+                    ? $"Ключ {old} → {next}. Он используется в {used} файл(ах) — там теперь заглушка, пока не замените."
+                    : $"Ключ {old} → {next}.",
                 used > 0 ? StatusKind.Warning : StatusKind.Ok);
 
             CollectUnknown();
@@ -1424,13 +1670,18 @@ namespace Exerussus.Nexus.Pages.App
         private void DeleteKey(LocEntry entry)
         {
             var used = UsageCount(entry.Key);
+            var files = Workspace.FilesOf(entry.Key);
+            var where = files.Count > 1 ? $"\nПакеты: {string.Join(", ", files.Select(LocalizationTab.PackageLabel))}." : string.Empty;
+            var readOnly = files.Any(f => !f.Writable) ? "\nВ пакетах только для чтения ключ останется." : string.Empty;
             var message = used > 0
-                ? $"Ключ ^{entry.Key} используется в {used} файл(ах). После удаления там будет «???». Удалить?"
-                : $"Удалить ключ ^{entry.Key}?";
+                ? $"Ключ {entry.Key} используется в {used} файл(ах):\n{string.Join("\n", UsageFiles(entry.Key).Take(6))}\nПосле удаления там будет заглушка.{where}{readOnly}\nУдалить?"
+                : Usages == null
+                    ? $"Удалить ключ {entry.Key}? Употребления не считали — проверьте «Употребления».{where}{readOnly}"
+                    : $"Удалить ключ {entry.Key}?{where}{readOnly}";
 
             if (!EditorUtility.DisplayDialog("Удалить ключ", message, "Удалить", "Отмена")) return;
 
-            Table.Remove(entry.Key);
+            Workspace.DeleteKey(entry.Key);
             _modeOverride.Remove(entry.Key);
             _selected = null;
             _owner.MarkDirty();
@@ -1448,8 +1699,10 @@ namespace Exerussus.Nexus.Pages.App
             {
                 _search = string.Empty;
                 _group = AllGroups;
+                _package = AllPackages;
                 _onlyMissing = false;
                 _onlyUnused = false;
+                _onlyOverridden = false;
                 ApplyFilter();
             }
 
@@ -1468,8 +1721,10 @@ namespace Exerussus.Nexus.Pages.App
             _selected = key;
             _search = string.Empty;
             _group = AllGroups;
+            _package = AllPackages;
             _onlyMissing = false;
             _onlyUnused = false;
+            _onlyOverridden = false;
         }
 
         // ============================================================ фильтр и сводка
@@ -1477,12 +1732,15 @@ namespace Exerussus.Nexus.Pages.App
         private void ApplyFilter()
         {
             _view.Clear();
+            var package = _package != AllPackages ? PackageByLabel(_package) : null;
 
             foreach (var entry in Table.Entries.OrderBy(e => e.Key, StringComparer.Ordinal))
             {
                 if (_group != AllGroups && GroupOf(entry.Key) != _group) continue;
+                if (package != null && !Workspace.FilesOf(entry.Key).Contains(package) && Workspace.HomeOf(entry.Key) != package) continue;
+                if (_onlyOverridden && !Workspace.IsOverridden(entry.Key)) continue;
                 if (_onlyMissing && !HasMissing(entry)) continue;
-                if (_onlyUnused && (_usage == null || IsUsed(entry.Key))) continue;
+                if (_onlyUnused && (Usages == null || IsUsed(entry.Key))) continue;
                 if (!Matches(entry)) continue;
 
                 _view.Add(entry);
@@ -1534,6 +1792,7 @@ namespace Exerussus.Nexus.Pages.App
             if (_summary == null || Table == null) return;
 
             var parts = new List<string> { $"Ключей: {Table.Count}", $"показано: {_view.Count}" };
+            if (Workspace != null && Workspace.Files.Count > 1) parts.Add($"файлов: {Workspace.Files.Count}");
 
             foreach (var language in Languages)
             {
@@ -1541,7 +1800,7 @@ namespace Exerussus.Nexus.Pages.App
                 if (missing > 0) parts.Add($"пусто {language.Code}: {missing}");
             }
 
-            if (_usage != null)
+            if (Usages != null)
             {
                 var unused = Table.Entries.Count(e => !IsUsed(e.Key));
                 if (unused > 0) parts.Add($"без использования: {unused}");
@@ -1552,11 +1811,11 @@ namespace Exerussus.Nexus.Pages.App
             _summary.text = string.Join(" · ", parts);
         }
 
-        /// <summary>Группа ключа — всё до первого «_»: MENU_PLAY → MENU.</summary>
+        /// <summary>Группа ключа — всё до первого «.» или «_»: MENU_PLAY → MENU, ui.menu.play → ui.</summary>
         private static string GroupOf(string key)
         {
-            var underscore = key.IndexOf('_');
-            return underscore > 0 ? key.Substring(0, underscore) : key;
+            var cut = key.IndexOfAny(new[] { '.', '_' });
+            return cut > 0 ? key.Substring(0, cut) : key;
         }
     }
 

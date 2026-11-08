@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "0a1f7c4e9b2d4f6a8c3e5d7b1a9f0e22",
   "id": "app",
-  "version": "3.10.0",
+  "version": "3.11.0",
   "typeName": "Exerussus.Nexus.Pages.App.AppPage",
   "kind": "servicing",
   "display": {
@@ -21,7 +21,7 @@
     {
       "name": "com.exerussus.app-core",
       "gitUrl": "https://github.com/exerussus/app-core.git",
-      "version": "6.1.0"
+      "version": "6.2.0"
     }
   ],
   "deploy": [
@@ -68,6 +68,14 @@
     {
       "from": "LocTableView.cs.txt",
       "to": "LocTableView.cs"
+    },
+    {
+      "from": "LocalizationTab.Packages.cs.txt",
+      "to": "LocalizationTab.Packages.cs"
+    },
+    {
+      "from": "LocCommands.cs.txt",
+      "to": "LocCommands.cs"
     },
     {
       "from": "DeckTab.cs.txt",

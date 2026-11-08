@@ -28,6 +28,22 @@ namespace Exerussus.Nexus.Core
             return true;
         }
 
+        /// <summary>Упала ли страница id хоть в одном открытом окне (сбой в песочнице хоста).</summary>
+        public static bool IsFaulted(string id)
+        {
+            foreach (var h in Hosts)
+                if (h.IsFaulted(id)) return true;
+            return false;
+        }
+
+        /// <summary>Текст сбоя страницы id (первый найденный) или null.</summary>
+        public static string ErrorOf(string id)
+        {
+            foreach (var h in Hosts)
+                if (h.IsFaulted(id)) return h.ErrorOf(id);
+            return null;
+        }
+
         /// <summary>Дать всем хостам id свернуть страницу и сбросить данные перед упаковкой.</summary>
         public static void PrePack(string id)
         {

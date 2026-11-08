@@ -2,6 +2,35 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.0.0-pre.11]
+
+Nexus Daemon 0.4.0.
+
+### Изменено
+- **Nexus Daemon на .NET 10 (LTS).** Поддержка .NET 8 заканчивается 10 ноября 2026; демон собран под `net10.0`
+  (roll-forward на новые мажорные версии остаётся) — **нужен .NET 10 Runtime или новее**. dotnet, рядом с которым
+  нет рантайма 10+ (в том числе dotnet из Unity со своим .NET 8), пропускается сразу, без 8 с ожидания старта;
+  не нашлось ни одного — `daemon.status` и Manage пишут «нужен .NET 10 или новее». Сборка — SDK 10.
+- Apply разделён на расчёт и выполнение: `ApplyService.Plan` (gate, пакеты, версии сейва, сводка) →
+  `ApplyService.Execute` (файлы, без диалогов и без Refresh). Окно Manage работает как прежде, но все подтверждения
+  (сводка и UPM-пакеты) теперь спрашиваются до первой файловой операции.
+
+### Добавлено
+- Команды управления плагинами — всё, что умеет окно Manage, без мыши:
+  - `plugin.list [--status …]`, `plugin.info <id>` — статус (в том числе упавшая страница), версии манифеста, State и
+    сейва, настройки, видимость, отказы gate, недостающие пакеты, где лежат исходник, State, сейв и настройки;
+  - `plugin.validate [id …]` — живые файлы в исходнике, маппинг развёртки, id ≠ папке, файлы вне маппинга, один id
+    в нескольких корнях;
+  - `plugin.deploy <id …> [--packages]`, `plugin.undeploy <id …> --yes`, `plugin.apply --deploy … --undeploy … --yes` —
+    одна перекомпиляция на вызов, итог — отчёт развёртки и результат компиляции; `--packages` — двухфазная
+    установка UPM-пакетов, задание ждёт её через перезагрузки;
+  - `plugin.restore <id> --yes`, `plugin.clean <id> --yes`, `plugin.settings.clear <id> --yes`;
+  - `plugin.roots`, `plugin.roots.add <папка>`, `plugin.roots.remove <путь>`, `plugin.roots.scan`;
+  - `page.hide <id>` / `page.show <id>` — видимость в сайдбаре.
+  Деструктивное — только с `--yes` (вместо диалога), без него — сводка и код 1. Задание `plugins` исключительное, как
+  `refresh`; в Play команды развёртки отказывают.
+- `PageHostRegistry.IsFaulted` / `ErrorOf` — упавшая страница видна ядру (для `plugin.list`).
+
 ## [2.0.0-pre.10]
 
 ### Исправлено

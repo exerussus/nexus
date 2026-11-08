@@ -34,6 +34,9 @@ namespace Exerussus.Nexus.Core
             SessionState.SetString(PendingKey, string.Join("\n", set));
         }
 
+        /// <summary>Страницы, ещё ждущие своих UPM-пакетов (копия; ждут их задания CLI).</summary>
+        internal static HashSet<string> Pending() => Current();
+
         private static HashSet<string> Current()
         {
             var raw = SessionState.GetString(PendingKey, string.Empty);

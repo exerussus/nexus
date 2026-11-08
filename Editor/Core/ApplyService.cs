@@ -13,6 +13,8 @@ namespace Exerussus.Nexus.Core
     /// Транзакционный Apply. Все файловые операции выполняются ДО
     /// AssetDatabase.Refresh(), поэтому domain reload не рвёт процедуру; сводку
     /// результата проносим через reload в <see cref="ApplyReportSink"/>.
+    /// Конвейер один: <see cref="Plan"/> (расчёт) → <see cref="Execute"/> (файлы). Окно Manage подтверждает
+    /// диалогами, CLI — флагом --yes и выполняет в тике задания (модальные окна в командах запрещены).
     ///
     /// Правило подтверждений: тогл и развёртка — молча; выключение/restore/очистка
     /// сироты — через диалог. Деструктив батчится в ОДИН сводный диалог, а не по
@@ -20,30 +22,56 @@ namespace Exerussus.Nexus.Core
     /// </summary>
     public static class ApplyService
     {
-        /// <summary>Применить набор намерений (из management-окна).</summary>
+        /// <summary>Применить набор намерений из окна Manage: сводный диалог → файлы → Refresh.</summary>
         public static void Apply(IReadOnlyList<PendingIntent> intents)
         {
             if (intents == null || intents.Count == 0) return;
 
-            var byId = PluginDiscovery.Discover().ToDictionary(d => d.Id);
+            var plan = Plan(intents);
 
-            var destructive = new List<string>();
-            var warnings    = new List<string>();
-            var refusals    = new List<string>();   // deploys, отклонённые dependency-gate
-            var okDeploys   = new List<PendingIntent>();
-            var undeploys   = new List<PendingIntent>();
-            var needsPackages = new List<DiscoveredPlugin>();   // deploys, ждущие UPM-пакета
-            var localNotes  = new List<string>();   // пакеты, уже найденные в проекте (для отчёта)
+            // диалог нужен, если есть деструктив ИЛИ отказы гейта (чтобы не молчать)
+            if (plan.Destructive.Count > 0 || plan.Refusals.Count > 0)
+            {
+                if (!EditorUtility.DisplayDialog("Nexus — применить", Summary(plan) + "\n\nПродолжить?", "Применить", "Отмена"))
+                    return;
+            }
+
+            // все подтверждения — до файловых операций
+            var installPackages = false;
+            if (plan.NeedsPackages.Count > 0)
+            {
+                installPackages = EditorUtility.DisplayDialog(
+                    "Nexus — нужны UPM-пакеты",
+                    "Этим страницам нужны внешние пакеты, которых нет в проекте:\n\n" +
+                    string.Join("\n", PackageLines(plan)) + "\n\n" +
+                    "Прописать их в Packages/manifest.json и установить? Когда пакет подтянется " +
+                    "(рекомпил), страница развернётся автоматически — это отдельный второй шаг.",
+                    "Установить и развернуть", "Пропустить");
+            }
+
+            var outcome = Execute(plan, installPackages);
+            Finish(outcome.Report);
+            if (outcome.ResolvePackages) Client.Resolve();   // применить правки Packages/manifest.json → пакет тянется → reload → фаза 2
+        }
+
+        /// <summary>
+        /// Расчёт без побочных эффектов: gate, недостающие пакеты, предупреждения о версиях сейва, сводка деструктива.
+        /// Общий для окна Manage и CLI — один конвейер, разные способы подтверждения.
+        /// </summary>
+        public static ApplyPlan Plan(IReadOnlyList<PendingIntent> intents)
+        {
+            var plan = new ApplyPlan { ById = PluginDiscovery.Discover().ToDictionary(d => d.Id) };
+            if (intents == null) return plan;
 
             foreach (var it in intents)
             {
-                byId.TryGetValue(it.Id, out var dp);
+                plan.ById.TryGetValue(it.Id, out var dp);
                 var name = dp?.DisplayName ?? it.Id;
 
                 if (it.Kind == IntentKind.Undeploy)
                 {
-                    undeploys.Add(it);
-                    destructive.Add($"• выключить «{name}» — живой код выгрузится (сейв уйдёт в Preserve)");
+                    plan.Undeploys.Add(it);
+                    plan.Destructive.Add($"• выключить «{name}» — живой код выгрузится (сейв уйдёт в Preserve)");
                     continue;
                 }
 
@@ -52,20 +80,20 @@ namespace Exerussus.Nexus.Core
                 if (gate.Count > 0)
                 {
                     NexusDiagnostics.Trace("Gate", $"'{it.Id}' отклонён: {string.Join("; ", gate)}");
-                    refusals.Add($"• «{name}»: {string.Join("; ", gate)}");
+                    plan.Refusals.Add($"• «{name}»: {string.Join("; ", gate)}");
                     continue;
                 }
 
                 // нет нужного UPM-пакета → не деплоим сейчас, уводим в двухфазную установку
-                if (DependencyGate.MissingPackages(dp?.Manifest).Count > 0 && dp != null)
+                if (dp != null && DependencyGate.MissingPackages(dp.Manifest).Count > 0)
                 {
                     NexusDiagnostics.Trace("Gate",
                         $"'{it.Id}' ждёт UPM-пакеты: {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest).Select(p => p.Name))}");
-                    needsPackages.Add(dp);
+                    plan.NeedsPackages.Add(dp);
                     continue;
                 }
 
-                okDeploys.Add(it);
+                plan.Deploys.Add(it);
 
                 // пакет, объявленный странице, но уже присутствующий в проекте (не через manifest) — отметим
                 foreach (var p in dp?.Manifest?.PackageRequires ?? Enumerable.Empty<PackageDependency>())
@@ -73,7 +101,7 @@ namespace Exerussus.Nexus.Core
                     if (string.IsNullOrEmpty(p?.Name) || PackageRegistry.Has(p.Name)) continue;
                     var src = PackageRegistry.LocalSource(p);
                     if (src != null)
-                        localNotes.Add($"«{name}»: пакет {p.Name} уже в проекте ({src}) — git-установка не требуется");
+                        plan.LocalNotes.Add($"«{name}»: пакет {p.Name} уже в проекте ({src}) — git-установка не требуется");
                 }
 
                 if (PluginDeployer.HasPreserve(it.Id))
@@ -81,106 +109,109 @@ namespace Exerussus.Nexus.Core
                     var pv = PluginDeployer.PreservedVersion(it.Id);
                     var mv = dp?.Manifest?.Version;
                     if (!string.IsNullOrEmpty(pv) && !string.IsNullOrEmpty(mv) && pv != mv)
-                        warnings.Add($"• «{name}»: сейв развёрнут из v{pv}, плагин сейчас v{mv}");
+                        plan.Warnings.Add($"• «{name}»: сейв развёрнут из v{pv}, плагин сейчас v{mv}");
                 }
             }
 
-            // диалог нужен, если есть деструктив ИЛИ отказы гейта (чтобы не молчать)
-            if (destructive.Count > 0 || refusals.Count > 0)
-            {
-                var msg = string.Empty;
-                if (destructive.Count > 0)
-                    msg += "Деструктивные операции:\n" + string.Join("\n", destructive) + "\n\n";
-                if (refusals.Count > 0)
-                    msg += "НЕ будут развёрнуты (зависимости не удовлетворены):\n" + string.Join("\n", refusals) + "\n\n";
-                if (warnings.Count > 0)
-                    msg += "Предупреждения о версиях:\n" + string.Join("\n", warnings) + "\n\n";
-                msg += "Продолжить?";
+            return plan;
+        }
 
-                if (!EditorUtility.DisplayDialog("Nexus — применить", msg.TrimEnd(), "Применить", "Отмена"))
-                    return;
-            }
+        /// <summary>Текст сводки плана: деструктив, отказы, предупреждения (для диалога и вывода CLI).</summary>
+        public static string Summary(ApplyPlan plan)
+        {
+            var msg = string.Empty;
+            if (plan.Destructive.Count > 0)
+                msg += "Деструктивные операции:\n" + string.Join("\n", plan.Destructive) + "\n\n";
+            if (plan.Refusals.Count > 0)
+                msg += "НЕ будут развёрнуты (зависимости не удовлетворены):\n" + string.Join("\n", plan.Refusals) + "\n\n";
+            if (plan.Warnings.Count > 0)
+                msg += "Предупреждения о версиях:\n" + string.Join("\n", plan.Warnings) + "\n\n";
+            return msg.TrimEnd();
+        }
 
-            var report = new List<string>();
-            report.AddRange(refusals.Select(r => "отказано: " + r.TrimStart('•', ' ')));
-            report.AddRange(localNotes);
+        /// <summary>Строки «• «имя» → пакеты» для страниц, ждущих UPM-пакетов.</summary>
+        public static IEnumerable<string> PackageLines(ApplyPlan plan)
+            => plan.NeedsPackages.Select(dp =>
+                $"• «{dp.DisplayName}» → {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest).Select(p => p.Name))}");
+
+        /// <summary>
+        /// Файловая часть Apply по готовому плану — без диалогов и без Refresh (их делает вызывающий).
+        /// <paramref name="installPackages"/> — согласие на запись недостающих пакетов в Packages/manifest.json.
+        /// </summary>
+        public static ApplyOutcome Execute(ApplyPlan plan, bool installPackages)
+        {
+            var outcome = new ApplyOutcome();
+            var report  = outcome.Report;
+            report.AddRange(plan.Refusals.Select(r => "отказано: " + r.TrimStart('•', ' ')));
+            report.AddRange(plan.LocalNotes);
 
             // сначала выключения (освобождаем), затем включения (занимаем)
-            foreach (var it in undeploys)
+            foreach (var it in plan.Undeploys)
             {
                 // вето страницы (несохранённое?) — отложить выключение
                 if (!PageHostRegistry.CanClose(it.Id))
                 {
+                    outcome.Vetoed.Add(it.Id);
                     report.Add($"отложено: «{it.Id}» не готова к выключению (есть несохранённое)");
                     continue;
                 }
                 // последний шанс сбросить данные перед упаковкой/рекомпилом
                 PageHostRegistry.PrePack(it.Id);
-                report.Add(PluginDeployer.Undeploy(it.Id).Message);
+                Note(outcome, it.Id, PluginDeployer.Undeploy(it.Id));
             }
-            foreach (var it in okDeploys)
+            foreach (var it in plan.Deploys)
             {
-                byId.TryGetValue(it.Id, out var dp);
-                report.Add(PluginDeployer.Deploy(dp?.Manifest).Message);
+                plan.ById.TryGetValue(it.Id, out var dp);
+                Note(outcome, it.Id, PluginDeployer.Deploy(dp?.Manifest));
             }
 
             // двухфазная установка: прописать недостающие UPM-пакеты, отложить деплой страниц
-            var triggerResolve = false;
-            if (needsPackages.Count > 0)
+            if (plan.NeedsPackages.Count == 0) return outcome;
+
+            if (!installPackages)
             {
-                var lines = needsPackages.Select(dp =>
-                {
-                    var pk = string.Join(", ", DependencyGate.MissingPackages(dp.Manifest)
-                        .Select(p => p.Name));
-                    return $"• «{dp.DisplayName}» → {pk}";
-                });
-
-                var install = EditorUtility.DisplayDialog(
-                    "Nexus — нужны UPM-пакеты",
-                    "Этим страницам нужны внешние пакеты, которых нет в проекте:\n\n" +
-                    string.Join("\n", lines) + "\n\n" +
-                    "Прописать их в Packages/manifest.json и установить? Когда пакет подтянется " +
-                    "(рекомпил), страница развернётся автоматически — это отдельный второй шаг.",
-                    "Установить и развернуть", "Пропустить");
-
-                if (install)
-                {
-                    var toEnqueue = new List<string>();
-                    foreach (var dp in needsPackages)
-                    {
-                        var conflict = false;
-                        foreach (var p in DependencyGate.MissingPackages(dp.Manifest))
-                        {
-                            var res = PackageRegistry.Add(p.Name, PackageRegistry.GitValue(p));
-                            if (res == PackageRegistry.AddResult.Conflict)
-                            {
-                                conflict = true;
-                                report.Add($"конфликт пакета «{p.Name}» для «{dp.DisplayName}» — уже стоит другой пин, пропущено");
-                            }
-                            else if (res == PackageRegistry.AddResult.Added)
-                            {
-                                report.Add($"пакет запрошен: {p.Name} ({PackageRegistry.GitValue(p)})");
-                            }
-                        }
-                        if (!conflict) toEnqueue.Add(dp.Id);
-                    }
-
-                    if (toEnqueue.Count > 0)
-                    {
-                        PackageDeployContinuation.Enqueue(toEnqueue);
-                        triggerResolve = true;
-                        report.Add("после установки пакетов будут развёрнуты: " + string.Join(", ", toEnqueue));
-                    }
-                }
-                else
-                {
-                    foreach (var dp in needsPackages)
-                        report.Add($"пропущено: «{dp.DisplayName}» — нужны UPM-пакеты (не установлены)");
-                }
+                foreach (var dp in plan.NeedsPackages)
+                    report.Add($"пропущено: «{dp.DisplayName}» — нужны UPM-пакеты (не установлены)");
+                return outcome;
             }
 
-            Finish(report);
-            if (triggerResolve) Client.Resolve();   // применить правки Packages/manifest.json → пакет тянется → reload → фаза 2
+            var toEnqueue = new List<string>();
+            foreach (var dp in plan.NeedsPackages)
+            {
+                var conflict = false;
+                foreach (var p in DependencyGate.MissingPackages(dp.Manifest))
+                {
+                    var res = PackageRegistry.Add(p.Name, PackageRegistry.GitValue(p));
+                    if (res == PackageRegistry.AddResult.Conflict)
+                    {
+                        conflict = true;
+                        report.Add($"конфликт пакета «{p.Name}» для «{dp.DisplayName}» — уже стоит другой пин, пропущено");
+                    }
+                    else if (res == PackageRegistry.AddResult.Added)
+                    {
+                        report.Add($"пакет запрошен: {p.Name} ({PackageRegistry.GitValue(p)})");
+                    }
+                }
+
+                if (conflict) outcome.Failed.Add(dp.Id);
+                else toEnqueue.Add(dp.Id);
+            }
+
+            if (toEnqueue.Count > 0)
+            {
+                PackageDeployContinuation.Enqueue(toEnqueue);
+                outcome.AwaitingPackages.AddRange(toEnqueue);
+                outcome.ResolvePackages = true;
+                report.Add("после установки пакетов будут развёрнуты: " + string.Join(", ", toEnqueue));
+            }
+
+            return outcome;
+        }
+
+        private static void Note(ApplyOutcome outcome, string id, PluginDeployer.Result result)
+        {
+            outcome.Report.Add(result.Ok ? result.Message : $"ошибка «{id}»: {result.Message}");
+            if (!result.Ok) outcome.Failed.Add(id);
         }
 
         /// <summary>Сброс страницы к дефолту — деструктивно (удаляет сейв).</summary>

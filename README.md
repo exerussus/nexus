@@ -38,7 +38,8 @@
 ### Nexus Daemon
 
 Команды идут через **Nexus Daemon** (`nexusd`) — фоновый сервис, один на машину. Редактор с включённым CLI сам
-запускает его (`Tools~/daemon/nexusd.dll`, нужен .NET 8 или новее; без него — dotnet из Unity 6). Демон:
+запускает его (`Tools~/daemon/nexusd.dll`, нужен **.NET 10** или новее — [Runtime](https://dotnet.microsoft.com/download);
+dotnet из Unity подойдёт, только если в нём есть рантайм 10+). Демон:
 
 - знает все проекты с включённым CLI (`nexus list`) и принимает вызов сразу — даже пока редактор перезагружает
   домен или спит в фоне; сам ждёт задания (refresh, Play, тесты) и отдаёт итог;
@@ -97,6 +98,7 @@ nexus play.start [--scene Main] [--clear-logs] [--fail-on-errors]
 nexus play.stop | play.pause [on|off] | play.step [--frames 10]
 nexus scene.list [--all] | scene.open Main [--save|--discard] | scene.save [--as …]
 nexus page.list | page.open world [--focus]     страницы окна Nexus; показать (по id или имени, без фокуса)
+nexus page.hide logs | page.show logs           видимость страницы в сайдбаре
 nexus screenshot                               Game с UI → путь к PNG (по умолчанию ≤1280 px, --full — как есть)
 nexus screenshot scene | screenshot window --window Inspector
 nexus tests.run [--mode edit|play|all] [--filter Analytics] → итог и упавшие тесты (код 1)
@@ -104,6 +106,26 @@ nexus tests.list [--mode play]
 nexus menu "Assets/Reimport All" | menu --list "Window"
 nexus assets.find "t:Prefab Ship" | asset.reimport <путь> | select <путь> | save
 nexus jobs | job.status <id> | job.cancel <id>
+```
+
+### Управление плагинами
+
+То же, что окно Manage, — через тот же конвейер Apply. Деструктивное только с `--yes` (вместо диалога; без него —
+сводка и код 1). Развёртка, выключение, сброс и чистка идут заданием: одна перекомпиляция на вызов, итог — отчёт
+и результат компиляции, как у `refresh`. В Play команды развёртки отказывают.
+
+```
+nexus plugin.list [--status deployed|available|orphaned|faulted]   статус, версии, сейв, настройки, отказы gate
+nexus plugin.info logs                         манифест, где лежат исходник/State/сейв/настройки, зависимости
+nexus plugin.validate [logs …]                 исходник инертен, маппинг полон, id = папке, дубли id в корнях
+nexus plugin.deploy logs,world [--packages]    развернуть; --packages — доставить недостающие UPM-пакеты (2 фазы)
+nexus plugin.undeploy logs --yes               выключить: сейв → Preserve, код выгружается
+nexus plugin.apply --deploy a,b --undeploy c --yes                 всё за одну перекомпиляцию
+nexus plugin.restore logs --yes                сброс к дистрибутиву (State и сейв удаляются, настройки — нет)
+nexus plugin.clean <id> --yes                  удалить осиротевшее состояние
+nexus plugin.settings.clear logs --yes         удалить UserSettings/Exerussus.Nexus/<id> (без перекомпиляции)
+nexus plugin.roots                             корни плагинов и сколько в каждом плагинов
+nexus plugin.roots.add Assets/Tools/NexusPlugins | plugin.roots.remove <путь> | plugin.roots.scan
 ```
 
 ### Файловый канал (агент без сети до редактора)

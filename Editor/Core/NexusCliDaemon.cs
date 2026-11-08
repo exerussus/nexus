@@ -14,17 +14,22 @@ namespace Exerussus.Nexus.Core
 {
     /// <summary>
     /// Запуск и обновление Nexus Daemon — компонент сервера CLI (владелец — <see cref="NexusCliServer"/>). Демон
-    /// (<c>Tools~/daemon/nexusd.dll</c>, .NET 8+) — один на машину: обслуживает файловый канал, сторожа и будильник,
+    /// (<c>Tools~/daemon/nexusd.dll</c>, .NET 10+) — один на машину: обслуживает файловый канал, сторожа и будильник,
     /// ходит в редактор по TCP. Работает, только пока включён CLI: выключен — демон не запускается (и сам выходит,
     /// когда CLI выключен во всех проектах).
     /// </summary>
     /// <remarks>
     /// Запуск — в фоновом потоке (поиск dotnet и ожидание старта не держат редактор). Порядок поиска dotnet:
-    /// DOTNET_ROOT, PATH, Program Files, затем dotnet из самой Unity (Data/DotNetSdk). Работает демон старее
+    /// DOTNET_ROOT, PATH, Program Files, затем dotnet из самой Unity (Data/DotNetSdk). dotnet, рядом с которым видно
+    /// только рантаймы старше <see cref="RuntimeMajor"/>, пропускается сразу — иначе каждый такой кандидат стоил бы
+    /// ожидания старта впустую (хост dotnet просто не найдёт фреймворк и выйдет). Работает демон старее
     /// пакетного — его просят выйти и запускают новый; новее — не трогают (другой проект на свежем Nexus).
     /// </remarks>
     public static class NexusCliDaemon
     {
+        /// <summary>Мажор .NET, под который собран демон (tfm в nexusd.runtimeconfig.json); новее — тоже годится.</summary>
+        private const int RuntimeMajor = 10;
+
         private static readonly object Gate = new object();
         private static volatile string _status = "демон: не проверялся";
         private static volatile bool _starting;
@@ -121,6 +126,12 @@ namespace Exerussus.Nexus.Core
 
             foreach (var dotnet in Candidates(unityDotnet))
             {
+                if (!HasRuntime(dotnet))
+                {
+                    NexusDiagnostics.Trace("CLI", $"dotnet пропущен — нет рантайма .NET {RuntimeMajor}+: {dotnet}");
+                    continue;
+                }
+
                 _status = "демон: запускаю через " + dotnet;
                 if (!Start(dotnet, installed)) continue;
 
@@ -134,8 +145,8 @@ namespace Exerussus.Nexus.Core
                 }
             }
 
-            _status = "демон: не запустился — нужен .NET 8 или новее (https://dotnet.microsoft.com/download), агентские функции недоступны";
-            NexusDiagnostics.Error("CLI", "Nexus Daemon не запустился: установите .NET 8+ Runtime (https://dotnet.microsoft.com/download).");
+            _status = $"демон: не запустился — нужен .NET {RuntimeMajor} или новее (https://dotnet.microsoft.com/download), агентские функции недоступны";
+            NexusDiagnostics.Error("CLI", $"Nexus Daemon не запустился: установите .NET {RuntimeMajor}+ Runtime (https://dotnet.microsoft.com/download).");
         }
 
         /// <summary>
@@ -294,6 +305,33 @@ namespace Exerussus.Nexus.Core
                 foreach (var candidate in unityDotnet.Split('|'))
                     if (File.Exists(candidate) && seen.Add(candidate))
                         yield return candidate;
+        }
+
+        /// <summary>
+        /// Есть ли рядом с dotnet рантайм Microsoft.NETCore.App мажора <see cref="RuntimeMajor"/> или новее. Папки
+        /// shared не видно (dotnet — ссылка или нестандартная раскладка) — не знаем, пробуем запустить.
+        /// </summary>
+        private static bool HasRuntime(string dotnet)
+        {
+            try
+            {
+                var shared = Path.Combine(Path.GetDirectoryName(dotnet) ?? string.Empty, "shared", "Microsoft.NETCore.App");
+                if (!Directory.Exists(shared)) return true;
+
+                foreach (var dir in Directory.GetDirectories(shared))
+                {
+                    var name = Path.GetFileName(dir);
+                    var dot = name.IndexOf('.');
+                    if (int.TryParse(dot < 0 ? name : name.Substring(0, dot), out var major) && major >= RuntimeMajor) return true;
+                }
+
+                return false;
+            }
+            catch (Exception e)
+            {
+                NexusDiagnostics.Swallowed("CLI: проверка рантайма " + dotnet, e);
+                return true;
+            }
         }
 
         /// <summary>dotnet из самой Unity 6 (Data/DotNetSdk, Data/NetCoreRuntime) — запасной путь без установки .NET; через «|».</summary>

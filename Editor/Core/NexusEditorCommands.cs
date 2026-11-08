@@ -25,7 +25,7 @@ namespace Exerussus.Nexus.Core
         private const double QuietSeconds = 1.5;
 
         /// <summary>Задания, которые меняют состояние редактора: одновременно идёт только одно.</summary>
-        internal static readonly string[] ExclusiveKinds = { "refresh", "compile", "settle", "play.start", "play.stop", "play.step", "tests" };
+        internal static readonly string[] ExclusiveKinds = { "refresh", "compile", "settle", "plugins", "play.start", "play.stop", "play.step", "tests" };
 
         static NexusEditorCommands()
         {
@@ -164,8 +164,9 @@ namespace Exerussus.Nexus.Core
             return r.ErrorCount > 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
         }
 
-        /// <summary>Обновление и компиляция: ждать, пока редактор не будет «тихим» <see cref="QuietSeconds"/>.</summary>
-        private static void Settle(NexusCliJob job)
+        /// <summary>Обновление и компиляция: ждать, пока редактор не будет «тихим» <see cref="QuietSeconds"/>.
+        /// Задания других видов (plugins) доводят свою работу и дальше ждут через него же.</summary>
+        internal static void Settle(NexusCliJob job)
         {
             var now = NexusCliJobs.Now;
 
@@ -235,6 +236,11 @@ namespace Exerussus.Nexus.Core
             var exit = NexusCommandContext.Exit.Ok;
             var errors = new List<string>();
 
+            // отчёт работы задания до компиляции (plugins: что развёрнуто/выключено) — первой строкой итога
+            var report = job.Get("report");
+            if (!string.IsNullOrEmpty(report)) sb.Append(report.TrimEnd('\n')).Append('\n');
+            if (job.Get("failed") == "1") exit = NexusCommandContext.Exit.Failed;
+
             if (compiled && r.ErrorCount > 0 || !compiled && failed)
             {
                 exit = NexusCommandContext.Exit.Failed;
@@ -280,6 +286,7 @@ namespace Exerussus.Nexus.Core
                 errorCount = compiled ? r.ErrorCount : failed ? r?.ErrorCount ?? -1 : 0,
                 warningCount = compiled ? r.WarningCount : 0,
                 errors, logErrors, logSince = job.LogSeq,
+                report = string.IsNullOrEmpty(report) ? null : report.Split('\n'),
             });
         }
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# nexus-cli-version: 7
+# nexus-cli-version: 8
 #
 # Nexus CLI через файловый канал проекта (NexusTemp/cli) — для сред без сети до редактора (агент в VM, WSL).
 # Тот же набор команд и коды выхода, что у nexus; ходит не через TCP, а через файлы папки проекта.
 #
 #   python3 nexus-fs [--project <папка проекта>] [--json] [--timeout <с>] [--keep <с>] [--no-wait] [--force] [--no-map]
 #                    <команда> [аргументы]
-#   python3 nexus-fs result <id>                      итог вызова, запущенного с --no-wait
+#   python3 nexus-fs [--timeout <с>] result <id>      итог вызова, запущенного с --no-wait (ещё идёт — код 5;
+#                                                     с --timeout — ждать итога до срока)
 #   python3 nexus-fs diag                             что с редактором: пульс, домен, сторож (работает и без ответа)
 #   python3 nexus-fs task.run <файл.json>             задача из локального файла (через NexusTemp/cli/tasks)
 #   python3 nexus-fs task.run <имя> | --steps "…"     сценарий проекта / быстрая задача
@@ -18,7 +19,8 @@
 # Nexus 2: файловый канал ведёт Nexus Daemon (alive.json с daemon: true) — вызов принимается сразу, даже пока
 # редактор перезагружает домен или спит; ждать и будить его — дело демона. Nexus 1.x — канал ведёт сам Unity.
 # Коды выхода: код команды (0 — успех, 1 — ошибка, 2 — аргументы, 3 — нет команды, 4 — исключение/прервано,
-# 5 — истёк --timeout или редактор замолчал посреди вызова: итог — nexus-fs result <id>), 10 — нет открытого
+# 5 — истёк --timeout, редактор замолчал посреди вызова или result <id> для ещё идущего вызова: итог — nexus-fs
+# result <id>), 10 — нет открытого
 # редактора, 12 — редактор не отвечает (вызов не отправлен), 13 — демон не отвечает. Код 6 наружу не отдаётся.
 #
 # Удалять файлы в общей папке агенту в ВМ часто нельзя: прочитанное nexus-fs удаляет, а если нельзя — переносит в
@@ -86,6 +88,32 @@ def read_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def seconds_arg(flag, raw, minimum):
+    """Число секунд из аргумента: не число — понятная ошибка (код 2), а не исключение."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        err("%s: нужно число секунд, получено «%s»" % (flag, raw))
+        finish(2)
+    if value != value or value < minimum:
+        err("%s: нужно число секунд не меньше %s, получено «%s»" % (flag, minimum, raw))
+        finish(2)
+    return min(value, 7 * 24 * 3600)
+
+
+def bad_token(response):
+    """Отказ «неверный токен»: машинное поле reason (Nexus 2+), у старых редакторов — по тексту."""
+    if not isinstance(response, dict):
+        return False
+    if response.get("reason") == "bad-token":
+        return True
+    return (response.get("output") or response.get("summary") or "").startswith("Неверный токен") or \
+        "Неверный токен" in (response.get("summary") or "")
 
 
 def write_atomic(path, data):
@@ -372,9 +400,9 @@ def main(argv):
         if not rest and a == "--json":
             as_json = True; i += 1; continue
         if not rest and a == "--timeout" and i + 1 < len(argv):
-            timeout = max(1, int(float(argv[i + 1]))); timeout_set = True; i += 2; continue
+            timeout = max(1, int(seconds_arg("--timeout", argv[i + 1], 0.001) + 0.999)); timeout_set = True; i += 2; continue
         if not rest and a == "--keep" and i + 1 < len(argv):
-            keep = max(0, float(argv[i + 1])); i += 2; continue
+            keep = seconds_arg("--keep", argv[i + 1], 0); i += 2; continue
         if not rest and a == "--no-wait":
             no_wait = True; i += 1; continue
         if not rest and a == "--force":
@@ -417,22 +445,46 @@ def main(argv):
         if not args:
             err("нужен id: nexus-fs result <id>")
             finish(2)
-        for sub in ("done", os.path.join("tasks", "done")):
-            path = os.path.join(ch.cli, sub, args[0] + ".json")
-            data = read_json(path)
-            if data is not None:
-                ch.load_instance()
-                out(data, report=sub != "done")
-                if not keep:
-                    try_remove(path, ("task-done-" if sub != "done" else "done-") + os.path.basename(path))
-                finish(int(data.get("exitCode", 1)))
-        for sub in ("active", os.path.join("tasks", "active")):
-            data = read_json(os.path.join(ch.cli, sub, args[0] + ".json"))
-            if data is not None:
-                print("… ещё идёт: %s" % (data.get("phase") or ""))
-                finish(0)
-        err("Нет вызова «%s» (итог уже прочитан или истёк keep)." % args[0])
-        finish(1)
+        call_id = args[0]
+        # id становится частью пути: только безопасные символы (никаких «../»)
+        if not CALL_ID_RE.match(call_id):
+            err("неверный id вызова: «%s»" % call_id)
+            finish(2)
+        # без --timeout — один взгляд (агенту в ВМ нельзя висеть дольше лимита оболочки); с --timeout — ждать итога
+        if not timeout_set:
+            ch.deadline = time.time()
+        last = None
+        beat = {}
+        while True:
+            for sub in ("done", os.path.join("tasks", "done")):
+                path = os.path.join(ch.cli, sub, call_id + ".json")
+                data = read_json(path)
+                if data is not None:
+                    ch.load_instance()
+                    out(data, report=sub != "done")
+                    if not keep:
+                        try_remove(path, ("task-done-" if sub != "done" else "done-") + os.path.basename(path))
+                    finish(int(data.get("exitCode", 1)))
+            running = None
+            for sub in ("active", os.path.join("tasks", "active"), "requests", os.path.join("tasks", "requests")):
+                if os.path.exists(os.path.join(ch.cli, sub, call_id + ".json")):
+                    running = read_json(os.path.join(ch.cli, sub, call_id + ".json")) or {}
+                    if sub.endswith("requests"):
+                        running.setdefault("phase", "ждёт приёма демоном")
+                    break
+            if running is None:
+                err("Нет вызова «%s» (итог уже прочитан или истёк keep)." % call_id)
+                finish(1)
+            phase = running.get("phase") or ""
+            if ch.expired():
+                # как у nexus: незавершённый вызов — код 5, не 0 (иначе «ещё идёт» не отличить от успеха)
+                err("… ещё идёт: %s — повторите nexus-fs result %s" % (phase, call_id))
+                finish(5)
+            if phase and phase != last:
+                err("… " + phase)
+                last = phase
+            ch.check_alive(beat, call_id)
+            time.sleep(0.3)
 
     # задача из локального файла — через tasks/requests (путь VM редактору не виден)
     if command == "task.run" and args and args[0].lower().endswith(".json") and os.path.isfile(os.path.expanduser(args[0])):
@@ -468,7 +520,7 @@ def apply_task_flags(definition, extra, timeout, keep):
             j += 2
             continue
         if extra[j] in ("--timeout", "--keep") and j + 1 < len(extra):
-            definition[extra[j][2:]] = float(extra[j + 1])
+            definition[extra[j][2:]] = seconds_arg(extra[j], extra[j + 1], 0)
             j += 2
             continue
         j += 1
@@ -565,9 +617,8 @@ def run_call(ch, request, no_wait, out):
         if not request.get("keep"):
             try_remove(done)
 
-        output = data.get("output") or ""
         code = int(data.get("exitCode", 1))
-        if output.startswith("Неверный токен"):
+        if bad_token(data):
             ch.say_wait("Устаревший токен — перечитываю экземпляр…")
             time.sleep(0.5)
             continue
@@ -624,8 +675,7 @@ def run_task_file(ch, definition, no_wait, out):
             PENDING.remove(task_path)
         if not definition.get("keep"):
             try_remove(done, "task-done-" + os.path.basename(done))
-        summary = data.get("summary") or ""
-        if "Неверный токен" in summary:
+        if bad_token(data):
             ch.say_wait("Устаревший токен — перечитываю экземпляр…")
             time.sleep(0.5)
             continue

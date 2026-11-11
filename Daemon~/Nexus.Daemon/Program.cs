@@ -15,6 +15,9 @@ namespace Exerussus.Nexus.Daemon
     {
         private static readonly ManualResetEventSlim Exit = new ManualResetEventSlim();
 
+        /// <summary>Циклы демона остановлены: только после ожидания идущих вызовов (<see cref="Drain"/>).</summary>
+        private static volatile bool _stopped;
+
         public static int Main(string[] args)
         {
             int? port = null;
@@ -64,15 +67,36 @@ namespace Exerussus.Nexus.Daemon
             };
 
             Exit.Wait();
+            Drain();
+            _stopped = true;
             Log.Info("выход");
             http.Stop();
             DaemonInfo.Delete();
             return 0;
         }
 
+        /// <summary>Сколько уходящий демон ждёт идущих вызовов (обновление пакета), с.</summary>
+        public const int DrainSeconds = 120;
+
+        /// <summary>
+        /// Остановка по API (обновление): новые вызовы уже не принимаются (<see cref="Calls.Draining"/>), идущие
+        /// доводятся до конца, но не дольше <see cref="DrainSeconds"/>; циклы демона (файлы, сторож) работают до выхода.
+        /// Не дождавшиеся вызовы файлового канала новый демон закроет итогом «демон перезапущен».
+        /// </summary>
+        private static void Drain()
+        {
+            if (!Calls.Draining) return;
+            var until = DateTime.UtcNow.AddSeconds(DrainSeconds);
+            while (Calls.Active.Any() && DateTime.UtcNow < until) Thread.Sleep(200);
+            var left = Calls.Active.Count();
+            if (left > 0) Log.Warn($"выход с незавершёнными вызовами: {left} (ждал {DrainSeconds} с)");
+            // циклы ещё идут: повторная запись итогов файлового канала (если первая не удалась) успевает пройти
+            Thread.Sleep(500);
+        }
+
         private static Task Loop(string name, int intervalMs, Action tick) => Task.Run(async () =>
         {
-            while (!Exit.IsSet)
+            while (!_stopped)
             {
                 try
                 {

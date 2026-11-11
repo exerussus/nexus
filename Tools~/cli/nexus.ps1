@@ -1,5 +1,5 @@
 ﻿# Nexus CLI: команды в редакторы Unity с Nexus через Nexus Daemon.
-# nexus-cli-version: 5
+# nexus-cli-version: 6
 #
 #   nexus list                                         проекты, которые знает демон
 #   nexus [--project <имя|путь>] [--json] [--timeout <с>] [--no-wait] [--force] <команда> [аргументы]
@@ -12,8 +12,9 @@
 # Без сети до localhost (агент в VM, WSL) — python3 <проект>/NexusTemp/nexus-fs: те же команды через файлы.
 #
 # Проект: --project (имя папки или путь), иначе — проект, в папке которого вы стоите, иначе — единственный.
-# Коды выхода: код команды (0 — успех), 10 — нет проекта / редактор закрыт, 11 — проект не однозначен,
-# 13 — демон не запущен.
+# Коды выхода: код команды (0 — успех), 2 — неверные аргументы клиента, 5 — вызов ещё идёт (срок --timeout
+# вышел: nexus result <id>), 10 — нет проекта / редактор закрыт, 11 — проект не однозначен, 13 — демон не
+# запущен или не отвечает.
 
 $ErrorActionPreference = 'Stop'
 
@@ -33,35 +34,51 @@ function Read-JsonFile([string]$path) {
     try { return [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch { return $null }
 }
 
-$daemon = Read-JsonFile (Join-Path $Root 'daemon.json')
-$tokens = Read-JsonFile (Join-Path $Root 'tokens.json')
-$alive = $false
-if ($daemon -and $daemon.pid) { $alive = $null -ne (Get-Process -Id $daemon.pid -ErrorAction SilentlyContinue) }
-if (-not $alive -or -not $tokens) {
-    Write-Err 'Nexus Daemon не запущен: откройте проект в Unity с включённым CLI (Exerussus/Nexus/Manage → CLI).'
+$script:Base = $null; $script:Token = $null; $script:DaemonPid = 0
+
+# daemon.json и токен: (пере)читать — после обновления демона у нового другой порт
+function Connect-Daemon {
+    $daemon = Read-JsonFile (Join-Path $Root 'daemon.json')
+    $tokens = Read-JsonFile (Join-Path $Root 'tokens.json')
+    $alive = $false
+    if ($daemon -and $daemon.pid) { $alive = $null -ne (Get-Process -Id $daemon.pid -ErrorAction SilentlyContinue) }
+    if (-not $alive -or -not $tokens) { return $false }
+    $script:Base = "http://127.0.0.1:$($daemon.port)"
+    $script:Token = [string]$tokens.local.token
+    $script:DaemonPid = [int]$daemon.pid
+    return $true
+}
+
+function Fail-NoDaemon([string]$why) {
+    if ($why) { Write-Err $why }
+    Write-Err 'Nexus Daemon не запущен: откройте проект в Unity с включённым CLI (Exerussus/Nexus/Manage → CLI) — редактор перезапустит его в течение 30 с.'
     Finish 13
 }
-$Base = "http://127.0.0.1:$($daemon.port)"
-$Token = [string]$tokens.local.token
 
-# HTTP без исключений на 4xx/5xx: (код, объект ответа)
+# HTTP без исключений на 4xx/5xx: (код, объект ответа); нет соединения — код 13
 function Invoke-Api([string]$method, [string]$path, $body = $null, [int]$timeoutMs = 30000) {
-    $req = [System.Net.HttpWebRequest]::Create($Base + $path)
-    $req.Method = $method
-    $req.Timeout = $timeoutMs
-    $req.ReadWriteTimeout = $timeoutMs
-    $req.Headers['Authorization'] = "Bearer $Token"
-    $req.Proxy = $null
-    $req.ServicePoint.Expect100Continue = $false
-    if ($null -ne $body) {
-        $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes(($body | ConvertTo-Json -Compress -Depth 6))
-        $req.ContentType = 'application/json; charset=utf-8'
-        $req.ContentLength = $bytes.Length
-        $s = $req.GetRequestStream(); $s.Write($bytes, 0, $bytes.Length); $s.Close()
-    }
-    try { $resp = $req.GetResponse() } catch [System.Net.WebException] {
-        if ($null -eq $_.Exception.Response) { Write-Err "Демон не отвечает: $($_.Exception.Message)"; Finish 13 }
+    $resp = $null
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($script:Base + $path)
+        $req.Method = $method
+        $req.Timeout = $timeoutMs
+        $req.ReadWriteTimeout = $timeoutMs
+        $req.Headers['Authorization'] = "Bearer $($script:Token)"
+        $req.Proxy = $null
+        $req.ServicePoint.Expect100Continue = $false
+        if ($null -ne $body) {
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes(($body | ConvertTo-Json -Compress -Depth 6))
+            $req.ContentType = 'application/json; charset=utf-8'
+            $req.ContentLength = $bytes.Length
+            # отправка тела — тоже соединение: демон мог умереть между проверкой и запросом
+            $s = $req.GetRequestStream(); $s.Write($bytes, 0, $bytes.Length); $s.Close()
+        }
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        if ($null -eq $_.Exception.Response) { Fail-NoDaemon "Демон не отвечает: $($_.Exception.Message)" }
         $resp = $_.Exception.Response
+    } catch {
+        Fail-NoDaemon "Демон не отвечает: $($_.Exception.Message)"
     }
     $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
     $text = $reader.ReadToEnd(); $reader.Close()
@@ -71,13 +88,26 @@ function Invoke-Api([string]$method, [string]$path, $body = $null, [int]$timeout
     return @($code, $obj)
 }
 
+# живой pid — ещё не живой демон (pid мог достаться другому процессу): спросить сам демон и сверить pid
+if (-not (Connect-Daemon)) { Fail-NoDaemon $null }
+$probe = Invoke-Api 'GET' '/v1/daemon' $null 3000
+if ($probe[0] -ne 200 -or $null -eq $probe[1] -or [int]$probe[1].pid -ne $script:DaemonPid) {
+    Fail-NoDaemon "Демон pid $($script:DaemonPid) не отвечает на своём порту (daemon.json устарел?)."
+}
+
 $project = $null; $json = $false; $timeout = 600; $timeoutSet = $false; $noWait = $false; $force = $false
 $rest = New-Object System.Collections.Generic.List[string]
 for ($k = 0; $k -lt $args.Count; $k++) {
     $a = [string]$args[$k]
     if ($rest.Count -eq 0 -and $a -eq '--project' -and $k + 1 -lt $args.Count) { $project = [string]$args[++$k]; continue }
     if ($rest.Count -eq 0 -and $a -eq '--json') { $json = $true; continue }
-    if ($rest.Count -eq 0 -and $a -eq '--timeout' -and $k + 1 -lt $args.Count) { $timeout = [Math]::Max(1, [int]$args[++$k]); $timeoutSet = $true; continue }
+    if ($rest.Count -eq 0 -and $a -eq '--timeout' -and $k + 1 -lt $args.Count) {
+        $raw = [string]$args[++$k]; $seconds = 0.0
+        if (-not [double]::TryParse($raw, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -or $seconds -le 0) {
+            Write-Err "--timeout: нужно положительное число секунд, получено «$raw»"; Finish 2
+        }
+        $timeout = [int][Math]::Max(1, [Math]::Ceiling([Math]::Min($seconds, 604800))); $timeoutSet = $true; continue
+    }
     if ($rest.Count -eq 0 -and $a -eq '--force') { $force = $true; continue }
     if ($rest.Count -eq 0 -and $a -eq '--no-wait') { $noWait = $true; continue }
     $rest.Add($a)
@@ -122,6 +152,7 @@ function Wait-Call([string]$id, [datetime]$deadline) {
 
 if ($command -eq 'result') {
     if ($cmdArgs.Count -lt 1) { Write-Err 'нужен id: nexus result <id>'; Finish 2 }
+    if ($cmdArgs[0] -notmatch '^[A-Za-z0-9_-]+$') { Write-Err "неверный id вызова: «$($cmdArgs[0])»"; Finish 2 }
     $c = Wait-Call $cmdArgs[0] ((Get-Date).AddSeconds($timeout))
     Show-Result $c
     Finish ([int]$c.exitCode)
@@ -131,6 +162,15 @@ $body = @{ command = $command; args = $cmdArgs; cwd = (Get-Location).ProviderPat
 if ($project) { $body.project = $project }
 if ($timeoutSet) { $body.timeout = $timeout }
 $r = Invoke-Api 'POST' '/v1/calls' $body
+# 503 — демон обновляется (доводит идущие вызовы и уходит): дождаться нового и отправить ему
+$retryUntil = (Get-Date).AddSeconds([Math]::Min($timeout, 180))
+$said = $false
+while ($r[0] -eq 503 -and (Get-Date) -lt $retryUntil) {
+    if (-not $said) { Write-Err '… демон обновляется — жду новый'; $said = $true }
+    Start-Sleep -Milliseconds 1000
+    if (Connect-Daemon) { $r = Invoke-Api 'POST' '/v1/calls' $body 5000 }
+}
+if ($r[0] -eq 503) { Write-Err "Демон: $($r[1].error)"; Finish 13 }
 if ($r[0] -eq 404) {
     $msg = [string]$r[1].error
     Write-Err $msg

@@ -58,12 +58,19 @@ namespace Exerussus.Nexus.Manifests
 
     /// <summary>Внешний UPM-пакет, который странице нужен. Версии НЕ пиним — ставится
     /// последнее (git-URL без тега). Перед требованием установки Nexus проверяет, нет ли
-    /// зависимости уже в проекте (UPM/embedded/вендор) — тогда git-установка не нужна.</summary>
+    /// зависимости уже в проекте (UPM/embedded/вендор) — тогда git-установка не нужна.
+    /// <see cref="Version"/> — НЕ пин, а нижняя граница: установленный пакет старее — страница
+    /// не разворачивается (иначе её код не скомпилируется против старого API).</summary>
     public sealed class PackageDependency
     {
         public string Name     { get; set; }   // имя UPM-пакета (ключ в Packages/manifest.json)
         public string GitUrl   { get; set; }   // git-URL (можно с ?path=); ставится последнее
         public string Assembly { get; set; }   // опц.: имя сборки для детекта «уже в проекте»
+        public string Version  { get; set; }   // опц.: минимальная версия (semver, с pre-release)
+
+        /// <summary>Неизвестные поля — сохраняются дословно.</summary>
+        [JsonExtensionData]
+        public IDictionary<string, JToken> Extra { get; set; }
     }
 
     /// <summary>Один файл развёртки: инертный исток в Plugins → живой путь в State.</summary>

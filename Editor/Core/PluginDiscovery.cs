@@ -83,7 +83,12 @@ namespace Exerussus.Nexus.Core
                 yield break;
 
             foreach (var dir in Directory.EnumerateDirectories(root))
-                yield return Path.GetFileName(dir);
+            {
+                // скрытые папки Unity не импортирует («.x», «x~») — там, например, старый State на время swap
+                var name = Path.GetFileName(dir);
+                if (name.StartsWith(".") || name.EndsWith("~")) continue;
+                yield return name;
+            }
         }
     }
 }

@@ -286,3 +286,100 @@ private static int Do(NexusCommandContext ctx)
 ```
 
 Команда выполняется в главном потоке редактора, без окон и диалогов.
+
+## Команды Unity
+
+Сборка `Exerussus.Nexus.UnityCommands` даёт базовые операции редактора готовыми командами — без своего C# и без
+пунктов меню. Все правки сцены идут через Undo, сцена помечается изменённой, но не сохраняется (`save`,
+`scene.save`). В Play меняющие команды объектов работают только с `--play`. Опасные команды (`go.delete --all`,
+`asset.delete`, `tag.remove`, `layer.remove`, `pkg.remove`, `prefab.apply`) без `--yes` только показывают, что
+произойдёт. Позиционные аргументы пишите до флагов.
+
+### Объекты, компоненты, префабы
+
+`go.find`, `go.tree`, `go.info`, `go.create` (пустой, `--primitive`, `--prefab`), `go.delete`, `go.duplicate`,
+`go.rename`, `go.move`, `go.set` (active, tag, layer, static, имя), `transform.set` (в т.ч. RectTransform:
+`--anchored`, `--size`); `comp.list`, `comp.add`, `comp.remove`, `comp.get`, `comp.set`, `comp.invoke` (методы
+`[ContextMenu]`); `prefab.create`, `prefab.open`, `prefab.close --save|--discard`, `prefab.save`,
+`prefab.overrides`, `prefab.apply`, `prefab.revert`, `prefab.unpack`.
+
+Объект (spec): `Root/Child` — путь по всем загруженным сценам; `Main:Root/Child` или
+`Assets/Scenes/Main.unity:Root/Child` — в конкретной сцене; `Player` — уникальное имя; `#123456` — id из `go.find` /
+`go.info` (живёт до перезагрузки сцены). Неоднозначность — ошибка со списком кандидатов. Открыт префаб
+(`prefab.open`) — адресация идёт по нему. Компонент: `Rigidbody`, `MyGame.Health`, `Health[1]` — второй такой же,
+или номер из `comp.list`.
+
+Поля (`comp.set`, `comp.add … path=value`, `asset.set`, `settings.set`) — `путь=значение`, несколько за раз одной
+записью Undo; пути показывает `comp.get` (`mass` найдёт `m_Mass`):
+
+| Тип | Формат |
+|---|---|
+| числа, bool | `5`, `3.5` (точка), `true` |
+| enum, флаги | `Kinematic`, `A\|B` или число |
+| векторы | `1,2,3`; Quaternion — эйлер `0,90,0` или `x,y,z,w` |
+| Color | `#ff8800`, `#ff880080`, `1,0.5,0[,1]` |
+| Rect / Bounds | `x,y,w,h` / `cx,cy,cz,sx,sy,sz` |
+| LayerMask | `Default\|UI`, `Everything`, `Nothing` или число |
+| ссылка на ассет | путь, guid, `путь:Подассет`, `null` |
+| ссылка на объект сцены | `go:Root/Enemy`, компонент — `go:Root/Enemy@Rigidbody` |
+| массив | `items.Array.size=3`; элемент — `items.Array.data[0]=…` |
+
+AnimationCurve, Gradient и не-null `[SerializeReference]` из CLI не задаются.
+
+    nexus go.create Enemy --prefab Assets/Prefabs/Enemy.prefab --parent Level --pos 0,0,5
+    nexus comp.add Enemy Rigidbody mass=2 useGravity=false
+    nexus prefab.overrides Level/Enemy && nexus prefab.apply Level/Enemy --yes
+
+### Ассеты, сцены, проект
+
+`asset.info`, `asset.create <путь> --type folder|material|so|text`, `asset.move`, `asset.rename`, `asset.copy`,
+`asset.delete` (по умолчанию в корзину), `asset.deps`, `asset.refs` (кто ссылается), `asset.get` / `asset.set`
+(`--importer` — настройки импорта), `asset.label`. Ассет (spec): путь `Assets/…` или `Packages/…`, guid или
+`guid:<hex>`, `путь:Имя` — подассет, просто имя — если совпадение одно.
+
+Сцены: `scene.new`, `scene.close`, `scene.active`, `build.scenes` (`--add`, `--remove`, `--move --to`,
+`--enable`, `--disable`). Проект: `tag.*`, `layer.*`, `sortinglayer.*`, `defines [--target] [--add A,B]
+[--remove] [--set "A;B"]`, `settings.get` / `settings.set <player|quality|physics|physics2d|time|audio|graphics|
+editor|input|tags>`. Изменение кода (`asset.create … .cs`, `defines`) ждёт компиляцию и возвращает её итог. В
+Unity 6 активный Build Profile может переопределять defines и список сцен — команды работают с глобальными
+PlayerSettings и EditorBuildSettings.
+
+### Пакеты
+
+`pkg.list [--all] [--git]`, `pkg.info`, `pkg.add <имя[@версия]|git-url#ref>`, `pkg.remove`, `pkg.ref <имя> <ref>`
+(git-пакет на другую ветку, тег или коммит), `pkg.update <имя…>|--all-git` (свежий коммит той же ссылки),
+`pkg.outdated` (сравнить lock с remote через `git ls-remote`), `pkg.resolve`, `pkg.registry`, `pkg.search`.
+`Packages/manifest.json` правится бережно (порядок ключей, отступы, переводы строк). Изменения идут заданием:
+Resolve → импорт → компиляция → перезагрузка домена; итог — было/стало hash и ошибки компиляции, как у `refresh`.
+Имя можно сокращать до хвоста (`nexus` = `com.exerussus.nexus`). Локальный `file:` путь — только с `--allow-file`.
+
+    nexus pkg.ref nexus feature/x      # проект на #feature/x
+    nexus pkg.ref nexus develop        # обратно
+    nexus pkg.outdated                 # после push в пакет: что отстало
+    nexus pkg.update nexus
+
+## Git через демон
+
+Команды `git.*` выполняет Nexus Daemon, а не Unity: они работают при закрытом или компилирующемся редакторе и с
+учётными данными этой машины. Произвольные команды git не пробрасываются, принудительной отправки нет.
+
+Белый список: корень проекта (`--repo project` или без `--repo` для чтения); `"gitRepos": ["../UnityPackages/*"]` в
+`ProjectSettings/Nexus.json` (пути относительно проекта); личный `%LOCALAPPDATA%\Exerussus\Nexus\git-repos.json`:
+`{"repos": ["C:/…/UnityPackages/*"]}`. Glob — только в последнем сегменте; путь должен быть корнем репозитория
+(причина недоступности видна в `git.repos`).
+
+Чтение: `git.repos`, `git.status`, `git.log [--max N] [--range a..b] [--path p]`, `git.diff [--staged] [--stat]`,
+`git.branch [--all]`, `git.show <rev>`, `git.fetch [--all]`.
+
+Запись: `git.checkout`, `git.pull` (только `--ff-only`), `git.add`, `git.commit -m`, `git.merge`, `git.tag` — без
+`--yes` показывают, что будет сделано (код 8). Коммиты и теги — от `user.name` / `user.email` репозитория; нет
+личности — отказ. Push в два шага:
+
+1. `git.push --repo R [--tags | --tag vX.Y.Z] [--set-upstream]` — ничего не отправляет: цель, все уходящие коммиты
+   (автор, коммиттер, полное сообщение, проверка), теги, предупреждения и одноразовый код на 10 минут.
+2. `git.push --repo R --confirm <код>` — отправляет, только если HEAD, коммиты, теги и цель не изменились.
+
+Проверка следа ИИ блокирует commit, tag и push: трейлеры `Co-Authored-By` с ИИ, `Claude-Session`, ссылки claude.ai,
+«Generated with/by …», 🤖, «AI-generated», ИИ как автор, а также автора или коммиттера, не совпадающего с личностью
+репозитория. Маркеры в добавленных строках диффа и простые упоминания — предупреждения. Обход — только явный
+`--allow-ai-marks`.

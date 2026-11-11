@@ -71,6 +71,8 @@ namespace Exerussus.Nexus.Daemon
         public bool ReadOnly(string command)
         {
             if (command == "trash.clean" || command == "ping" || command == "help" || command == "dialog.list") return true;
+            // git демона: чтение проходит блокировку, запись — нет (как меняющие команды редактора)
+            if (GitCommands.Owns(command)) return GitCommands.IsReadOnly(command);
             // служебные: демону и клиентам нужны всегда (список команд, задания, состояние демона)
             if (command == "bridge.hello" || command == "daemon.status" || command == "jobs" || command.StartsWith("job.", StringComparison.Ordinal)) return true;
             var list = Commands;

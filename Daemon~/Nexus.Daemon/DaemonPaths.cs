@@ -16,6 +16,12 @@ namespace Exerussus.Nexus.Daemon
         public static string TokensFile => Path.Combine(Root, "tokens.json");
         public static string LogFile => Path.Combine(Root, "daemon.log");
 
+        /// <summary>
+        /// Личный белый список репозиториев для git-команд демона: <c>{"repos": ["C:/…/UnityPackages/*"]}</c> —
+        /// абсолютные пути (или от «~»), glob только в последнем сегменте. Действует для всех проектов этого пользователя.
+        /// </summary>
+        public static string GitReposFile => Path.Combine(Root, "git-repos.json");
+
         /// <summary>Папка, из которой запущен демон (Tools~/daemon пакета): рядом лежит Tools~/cli.</summary>
         public static string Home => AppContext.BaseDirectory;
 

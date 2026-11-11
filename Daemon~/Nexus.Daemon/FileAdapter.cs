@@ -286,7 +286,7 @@ namespace Exerussus.Nexus.Daemon
             foreach (var c in DaemonCommands.All)
             {
                 names.Add(c.Name);
-                commands.Add(new JsonObject { ["name"] = c.Name, ["summary"] = c.Summary, ["usage"] = c.Usage, ["readOnly"] = c.Name != "trash.clean" });
+                commands.Add(new JsonObject { ["name"] = c.Name, ["summary"] = c.Summary, ["usage"] = c.Usage, ["readOnly"] = DaemonCommands.ReadOnlyCommand(c.Name) });
             }
 
             var editor = p.Commands;

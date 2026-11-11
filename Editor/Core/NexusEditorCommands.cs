@@ -25,7 +25,7 @@ namespace Exerussus.Nexus.Core
         private const double QuietSeconds = 1.5;
 
         /// <summary>Задания, которые меняют состояние редактора: одновременно идёт только одно.</summary>
-        internal static readonly string[] ExclusiveKinds = { "refresh", "compile", "settle", "plugins", "play.start", "play.stop", "play.step", "tests" };
+        internal static readonly string[] ExclusiveKinds = { "refresh", "compile", "settle", "plugins", "play.start", "play.stop", "play.step", "tests", "pkg" };
 
         static NexusEditorCommands()
         {

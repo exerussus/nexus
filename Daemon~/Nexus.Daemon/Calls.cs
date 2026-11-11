@@ -192,6 +192,13 @@ namespace Exerussus.Nexus.Daemon
                 return;
             }
 
+            // git.* — демон сам, без редактора (работает и при закрытой Unity); асинхронно, с отменой
+            if (GitCommands.Owns(call.Command))
+            {
+                await RunGit(call);
+                return;
+            }
+
             // команды демона (dialog.*, trash.clean, ping канала) — без редактора: они нужны как раз когда его главный поток стоит
             if (DaemonCommands.Owns(call))
             {
@@ -228,7 +235,13 @@ namespace Exerussus.Nexus.Daemon
                 {
                     if (call.CancelRequested) { Finish(call, 7, "✗ Отменено до отправки в редактор.\n"); return; }
                     if (p.Removed) { Finish(call, 10, "✗ CLI в проекте выключен.\n"); return; }
-                    if (p.State == "closed") { Finish(call, 10, "✗ Редактор проекта закрыт.\n"); return; }
+                    if (p.State == "closed")
+                    {
+                        // help при закрытом редакторе: команды демона (git.*) работают и без него
+                        if (call.Command == "help" && call.Args.Length == 0) Finish(call, 0, "Редактор проекта закрыт: команды Unity недоступны." + DaemonCommands.HelpSection());
+                        else Finish(call, 10, "✗ Редактор проекта закрыт.\n");
+                        return;
+                    }
                     if (DateTime.UtcNow > deadline) { Finish(call, 5, $"✗ Редактор не принял команду за {call.Timeout} с (фаза: {p.Phase}).\n"); return; }
 
                     if (!p.Ready)
@@ -388,6 +401,51 @@ namespace Exerussus.Nexus.Daemon
             {
                 p.Leave();
                 if (p.InFlight == 0) p.CallPhase = null;
+            }
+        }
+
+        /// <summary>
+        /// git-команда демона: срок — timeout вызова, отмена клиента (cancel/ файлового канала, шаг пакета) останавливает процесс git.
+        /// Слоты редактора не занимает: Unity тут ни при чём.
+        /// </summary>
+        private static async Task RunGit(Call call)
+        {
+            call.State = "running";
+            SetPhase(call, "git: выполняет демон");
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(call.Timeout));
+            // отмена клиента — флаг вызова: перевести его в токен
+            var watch = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    if (call.CancelRequested)
+                    {
+                        cts.Cancel();
+                        break;
+                    }
+
+                    await Task.Delay(200);
+                }
+            });
+            try
+            {
+                var (exit, output, result) = await GitCommands.Run(call, phase => SetPhase(call, "git: " + phase), cts.Token);
+                Finish(call, exit, GitRunner.Mask(output), result);
+            }
+            catch (OperationCanceledException)
+            {
+                if (call.CancelRequested) Finish(call, 7, "✗ git: отменено — процесс git остановлен; проверьте состояние (git.status).\n");
+                else Finish(call, 5, $"✗ git: не завершилось за {call.Timeout} с — процесс git остановлен; проверьте состояние (git.status).\n");
+            }
+            catch (Exception e)
+            {
+                Log.Error("git " + call.Command, e);
+                Finish(call, 4, $"✗ Демон: {e.GetType().Name}: {GitRunner.Mask(e.Message)}\n");
+            }
+            finally
+            {
+                cts.Cancel();
+                await watch;
             }
         }
 

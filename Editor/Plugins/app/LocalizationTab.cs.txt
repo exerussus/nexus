@@ -140,20 +140,24 @@ namespace Exerussus.Nexus.Pages.App
             return keys;
         }
 
-        /// <summary>Посчитать употребления всех ключей одним обходом (с прогрессом, можно прервать).</summary>
-        internal void ScanUsages()
+        /// <summary>
+        /// Посчитать употребления всех ключей одним обходом (с прогрессом, можно прервать). Прерванный обход
+        /// неполон — прежний подсчёт остаётся, а не подменяется им. true — подсчёт обновлён.
+        /// </summary>
+        internal bool ScanUsages()
         {
             var errors = new List<string>();
+            LocUsageIndex index;
             try
             {
-                Usages = LocUsages.Scan(LocSettings.Current, AllKeys(),
-                                        p => EditorUtility.DisplayCancelableProgressBar("Локализация", "Ищу употребления ключей…", p), errors);
+                index = LocUsages.Scan(LocSettings.Current, AllKeys(),
+                                       p => EditorUtility.DisplayCancelableProgressBar("Локализация", "Ищу употребления ключей…", p), errors);
             }
             catch (Exception e)
             {
                 Debug.LogException(e);
                 Context.SetStatus("Поиск употреблений не удался — подробности в консоли.", StatusKind.Error);
-                Usages = null;
+                return false;
             }
             finally
             {
@@ -161,10 +165,21 @@ namespace Exerussus.Nexus.Pages.App
             }
 
             if (errors.Count > 0) Debug.LogWarning("[Loc] Поиск употреблений:\n" + string.Join("\n", errors));
-            if (Usages != null)
-                Context.SetStatus($"Употребления посчитаны: файлов {Usages.FilesScanned}, {Usages.Seconds:0.0} с" +
-                                  (errors.Count > 0 ? $" · замечаний {errors.Count} — в консоли" : string.Empty),
-                                  errors.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
+
+            if (!index.Complete)
+            {
+                Context.SetStatus(Usages != null
+                                      ? $"Поиск употреблений прерван — остался прежний подсчёт ({Usages.Time:HH:mm:ss})."
+                                      : "Поиск употреблений прерван — употребления не посчитаны.",
+                                  StatusKind.Warning);
+                return false;
+            }
+
+            Usages = index;
+            Context.SetStatus($"Употребления посчитаны: файлов {Usages.FilesScanned}, {Usages.Seconds:0.0} с" +
+                              (errors.Count > 0 ? $" · замечаний {errors.Count} — в консоли" : string.Empty),
+                              errors.Count > 0 ? StatusKind.Warning : StatusKind.Ok);
+            return true;
         }
 
         internal void MarkDirty()
@@ -585,7 +600,7 @@ namespace Exerussus.Nexus.Pages.App
 
         private void ShowHistory(string key, string language)
         {
-            _historyKey = Loc.KeyOf((key ?? string.Empty).Trim());
+            _historyKey = LocUsages.NormalizeKey(key);
             _historyLanguage = string.IsNullOrWhiteSpace(language) ? string.Empty : language.Trim();
             if (_historyOutput == null) return;
 
@@ -945,8 +960,7 @@ namespace Exerussus.Nexus.Pages.App
             row.Add(_kit.Btn(NexusRole.Info, "Проверить ключи проекта", () =>
             {
                 if (Table == null) return;
-                ScanUsages();
-                if (Usages == null) return;
+                if (!ScanUsages()) return;
                 var report = LocKeyScanner.Check(Table, LocSettings.Current, Usages);
                 if (report.Unknown.Count == 0)
                     Context.SetStatus($"Все ключи проекта есть в таблице. Без использования: {report.Unused.Count}.", StatusKind.Ok);

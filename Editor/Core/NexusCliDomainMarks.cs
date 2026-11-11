@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
+using System.Threading;
 using Exerussus.Nexus.Abstractions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -28,12 +30,39 @@ namespace Exerussus.Nexus.Core
                 using (var p = Process.GetCurrentProcess())
                 {
                     var o = new JObject { ["state"] = state, ["at"] = DateTime.UtcNow.ToString("o"), ["pid"] = p.Id };
-                    File.WriteAllText(DomainFile, o.ToString(Formatting.None));
+                    WriteAtomic(DomainFile, o.ToString(Formatting.None));
                 }
             }
             catch (Exception e)
             {
                 NexusDiagnostics.Swallowed("CLI: метка домена", e);
+            }
+        }
+
+        /// <summary>
+        /// Запись через временный файл и замену: демон и nexus-fs читают метку в любой момент — недописанный файл
+        /// они приняли бы за «меток нет». Занят читателем — несколько повторов.
+        /// </summary>
+        private static void WriteAtomic(string path, string content)
+        {
+            var temp = path + ".tmp";
+            File.WriteAllText(temp, content, new UTF8Encoding(false));
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path)) File.Replace(temp, path, null);
+                    else File.Move(temp, path);
+                    return;
+                }
+                catch (IOException) when (attempt < 5)
+                {
+                    Thread.Sleep(20);
+                }
+                catch (UnauthorizedAccessException) when (attempt < 5)
+                {
+                    Thread.Sleep(20);
+                }
             }
         }
 

@@ -58,7 +58,10 @@ namespace Exerussus.Nexus.Abstractions
         public IReadOnlyList<string> Positional => _positional;
 
         /// <summary>Клиент перестал ждать: долгой команде стоит прекратить работу.</summary>
-        public bool Cancelled { get; private set; }
+        public bool Cancelled => _cancelled;
+
+        // ставится потоком соединения, читается главным — без кэша в регистре
+        private volatile bool _cancelled;
 
         /// <summary>Данные для машины (<c>--json</c>): объект, словарь или список — хаб сериализует в JSON.</summary>
         public object Data { get; set; }
@@ -184,7 +187,7 @@ namespace Exerussus.Nexus.Abstractions
         }
 
         /// <summary>Только для хаба: клиент перестал ждать.</summary>
-        public void MarkCancelled() => Cancelled = true;
+        public void MarkCancelled() => _cancelled = true;
     }
 
     /// <summary>Остановить команду с кодом выхода и сообщением (обычно — неверные аргументы).</summary>

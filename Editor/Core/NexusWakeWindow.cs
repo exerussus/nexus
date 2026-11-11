@@ -14,7 +14,8 @@ namespace Exerussus.Nexus.Core
     /// <list type="bullet">
     /// <item>Обработчик окна — системный <c>DefWindowProcW</c>, ни строчки управляемого кода: окно переживает
     /// перезагрузку домена (её оно и помогает закончить) и ничего не делает само.</item>
-    /// <item>Живёт, только пока CLI включён и будильник в режиме <c>quiet</c>; иначе уничтожается.</item>
+    /// <item>Живёт, только пока CLI включён и будильник в режиме <c>quiet</c>; иначе уничтожается. В сервисных
+    /// процессах (импорт ассетов, batch mode) не создаётся.</item>
     /// <item>Одно на процесс: ищется по классу и заголовку <c>NexusWake:&lt;pid&gt;</c>.</item>
     /// </list>
     /// Только Windows; на других ОС класс ничего не делает.
@@ -37,6 +38,8 @@ namespace Exerussus.Nexus.Core
         {
 #if UNITY_EDITOR_WIN
             if (Thread.CurrentThread.ManagedThreadId != MainThread) return;
+            // процесс импорта ассетов и batch mode (сборка, CI): CLI там не поднимается — и окно не нужно
+            if (NexusCliServer.IsServiceProcess) return;
             try
             {
                 var want = NexusCliStore.Enabled && NexusCliStore.Wake == "quiet";

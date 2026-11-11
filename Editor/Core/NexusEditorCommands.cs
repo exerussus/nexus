@@ -25,7 +25,7 @@ namespace Exerussus.Nexus.Core
         private const double QuietSeconds = 1.5;
 
         /// <summary>Задания, которые меняют состояние редактора: одновременно идёт только одно.</summary>
-        internal static readonly string[] ExclusiveKinds = { "refresh", "compile", "settle", "plugins", "play.start", "play.stop", "play.step", "tests" };
+        internal static readonly string[] ExclusiveKinds = { "refresh", "compile", "settle", "plugins", "play.start", "play.stop", "play.step", "tests", "pkg" };
 
         static NexusEditorCommands()
         {
@@ -337,7 +337,12 @@ namespace Exerussus.Nexus.Core
         private static int JobStatus(NexusCommandContext ctx)
         {
             var id = ctx.Arg(0) ?? throw new NexusCommandException("нужно <id> задания: jobs");
-            var job = NexusCliJobs.Find(id) ?? throw new NexusCommandException($"Нет задания «{id}» (задания живут до перезапуска редактора).", NexusCommandContext.Exit.Failed);
+            var job = NexusCliJobs.Find(id);
+            if (job == null)
+            {
+                ctx.Data = new { reason = "no-job", id };
+                throw new NexusCommandException($"Нет задания «{id}» (задания живут до перезапуска редактора).", NexusCommandContext.Exit.Failed);
+            }
             ctx.Job = job.Id;
 
             if (!job.Done)

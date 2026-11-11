@@ -33,19 +33,42 @@ namespace Exerussus.Nexus.Deployment
     /// <summary>
     /// Чтение/запись проектного конфига. Хранится в ProjectSettings (вне Assets, вне
     /// основной папки Nexus) — поэтому обновление/переустановка Nexus его не трогает.
-    /// Явный владелец — этот модуль; кэш сбрасывается записью.
+    /// Явный владелец — этот модуль; кэш перечитывается, когда файл поменялся на диске
+    /// (git pull, правка руками, другой процесс) — сверка по времени изменения и размеру.
     /// </summary>
     public static class NexusConfigStore
     {
         private static NexusConfig _cached;
+        private static DateTime    _cachedStamp;
+        private static long        _cachedLength = -1;
 
         public static NexusConfig Load()
         {
-            if (_cached != null) return _cached;
-            _cached = JsonIo.Load<NexusConfig>(NexusPaths.ProjectConfigPath) ?? new NexusConfig();
+            var path = NexusPaths.ProjectConfigPath;
+            Stamp(path, out var stamp, out var length);
+            if (_cached != null && stamp == _cachedStamp && length == _cachedLength) return _cached;
+
+            _cached = JsonIo.Load<NexusConfig>(path) ?? new NexusConfig();
             _cached.ScanPaths       ??= new List<string>();
             _cached.DiscoveredRoots ??= new List<DiscoveredRoot>();
+            _cachedStamp  = stamp;
+            _cachedLength = length;
             return _cached;
+        }
+
+        // нет файла → (MinValue, -1): появление файла тоже считается изменением
+        private static void Stamp(string path, out DateTime stamp, out long length)
+        {
+            stamp  = DateTime.MinValue;
+            length = -1;
+            try
+            {
+                var fi = new System.IO.FileInfo(path);
+                if (!fi.Exists) return;
+                stamp  = fi.LastWriteTimeUtc;
+                length = fi.Length;
+            }
+            catch (Exception ex) { Exerussus.Nexus.Abstractions.NexusDiagnostics.Swallowed("время изменения " + path, ex); }
         }
 
         /// <summary>Добавить путь (относительный корню проекта); дубли и пустое игнорируются.</summary>
@@ -91,6 +114,12 @@ namespace Exerussus.Nexus.Deployment
             return true;
         }
 
-        private static void Save() => JsonIo.Save(NexusPaths.ProjectConfigPath, _cached);
+        private static void Save()
+        {
+            var path = NexusPaths.ProjectConfigPath;
+            JsonIo.Save(path, _cached);
+            // своя запись — не повод перечитывать: запоминаем новую отметку файла
+            Stamp(path, out _cachedStamp, out _cachedLength);
+        }
     }
 }

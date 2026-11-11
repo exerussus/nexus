@@ -77,6 +77,51 @@ namespace Exerussus.Nexus.Deployment
             return FindInAssets(d.Name) != null;
         }
 
+        /// <summary>
+        /// Установленная версия пакета (поле version его package.json), или null — не определить
+        /// (пакет есть только сборкой, ещё не разрешён и т.п.). Порядок: зарегистрированные пакеты
+        /// Package Manager → встроенный Packages/&lt;имя&gt; → кэш Library/PackageCache → package.json в Assets.
+        /// packages-lock.json для git-пакетов хранит URL, а не версию, поэтому сам по себе не годится.
+        /// </summary>
+        public static string InstalledVersion(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+
+            try
+            {
+                foreach (var info in UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages())
+                    if (info != null && string.Equals(info.name, name, System.StringComparison.Ordinal)
+                                     && !string.IsNullOrEmpty(info.version))
+                        return info.version;
+            }
+            catch (System.Exception ex) { NexusDiagnostics.Swallowed("версия пакета " + name, ex); }
+
+            var embedded = Path.Combine(NexusPaths.ProjectRoot, "Packages", name, "package.json");
+            var v = VersionOf(embedded);
+            if (v != null) return v;
+
+            var cache = Path.Combine(NexusPaths.ProjectRoot, "Library", "PackageCache");
+            if (Directory.Exists(cache))
+            {
+                try
+                {
+                    foreach (var dir in Directory.GetDirectories(cache, name + "@*"))
+                        if ((v = VersionOf(Path.Combine(dir, "package.json"))) != null) return v;
+                }
+                catch (System.Exception ex) { NexusDiagnostics.Swallowed("кэш пакетов для " + name, ex); }
+            }
+
+            if (IsResolved(name) || Has(name)) return null;   // UPM-пакет, но версия ещё не видна — не сканируем Assets
+            return VersionOf(FindInAssets(name));
+        }
+
+        private static string VersionOf(string packageJson)
+        {
+            if (string.IsNullOrEmpty(packageJson) || !File.Exists(packageJson)) return null;
+            try { return JsonIo.Load<PackageJsonName>(packageJson)?.Version; }
+            catch (System.Exception ex) { NexusDiagnostics.Swallowed($"нечитаемый package.json '{packageJson}'", ex); return null; }
+        }
+
         /// <summary>Откуда зависимость уже есть в проекте (для отчёта), или null если её нет.</summary>
         public static string LocalSource(PackageDependency d)
         {
@@ -106,10 +151,11 @@ namespace Exerussus.Nexus.Deployment
         /// <summary>git-значение зависимости: просто URL (версии не пиним — последнее).</summary>
         public static string GitValue(PackageDependency d) => d?.GitUrl;
 
-        // только поле name из package.json
+        // только поля name и version из package.json
         private sealed class PackageJsonName
         {
-            public string Name { get; set; }
+            public string Name    { get; set; }
+            public string Version { get; set; }
 
             [JsonExtensionData]
             public IDictionary<string, JToken> Extra { get; set; }

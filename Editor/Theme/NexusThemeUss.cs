@@ -78,15 +78,31 @@ namespace Exerussus.Nexus.Theme
         [MenuItem("Exerussus/Nexus/Dev/Regenerate theme USS")]
         private static void Regenerate()
         {
-            var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(NexusThemeUss).Assembly);
-            if (info == null || info.source == PackageSource.Git || info.source == PackageSource.Registry)
+            // движок в Assets (пакета нет) — тоже пишем: папка проекта записываема
+            var info = NexusThemePaths.Package;
+            if (info != null && (info.source == PackageSource.Git || info.source == PackageSource.Registry))
             {
                 Debug.LogWarning("[Nexus] Пакет только для чтения — USS палитр генерируется в локальной копии пакета (file: или embedded).");
                 return;
             }
 
-            var dir = Path.Combine(info.resolvedPath, "Editor", "Theme", "Uss");
-            Directory.CreateDirectory(dir);
+            var themeDir = NexusThemePaths.AbsDir;
+            if (string.IsNullOrEmpty(themeDir))
+            {
+                Debug.LogWarning("[Nexus] Не удалось определить папку темы (Editor/Theme) — USS не пересобран.");
+                return;
+            }
+
+            var dir = Path.Combine(themeDir, "Uss");
+            try
+            {
+                Directory.CreateDirectory(dir);
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"[Nexus] Папка {dir} недоступна для записи — USS не пересобран: {ex.Message}");
+                return;
+            }
 
             foreach (var palette in NexusPalettes.All)
             {

@@ -15,8 +15,11 @@ namespace Exerussus.Nexus.Core
     /// не размазан по окну и не рассинхронится.
     ///
     /// КАЖДЫЙ вызов страницы — в песочнице: исключение помечает страницу faulted и не
-    /// роняет хаб. Инстансы ленивые и кэшируются на сессию окна; после domain reload
-    /// кэш пуст (OnDispose через перезагрузку не зовётся — осознанное ограничение).
+    /// роняет хаб. Упавшая страница сразу освобождается (OnDispose → её Track-подписки),
+    /// хуков больше не получает до Reload. Обработчики шины, подписанные страницей, тоже
+    /// в песочнице: их падение валит именно эту страницу. Инстансы ленивые и кэшируются на
+    /// сессию окна; после domain reload кэш пуст (OnDispose через перезагрузку не зовётся —
+    /// осознанное ограничение).
     /// </summary>
     public sealed class PageHost
     {
@@ -37,7 +40,12 @@ namespace Exerussus.Nexus.Core
             public string        Error;
             public bool          Entered;   // получила OnEnter и ещё не OnExit
             public bool          Focused;   // получила OnFocus и ещё не OnUnfocus
+            public bool          Disposed;  // OnDispose уже позван (при падении или Reload/Dispose)
         }
+
+        /// <summary>Страница перешла в faulted (в т.ч. вне вызова хоста — из обработчика шины).
+        /// Окну стоит перерисовать её, если она на экране.</summary>
+        public event Action<string> Faulted;
 
         public PageHost(IPageMessageBus bus, IPageTheme theme, IPageUi ui)
         {
@@ -73,9 +81,10 @@ namespace Exerussus.Nexus.Core
             if (view == null) return null;   // faulted
 
             var e = _entries[newId];
-            if (!e.Entered) { Guard(newId, "OnEnter", pg => pg.OnEnter()); e.Entered = true; }
+            // упала в OnEnter — не «вошла»: OnExit ей не положен, вида нет
+            if (!e.Entered && Guard(newId, "OnEnter", pg => pg.OnEnter())) e.Entered = true;
             ReconcileFocus();          // OnFocus, если окно в фокусе
-            return view;
+            return e.Faulted ? null : view;
         }
 
         /// <summary>Окно получило/потеряло фокус. Сводит фокус активной страницы.</summary>
@@ -161,7 +170,7 @@ namespace Exerussus.Nexus.Core
             if (_activeId == null) return;
             if (!_entries.TryGetValue(_activeId, out var e) || e.Page == null || e.Faulted || !e.Entered) return;
 
-            if (_windowFocused && !e.Focused)      { Guard(_activeId, "OnFocus",   p => p.OnFocus());   e.Focused = true;  }
+            if (_windowFocused && !e.Focused)      { if (Guard(_activeId, "OnFocus", p => p.OnFocus())) e.Focused = true; }
             else if (!_windowFocused && e.Focused) { Guard(_activeId, "OnUnfocus", p => p.OnUnfocus()); e.Focused = false; }
         }
 
@@ -186,49 +195,103 @@ namespace Exerussus.Nexus.Core
                     return Fault(entry, $"{type.FullName} не реализует IEditorPage");
 
                 var page = (IEditorPage)Activator.CreateInstance(type);
-                entry.Page = page;                       // до BuildUI — чтобы Reload/Dispose сняли подписки даже при падении
-                page.Initialize(new NexusPageContext(id, entry.Name, _bus, _theme, _ui));
+                entry.Page = page;                       // до BuildUI — чтобы при падении снять уже взятые подписки
+                page.Initialize(new NexusPageContext(id, entry.Name, ScopeBus(id, entry), _theme, _ui));
                 entry.Root = page.BuildUI() ?? new VisualElement();
                 return entry.Root;
             }
             catch (Exception ex)
             {
-                // Полный стек — в консоль: по одному «Object reference not set…» место не найти.
+                // Полный стек — в журнал сообщений (в консоль — только в Verbose, см. NexusDiagnostics.Error):
+                // по одному «Object reference not set…» место не найти.
                 NexusDiagnostics.Error($"Страница '{id}' упала при сборке", ex);
-                return Fault(entry, ex.Message);
+                return Fault(entry, ex.Message, ex);
             }
         }
 
-        private void Guard(string id, string what, Action<IEditorPage> act)
+        /// <summary>Вызов хука в песочнице; false — страница упала (или уже faulted/нет инстанса).</summary>
+        private bool Guard(string id, string what, Action<IEditorPage> act)
         {
-            if (!_entries.TryGetValue(id, out var e) || e.Faulted || e.Page == null) return;
+            if (!_entries.TryGetValue(id, out var e) || e.Faulted || e.Page == null) return false;
             try
             {
                 act(e.Page);
+                return true;
             }
             catch (Exception ex)
             {
-                e.Faulted = true;
-                e.Error   = $"{what}: {ex.Message}";
-                NexusDiagnostics.Error($"Страница '{id}' упала в {what}", ex);
-                NexusStatusLog.Add(e.Name ?? id, $"Страница упала в {what}: {ex.Message}\n\n{ex}", StatusKind.Error);
+                MarkFaulted(id, e, what, ex);
+                return false;
             }
         }
 
-        private VisualElement Fault(Entry e, string error)
+        // общий путь падения уже созданной страницы: пометить, свернуть флаги (хуков больше не будет),
+        // сразу освободить её Track-подписки и сообщить окну
+        private void MarkFaulted(string id, Entry e, string what, Exception ex)
+        {
+            if (e.Faulted) return;
+            e.Faulted = true;
+            e.Error   = $"{what}: {ex.Message}";
+            e.Entered = false;
+            e.Focused = false;
+            NexusDiagnostics.Error($"Страница '{id}' упала в {what}", ex);
+            NexusStatusLog.Add(e.Name ?? id, $"Страница упала в {what}: {ex.Message}\n\n{ex}", StatusKind.Error);
+            SafeDispose(e);
+            RaiseFaulted(id);
+        }
+
+        private VisualElement Fault(Entry e, string error, Exception ex = null)
         {
             e.Faulted = true;
             e.Error   = error;
             NexusDiagnostics.Error("Страница не загрузилась", error);
-            NexusStatusLog.Add(e.Name ?? "Nexus", "Страница не загрузилась: " + error, StatusKind.Error);
+            NexusStatusLog.Add(e.Name ?? "Nexus",
+                ex == null ? "Страница не загрузилась: " + error : $"Страница не загрузилась: {error}\n\n{ex}",
+                StatusKind.Error);
+            SafeDispose(e);   // Initialize мог успеть подписаться
             return null;
         }
 
+        private void RaiseFaulted(string id)
+        {
+            try { Faulted?.Invoke(id); }
+            catch (Exception ex) { NexusDiagnostics.Error("Обработчик падения страницы", ex); }
+        }
+
+        // OnDispose — не больше одного раза на инстанс (падение, затем Reload/закрытие окна)
         private void SafeDispose(Entry e)
         {
-            if (e?.Page == null) return;
+            if (e?.Page == null || e.Disposed) return;
+            e.Disposed = true;
             try { e.Page.OnDispose(); }
             catch (Exception ex) { NexusDiagnostics.Error("OnDispose упал", ex); }
+        }
+
+        // шина страницы: подписки помечены владельцем, чтобы падение обработчика валило эту страницу
+        private IPageMessageBus ScopeBus(string id, Entry entry)
+            => _bus is PageMessageBus bus ? new PageBus(bus, ex => OnBusFault(id, entry, ex)) : _bus;
+
+        // подписка привязана к ИНСТАНСУ: забытая (не через Track) подписка старого инстанса после Reload
+        // не должна валить новый — только лог
+        private void OnBusFault(string id, Entry owner, Exception ex)
+        {
+            if (!_entries.TryGetValue(id, out var e) || e != owner || e.Page == null)
+            {
+                NexusDiagnostics.Error($"Обработчик шины страницы '{id}' упал", ex);
+                return;
+            }
+            MarkFaulted(id, e, "обработчике шины", ex);
+        }
+
+        private sealed class PageBus : IPageMessageBus
+        {
+            private readonly PageMessageBus    _bus;
+            private readonly Action<Exception> _onFault;
+
+            public PageBus(PageMessageBus bus, Action<Exception> onFault) { _bus = bus; _onFault = onFault; }
+
+            public IDisposable Subscribe<T>(Action<T> handler) => _bus.Subscribe(handler, _onFault);
+            public void Publish<T>(T message) => _bus.Publish(message);
         }
     }
 }

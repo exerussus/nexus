@@ -130,16 +130,10 @@ namespace Exerussus.Nexus.Pages.App
             _unknown.Clear();
             if (Usages == null || Table == null) return;
 
-            var settings = LocSettings.Current;
-            foreach (var key in Usages.Keys)
-                if (!Table.Contains(key) && !LocKeyScanner.IsBuiltin(key) && !LocKeyScanner.IsDynamic(key, settings))
-                    _unknown.Add(key);
-
-            _unknown.Sort(StringComparer.Ordinal);
+            _unknown.AddRange(Usages.Unknown(Table, LocSettings.Current));
         }
 
-        private bool IsUsed(string key) =>
-            LocKeyScanner.IsDynamic(key, LocSettings.Current) || (Usages != null && (Usages.Contains(key) || Usages.IsPrefixed(key)));
+        private bool IsUsed(string key) => Usages != null && Usages.IsUsed(key, LocSettings.Current);
 
         private int UsageCount(string key) => Usages != null ? Usages.FileCount(key) : 0;
 
@@ -697,7 +691,8 @@ namespace Exerussus.Nexus.Pages.App
             var uses = UsageCount(entry.Key);
             var usage = Usages == null ? "употребления не считали"
                 : uses > 0 ? $"используется в {uses} файл(ах)"
-                : LocKeyScanner.IsDynamic(entry.Key, LocSettings.Current) || Usages.IsPrefixed(entry.Key) ? "собирается кодом"
+                : Usages.IsAssembled(entry.Key, LocSettings.Current) ? "собирается кодом"
+                : LocKeyScanner.IsBuiltin(entry.Key) ? "ключ AppCore"
                 : "нигде не используется";
             var tag = _kit.Tag(uses > 0 ? NexusTagColor.Blue : NexusTagColor.Amber, usage);
             if (uses > 0)
@@ -1570,7 +1565,7 @@ namespace Exerussus.Nexus.Pages.App
 
         private void AddKey(TextField input)
         {
-            var key = (_newKey ?? string.Empty).Trim().TrimStart('^').Replace(' ', '_');
+            var key = LocUsages.NormalizeKey(_newKey);
             if (!LocSlots.IsValidKey(key) || Table.Contains(key))
             {
                 Context.SetStatus(Table.Contains(key) ? $"Ключ {key} уже есть." : $"Ключ «{key}» не подходит: латиница, цифры, _ . -", StatusKind.Error);
@@ -1596,7 +1591,7 @@ namespace Exerussus.Nexus.Pages.App
         {
             if (previous == next) return;
 
-            next = (next ?? string.Empty).Trim().TrimStart('^').Replace(' ', '_');
+            next = LocUsages.NormalizeKey(next);
             var old = entry.Key;
             if (next == old) return;
 
@@ -1607,19 +1602,40 @@ namespace Exerussus.Nexus.Pages.App
                 return;
             }
 
-            // Употребления: план замены (если считали) — заменить сразу вместе с сохранением таблиц.
+            // План замены читает весь проект: только когда употребления уже посчитаны или по явному выбору.
+            if (Usages == null)
+            {
+                var ask = EditorUtility.DisplayDialogComplex("Переименовать ключ",
+                                                             $"{old} → {next}\n\nУпотребления не считали. Найти их в проекте (один обход) " +
+                                                             "и предложить замену или переименовать только ключ?",
+                                                             "Найти употребления", "Отмена", "Только ключ");
+                if (ask == 1 || (ask == 0 && !_owner.ScanUsages()))
+                {
+                    field.SetValueWithoutNotify(old);
+                    return;
+                }
+            }
+
+            // Употребления: план замены — заменить сразу вместе с сохранением таблиц.
             var errors = new List<string>();
-            var plan = LocUsages.PlanRename(old, next, LocSettings.Current, _owner.AllKeys(), errors);
+            var warnings = new List<string>();
+            var plan = Usages != null
+                ? LocUsages.PlanRename(old, next, LocSettings.Current, _owner.AllKeys(), errors, warnings)
+                : new List<LocUsages.RenameChange>();
             var replace = false;
-            if (plan.Count > 0)
+            if (plan.Count > 0 || warnings.Count > 0)
             {
                 var files = plan.Select(c => c.File).Distinct().ToList();
                 var sample = string.Join("\n", plan.Take(6).Select(c => $"{c.File}:{c.Line}  {c.After}"));
-                var choice = EditorUtility.DisplayDialogComplex("Переименовать ключ",
-                                                                $"{old} → {next}\n\nУпотреблений: {plan.Count} в {files.Count} файл(ах):\n{sample}" +
-                                                                (plan.Count > 6 ? "\n…" : string.Empty) +
-                                                                "\n\nЗаменить их? Таблицы при этом сохранятся сразу.",
-                                                                "Заменить и сохранить", "Отмена", "Только ключ");
+                var notes = warnings.Count == 0 ? string.Empty
+                    : "\n\nВнимание:\n" + string.Join("\n", warnings.Take(4)) + (warnings.Count > 4 ? $"\n… и ещё {warnings.Count - 4}" : string.Empty);
+                var choice = plan.Count > 0
+                    ? EditorUtility.DisplayDialogComplex("Переименовать ключ",
+                                                         $"{old} → {next}\n\nУпотреблений: {plan.Count} в {files.Count} файл(ах):\n{sample}" +
+                                                         (plan.Count > 6 ? "\n…" : string.Empty) + notes +
+                                                         "\n\nЗаменить их? Таблицы при этом сохранятся сразу.",
+                                                         "Заменить и сохранить", "Отмена", "Только ключ")
+                    : EditorUtility.DisplayDialog("Переименовать ключ", $"{old} → {next}\n\nЗамен в проекте нет.{notes}", "Только ключ", "Отмена") ? 2 : 1;
                 if (choice == 1)
                 {
                     field.SetValueWithoutNotify(old);
@@ -1644,8 +1660,12 @@ namespace Exerussus.Nexus.Pages.App
             {
                 if (!_owner.Save()) return;
 
+                // Запись повторяет обход плана — его замечания пришли бы дважды.
+                errors.Clear();
+                warnings.Clear();
                 var changed = new List<string>();
-                var count = LocUsages.ApplyRename(old, next, changed, errors, LocSettings.Current, _owner.AllKeys());
+                var count = LocUsages.ApplyRename(old, next, changed, errors, LocSettings.Current, _owner.AllKeys(), warnings);
+                errors.AddRange(warnings);
                 if (errors.Count > 0) Debug.LogWarning("[Loc] Переименование употреблений:\n" + string.Join("\n", errors));
                 if (_owner.Usages != null) _owner.ScanUsages();
                 Context.SetStatus($"Ключ {old} → {next}: таблицы сохранены, замен {count} в {changed.Count} файл(ах)" +
@@ -1658,8 +1678,10 @@ namespace Exerussus.Nexus.Pages.App
             var used = plan.Count > 0 ? plan.Select(c => c.File).Distinct().Count() : UsageCount(old);
             Context.SetStatus(used > 0
                     ? $"Ключ {old} → {next}. Он используется в {used} файл(ах) — там теперь заглушка, пока не замените."
-                    : $"Ключ {old} → {next}.",
-                used > 0 ? StatusKind.Warning : StatusKind.Ok);
+                    : Usages == null
+                        ? $"Ключ {old} → {next}. Употребления не считали — проверьте «Употребления»."
+                        : $"Ключ {old} → {next}.",
+                used > 0 || Usages == null ? StatusKind.Warning : StatusKind.Ok);
 
             CollectUnknown();
             ApplyFilter();

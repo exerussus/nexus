@@ -14,7 +14,8 @@ namespace Exerussus.Nexus.Theme
     /// </summary>
     public static class NexusFonts
     {
-        private const string Dir = "Packages/com.exerussus.nexus/Editor/Theme/Fonts";
+        // папка шрифтов — от фактического корня движка (пакет или Assets)
+        private static string Dir => NexusThemePaths.FontsDir;
 
         private static FontAsset _sans;
         private static FontAsset _mono;

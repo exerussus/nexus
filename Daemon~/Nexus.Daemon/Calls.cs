@@ -38,6 +38,8 @@ namespace Exerussus.Nexus.Daemon
         public int ExitCode;
         public string Output = string.Empty;
         public string Result;
+        /// <summary>Итог отдан в файловый канал (done/) и отпущен в памяти: вызов живёт до keep, вывод — уже нет.</summary>
+        public volatile bool Released;
         public DateTime Created = DateTime.UtcNow;
         public DateTime Finished;
 
@@ -64,7 +66,7 @@ namespace Exerussus.Nexus.Daemon
             {
                 o["exitCode"] = ExitCode;
                 o["ok"] = ExitCode == 0;
-                o["output"] = Output;
+                o["output"] = Released ? "(итог отдан в файловый канал: NexusTemp/cli/done/" + Id + ".json)\n" : Output;
                 if (Result != null) o["result"] = Result;
             }
 
@@ -85,6 +87,34 @@ namespace Exerussus.Nexus.Daemon
         public static Call Find(string id) => id != null && ById.TryGetValue(id, out var c) ? c : null;
 
         public static IEnumerable<Call> Active => ById.Values.Where(c => c.State != "done");
+
+        /// <summary>
+        /// Демон уходит (обновление): новые вызовы не принимаются, идущие доводятся до конца (<see cref="Program"/>
+        /// ждёт <see cref="Active"/> с ограничением).
+        /// </summary>
+        public static volatile bool Draining;
+
+        /// <summary>Машинная причина ответа Bridge: поле <c>reason</c> ответа или его данных (<c>result</c>).</summary>
+        public static string Reason(JsonObject response)
+        {
+            var reason = Json.Str(response, "reason");
+            if (reason != null) return reason;
+            var result = Json.Str(response, "result");
+            return result != null && result.Contains("\"reason\"", StringComparison.Ordinal) ? Json.Str(Json.TryParseObject(result), "reason") : null;
+        }
+
+        /// <summary>Отказ Bridge «неверный токен» (редактор перезапустил сервер): reason, а у старых редакторов — текст.</summary>
+        private static bool BadToken(int exit, JsonObject response) =>
+            exit == 2 && (Reason(response) == "bad-token" || (Json.Str(response, "output") ?? string.Empty).StartsWith("Неверный токен", StringComparison.Ordinal));
+
+        /// <summary>Итог вызова отдан в done/: вывод и данные в памяти больше не нужны.</summary>
+        public static void Release(Call call)
+        {
+            if (call == null || call.State != "done") return;
+            call.Released = true;
+            call.Output = string.Empty;
+            call.Result = null;
+        }
 
         /// <summary>Самый долгий keep: неделя (больше — переполнение дат и мусор на диске).</summary>
         public const double MaxKeep = 7 * 24 * 3600;
@@ -135,22 +165,37 @@ namespace Exerussus.Nexus.Daemon
             }
         }
 
+        /// <summary>
+        /// Блокировка пакета efc: чужие меняющие вызовы — отказ (--force проходит, читающие — тоже). true — вызов
+        /// завершён отказом. Проверяется и перед каждой отправкой в редактор: вызов мог ждать перезагрузку домена,
+        /// пока кто-то взял блокировку.
+        /// </summary>
+        private static bool RefusedByLock(Call call)
+        {
+            var p = call.Project;
+            var holder = p.LockHolder;
+            if (holder == null || call.LockOwner == holder || call.Id == holder || call.Force || p.ReadOnly(call.Command)) return false;
+            call.BusyWith = holder;
+            Finish(call, 1, $"✗ Идёт пакет {holder} с блокировкой — дождитесь его, отмените или повторите с --force.\n");
+            return true;
+        }
+
         private static async Task Run(Call call)
         {
             var p = call.Project;
 
-            // блокировка пакета efc: чужие меняющие вызовы — отказ (--force проходит, читающие — тоже)
-            var holder = p.LockHolder;
-            if (holder != null && call.LockOwner != holder && call.Id != holder && !call.Force && !p.ReadOnly(call.Command))
-            {
-                call.BusyWith = holder;
-                Finish(call, 1, $"✗ Идёт пакет {holder} с блокировкой — дождитесь его, отмените или повторите с --force.\n");
-                return;
-            }
+            if (RefusedByLock(call)) return;
 
             if (call.CancelRequested)
             {
                 Finish(call, 7, "✗ Отменено до начала выполнения.\n");
+                return;
+            }
+
+            // git.* — демон сам, без редактора (работает и при закрытой Unity); асинхронно, с отменой
+            if (GitCommands.Owns(call.Command))
+            {
+                await RunGit(call);
                 return;
             }
 
@@ -190,7 +235,13 @@ namespace Exerussus.Nexus.Daemon
                 {
                     if (call.CancelRequested) { Finish(call, 7, "✗ Отменено до отправки в редактор.\n"); return; }
                     if (p.Removed) { Finish(call, 10, "✗ CLI в проекте выключен.\n"); return; }
-                    if (p.State == "closed") { Finish(call, 10, "✗ Редактор проекта закрыт.\n"); return; }
+                    if (p.State == "closed")
+                    {
+                        // help при закрытом редакторе: команды демона (git.*) работают и без него
+                        if (call.Command == "help" && call.Args.Length == 0) Finish(call, 0, "Редактор проекта закрыт: команды Unity недоступны." + DaemonCommands.HelpSection());
+                        else Finish(call, 10, "✗ Редактор проекта закрыт.\n");
+                        return;
+                    }
                     if (DateTime.UtcNow > deadline) { Finish(call, 5, $"✗ Редактор не принял команду за {call.Timeout} с (фаза: {p.Phase}).\n"); return; }
 
                     if (!p.Ready)
@@ -205,6 +256,13 @@ namespace Exerussus.Nexus.Daemon
                     {
                         SetPhase(call, "в очереди");
                         continue;
+                    }
+
+                    // блокировку могли взять, пока вызов ждал редактор
+                    if (RefusedByLock(call))
+                    {
+                        p.Slots.Release();
+                        return;
                     }
 
                     BridgeStatus status;
@@ -246,7 +304,7 @@ namespace Exerussus.Nexus.Daemon
                         continue;
                     }
 
-                    if (exit == 2 && output.StartsWith("Неверный токен", StringComparison.Ordinal))
+                    if (BadToken(exit, r))
                     {
                         Registry.Refresh();
                         await Task.Delay(300);
@@ -301,9 +359,11 @@ namespace Exerussus.Nexus.Daemon
                     var (status, r, _) = await Bridge.Send(p, Bridge.Request("job.status", new[] { job }, p.Path, 10), 10, CancellationToken.None);
                     if (status != BridgeStatus.Ok) continue; // перезагрузка домена — задание живёт в SessionState
                     var exit = (int)Json.Num(r, "exitCode", 1);
-                    // 6 — занят; 5 — главный поток Unity не успел ответить (импорт, компиляция): задание живо, ждём
-                    if (exit == 6 || exit == 5) continue;
-                    if (exit == 2 && (Json.Str(r, "output") ?? string.Empty).StartsWith("Неверный токен", StringComparison.Ordinal))
+                    // 6 — занят; 5 — главный поток Unity не успел ответить (импорт, компиляция): задание живо, ждём.
+                    // Но только если ответ — не итог задания: job.status завершённого задания несёт поле job и его
+                    // собственный код (задание, прерванное сроком, кончается кодом 5) — это окончательный ответ
+                    if ((exit == 6 || exit == 5) && string.IsNullOrEmpty(Json.Str(r, "job"))) continue;
+                    if (BadToken(exit, r))
                     {
                         Registry.Refresh();
                         continue;
@@ -320,7 +380,7 @@ namespace Exerussus.Nexus.Daemon
                     }
 
                     var output = Json.Str(r, "output") ?? string.Empty;
-                    if (exit == 1 && output.Contains("Нет задания «", StringComparison.Ordinal))
+                    if (exit == 1 && (Reason(r) == "no-job" || output.Contains("Нет задания «", StringComparison.Ordinal)))
                     {
                         Finish(call, 4, first + "✗ Задание пропало (редактор перезапущен?) — результат неизвестен.\n");
                         return;
@@ -341,6 +401,51 @@ namespace Exerussus.Nexus.Daemon
             {
                 p.Leave();
                 if (p.InFlight == 0) p.CallPhase = null;
+            }
+        }
+
+        /// <summary>
+        /// git-команда демона: срок — timeout вызова, отмена клиента (cancel/ файлового канала, шаг пакета) останавливает процесс git.
+        /// Слоты редактора не занимает: Unity тут ни при чём.
+        /// </summary>
+        private static async Task RunGit(Call call)
+        {
+            call.State = "running";
+            SetPhase(call, "git: выполняет демон");
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(call.Timeout));
+            // отмена клиента — флаг вызова: перевести его в токен
+            var watch = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    if (call.CancelRequested)
+                    {
+                        cts.Cancel();
+                        break;
+                    }
+
+                    await Task.Delay(200);
+                }
+            });
+            try
+            {
+                var (exit, output, result) = await GitCommands.Run(call, phase => SetPhase(call, "git: " + phase), cts.Token);
+                Finish(call, exit, GitRunner.Mask(output), result);
+            }
+            catch (OperationCanceledException)
+            {
+                if (call.CancelRequested) Finish(call, 7, "✗ git: отменено — процесс git остановлен; проверьте состояние (git.status).\n");
+                else Finish(call, 5, $"✗ git: не завершилось за {call.Timeout} с — процесс git остановлен; проверьте состояние (git.status).\n");
+            }
+            catch (Exception e)
+            {
+                Log.Error("git " + call.Command, e);
+                Finish(call, 4, $"✗ Демон: {e.GetType().Name}: {GitRunner.Mask(e.Message)}\n");
+            }
+            finally
+            {
+                cts.Cancel();
+                await watch;
             }
         }
 

@@ -199,6 +199,9 @@ namespace Exerussus.Nexus.Pages.App
             }
 
             head.Add(_kit.Faint($"Посчитано {Usages.Time:HH:mm:ss}: файлов {Usages.FilesScanned}, {Usages.Seconds:0.0} с. Правки .cs и вёрстки подсчёт не обновляют — пересчитайте."));
+            if (Usages.Skipped.Count > 0)
+                head.Add(_kit.Status(StatusKind.Warning, $"Не просмотрено файлов: {Usages.Skipped.Count} (больше 32 МБ или не прочитались) — " +
+                                                         string.Join("; ", Usages.Skipped.Take(3)) + (Usages.Skipped.Count > 3 ? "; …" : string.Empty)));
             root.Add(head);
 
             root.Add(KeyUsagesCard());
@@ -231,14 +234,14 @@ namespace Exerussus.Nexus.Pages.App
 
         internal void ShowUsages(string key)
         {
-            _usageKey = Loc.KeyOf((key ?? string.Empty).Trim());
+            _usageKey = LocUsages.NormalizeKey(key);
             if (_usageOutput == null || Usages == null) return;
 
             _usageOutput.Clear();
             var list = Usages.Of(_usageKey);
             if (list.Count == 0)
             {
-                _usageOutput.Add(_kit.Faint(LocKeyScanner.IsDynamic(_usageKey, LocSettings.Current) || Usages.IsPrefixed(_usageKey)
+                _usageOutput.Add(_kit.Faint(Usages.IsAssembled(_usageKey, LocSettings.Current)
                                                 ? "Ключ собирается кодом (динамический или найденный префикс)." : "Употреблений нет."));
                 return;
             }
@@ -269,10 +272,7 @@ namespace Exerussus.Nexus.Pages.App
 
         private VisualElement UnknownKeysCard(LocSettings settings)
         {
-            var unknown = Usages.Keys
-                                .Where(k => Table == null || !Table.Contains(k))
-                                .Where(k => !LocKeyScanner.IsBuiltin(k) && !LocKeyScanner.IsDynamic(k, settings))
-                                .OrderBy(k => k, StringComparer.Ordinal).ToList();
+            var unknown = Usages.Unknown(Table, settings);
 
             var targets = WritableFiles();
             if (_unknownTarget < 0 || _unknownTarget >= targets.Count)
@@ -316,16 +316,13 @@ namespace Exerussus.Nexus.Pages.App
 
         private VisualElement UnusedKeysCard(LocSettings settings)
         {
-            var unused = Table == null ? new List<LocEntry>()
-                : Table.Entries.Where(e => !Usages.Contains(e.Key) && !Usages.IsPrefixed(e.Key) && !LocKeyScanner.IsDynamic(e.Key, settings))
-                       .OrderBy(e => e.Key, StringComparer.Ordinal).ToList();
+            var unused = Usages.Unused(Table, settings);
 
             var card = _kit.Card($"Нигде не употребляются: {unused.Count}",
                                  $"С учётом динамических префиксов (Настройки → Dynamic Prefixes) и найденных в коде ({Usages.Prefixes.Count}: " +
                                  "Tr(\"alchemy.why.\" + id)). Ключ, собранный кодом без такого префикса, так не найти.");
-            foreach (var entry in unused.Take(150))
+            foreach (var key in unused.Take(150))
             {
-                var key = entry.Key;
                 var row = _kit.ListRow(() => OpenInTable(key));
                 row.Add(_kit.Text(key));
                 row.Add(_kit.Spacer());
@@ -360,7 +357,7 @@ namespace Exerussus.Nexus.Pages.App
         /// <summary>Перейти в «Употребления» с местами ключа.</summary>
         internal void OpenUsages(string key)
         {
-            _usageKey = Loc.KeyOf(key);
+            _usageKey = LocUsages.NormalizeKey(key);
             _subtab = UsagesTab;
             SessionState.SetInt(Context.GetSessionKey(SubtabKey), UsagesTab);
             Render();

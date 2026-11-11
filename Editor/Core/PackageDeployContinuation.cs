@@ -77,6 +77,14 @@ namespace Exerussus.Nexus.Core
                     continue;
                 }
 
+                // пакет подтянулся, но мог оказаться старее минимальной версии из манифеста — не разворачиваем
+                var gate = DependencyGate.Check(dp.Manifest);
+                if (gate.Count > 0)
+                {
+                    report.Add($"отложенный деплой «{id}» отменён: {string.Join("; ", gate)}");
+                    continue;
+                }
+
                 report.Add("после установки пакета развёрнут: " + PluginDeployer.Deploy(dp.Manifest).Message);
                 deployedAny = true;
             }

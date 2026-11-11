@@ -91,7 +91,7 @@ namespace Exerussus.Nexus.Core
             ctx.Print($"{p.DisplayName} ({p.Id}) — {StatusText(status)}");
 
             var stateDir = NexusPaths.StateDir(p.Id);
-            var stateFiles = Directory.Exists(stateDir) ? Directory.GetFiles(stateDir).Length : 0;
+            var stateFiles = Directory.Exists(stateDir) ? Directory.GetFiles(stateDir, "*", SearchOption.AllDirectories).Length : 0;
             var deployed = DeployedVersion(p.Id);
             var preserve = PluginDeployer.HasPreserve(p.Id) ? PluginDeployer.PreservedVersion(p.Id) ?? "?" : null;
             var settings = PluginDeployer.HasUserSettings(p.Id);

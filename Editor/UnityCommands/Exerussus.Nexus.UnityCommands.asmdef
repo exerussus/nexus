@@ -1,0 +1,20 @@
+{
+    "name": "Exerussus.Nexus.UnityCommands",
+    "rootNamespace": "Exerussus.Nexus.UnityCommands",
+    "references": [
+        "Exerussus.Nexus.Abstractions",
+        "Exerussus.Nexus.Core",
+        "Exerussus.Nexus.Deployment"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

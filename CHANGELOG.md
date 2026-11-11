@@ -2,6 +2,31 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.0.0-pre.14]
+
+Nexus Daemon 0.5.0.
+
+### Добавлено
+- Сборка `Exerussus.Nexus.UnityCommands` — базовые операции редактора готовыми командами:
+  - объекты: `go.find`, `go.tree`, `go.info`, `go.create`, `go.delete`, `go.duplicate`, `go.rename`, `go.move`,
+    `go.set`, `transform.set`;
+  - компоненты: `comp.list`, `comp.add`, `comp.remove`, `comp.get`, `comp.set`, `comp.invoke`;
+  - префабы: `prefab.create`, `prefab.open`, `prefab.close`, `prefab.save`, `prefab.overrides`, `prefab.apply`,
+    `prefab.revert`, `prefab.unpack`;
+  - ассеты: `asset.info`, `asset.create`, `asset.move`, `asset.rename`, `asset.copy`, `asset.delete`, `asset.deps`,
+    `asset.refs`, `asset.get`, `asset.set`, `asset.label`;
+  - сцены и проект: `scene.new`, `scene.close`, `scene.active`, `build.scenes`, `tag.*`, `layer.*`,
+    `sortinglayer.*`, `defines`, `settings.get`, `settings.set`;
+  - пакеты: `pkg.list`, `pkg.info`, `pkg.add`, `pkg.remove`, `pkg.ref`, `pkg.update`, `pkg.outdated`,
+    `pkg.resolve`, `pkg.registry`, `pkg.search` (задание `pkg`).
+  Адресация объектов и ассетов (spec), чтение и запись сериализованных полей текстом; правки через Undo.
+- Nexus Daemon 0.5.0: команды `git.*`, которые выполняет сам демон (`git.repos`, `git.status`, `git.log`,
+  `git.diff`, `git.branch`, `git.show`, `git.fetch`, `git.checkout`, `git.pull`, `git.add`, `git.commit`,
+  `git.merge`, `git.tag`, `git.push`), только для репозиториев из белого списка (`gitRepos` в
+  `ProjectSettings/Nexus.json`, личный `git-repos.json`). Запись — с `--yes`, push — в два шага с одноразовым
+  кодом. Проверка следа ИИ в сообщениях коммитов и тегов и у авторов блокирует запись; обход — `--allow-ai-marks`.
+- `help` при закрытом редакторе показывает команды демона.
+
 ## [2.0.0-pre.13]
 
 Nexus Daemon 0.4.1, клиенты nexus 6 / nexus-fs 8. Плагин app 3.12.0 (нужен app-core 6.3.0).

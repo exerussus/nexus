@@ -10,15 +10,23 @@ namespace Exerussus.Nexus.Daemon
     /// Команды, которые выполняет сам демон, не обращаясь к редактору: они нужны именно тогда, когда главный
     /// поток Unity стоит (модальное окно). <c>dialog.*</c>, <c>trash.clean</c> (корзина файлового канала, efc) и
     /// <c>ping</c> файлового канала; остальное уходит в Bridge (<c>ping</c> по HTTP — тоже: он про главный поток Unity).
+    /// <c>git.*</c> — тоже команды демона, но асинхронные: их ведёт <see cref="GitCommands"/> (маршрут — в <see cref="Calls"/>).
     /// </summary>
     internal static class DaemonCommands
     {
-        public static readonly (string Name, string Usage, string Summary)[] All =
+        private static readonly (string Name, string Usage, string Summary)[] Own =
         {
             ("dialog.list", "dialog.list [--raw] [--no-shot]", "системные диалоги Windows редактора: заголовок, текст, кнопки, снимок (только чтение)"),
             ("trash.clean", "trash.clean [--dry]", "очистить корзину файлового канала NexusTemp/cli/trash (клиенту в ВМ удалять нельзя)"),
             ("ping", "ping", "в файловом канале — ответ демона без редактора (по HTTP — пинг главного потока Unity)"),
         };
+
+        /// <summary>Все команды демона: свои и git.* (для help, паспорта канала и списка команд API).</summary>
+        public static readonly (string Name, string Usage, string Summary)[] All =
+            Own.Concat(GitCommands.Table.Select(t => (t.Name, t.Usage, t.Summary))).ToArray();
+
+        /// <summary>Только читает (для паспорта efc): trash.clean меняет файлы, git — по таблице.</summary>
+        public static bool ReadOnlyCommand(string name) => GitCommands.Owns(name) ? GitCommands.IsReadOnly(name) : name != "trash.clean";
 
         public static bool Owns(Call call)
         {
@@ -32,7 +40,7 @@ namespace Exerussus.Nexus.Daemon
         /// <summary>Раздел «команды демона» к выводу help редактора.</summary>
         public static string HelpSection()
         {
-            var sb = new StringBuilder("\nКоманды демона (работают и при зависшем редакторе):\n");
+            var sb = new StringBuilder("\nКоманды демона (работают и при зависшем или закрытом редакторе; git.* — запись только с подтверждением):\n");
             var w = All.Max(c => c.Name.Length);
             foreach (var c in All) sb.Append("  ").Append(c.Name.PadRight(w)).Append("  ").Append(c.Summary).Append('\n');
             return sb.ToString();

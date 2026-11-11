@@ -17,8 +17,8 @@ namespace Exerussus.Nexus.Core
     /// обновляется, «нет Tools~/daemon/nexusd.dll»). Локальный пакет (<c>file:</c>) меняется на месте — видна
     /// только другая версия в <c>package.json</c>.</para>
     /// <para>Заметили — один раз за домен <c>AssetDatabase.Refresh</c> и перекомпиляция (как <c>compile</c> из CLI);
-    /// застрявшую в фоне перезагрузку домена доводит будильник демона. В Play, во время компиляции и импорта —
-    /// ждём следующей проверки. Состояние — только поля текущего домена.</para>
+    /// застрявшую в фоне перезагрузку домена доводит будильник демона. В Play, во время компиляции и импорта,
+    /// пока идут задания и задачи CLI — ждём следующей проверки. Состояние — только поля текущего домена.</para>
     /// </summary>
     internal static class NexusPackageWatch
     {
@@ -47,6 +47,15 @@ namespace Exerussus.Nexus.Core
                 var (disk, where) = DiskVersion();
                 if (disk == null || disk == _loaded) return;
                 if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling || EditorApplication.isUpdating) return;
+
+                // идёт задание или задача CLI (задача — тоже задание вида task): перезагрузка домена посреди них
+                // оборвала бы шаг и исказила отчёт — откладываем до следующей проверки, когда всё закончится
+                var busy = NexusCliJobs.Running();
+                if (busy != null)
+                {
+                    NexusDiagnostics.Trace("CLI", $"обновление пакета ({_loaded} → {disk}) ждёт конца задания {busy.Id} ({busy.Kind})");
+                    return;
+                }
 
                 _requested = true;
                 // в консоль всегда (не только Verbose): человек должен видеть, почему редактор перекомпилировался

@@ -1,11 +1,12 @@
 // ============================================================
-//  LocCommands.cs — команды CLI локализации AppCore (app-core 6.2+): база и пакеты модулей.
+//  LocCommands.cs — команды CLI локализации AppCore (app-core 6.3+): база и пакеты модулей.
 //    loc.packages — каталог таблиц: порядок, кто нашёл, ключи, ошибки, только чтение;
 //    loc.find     — ключи по ключу или тексту на любом языке (с пакетом);
 //    loc.usages   — где употреблён ключ («^KEY», L.KEY, шаблоны без «^», провайдеры);
 //    loc.check    — сверка проекта с таблицами: нет в таблицах, не употребляются, ошибки файлов;
 //    loc.rename   — переименовать ключ в таблицах и в употреблениях (--dry — только план).
 //
+//  Ключ из аргументов разбирается как в таблице страницы: LocUsages.NormalizeKey.
 //  Логика — в редакторе AppCore (LocWorkspace, LocUsages): команда разбирает аргументы и печатает.
 // ============================================================
 
@@ -100,14 +101,15 @@ namespace Exerussus.Nexus.Pages.App
         [NexusCommand("loc.usages", "Где употреблён ключ", Usage = "loc.usages <ключ>", ReadOnly = true)]
         private static int Usages(NexusCommandContext ctx)
         {
-            var key = Loc.KeyOf(ctx.Arg(0) ?? throw new NexusCommandException("нужен ключ: loc.usages ui.menu.play"));
+            var key = LocUsages.NormalizeKey(ctx.Arg(0) ?? throw new NexusCommandException("нужен ключ: loc.usages ui.menu.play"));
             var errors = new List<string>();
             var index = LocUsages.Scan(LocSettings.Current, null, null, errors);
             foreach (var error in errors) ctx.Warn(error);
+            if (!index.Complete) ctx.Warn("обход прерван — список неполный");
 
             var list = index.Of(key);
             foreach (var usage in list) ctx.Print($"{usage.File}:{usage.Line}  [{usage.Kind}]  {usage.Snippet}");
-            ctx.Print(list.Count == 0 ? "Употреблений нет." : $"употреблений {list.Count} в {index.FileCount(key)} файл(ах); обход {index.FilesScanned} файлов, {index.Seconds:0.0} с");
+            ctx.Print(list.Count == 0 ? (index.IsAssembled(key, LocSettings.Current) ? "Ключ собирается кодом (динамический или найденный префикс)." : "Употреблений нет.") : $"употреблений {list.Count} в {index.FileCount(key)} файл(ах); обход {index.FilesScanned} файлов, {index.Seconds:0.0} с");
             ctx.Data = list.Select(u => new { file = u.File, line = u.Line, column = u.Column, kind = u.Kind, snippet = u.Snippet }).ToList();
             return NexusCommandContext.Exit.Ok;
         }
@@ -125,6 +127,7 @@ namespace Exerussus.Nexus.Pages.App
             foreach (var error in parseErrors.Take(limit)) ctx.Warn(error);
 
             var report = LocKeyScanner.Check(merged, settings);
+            if (!report.Complete) ctx.Warn("обход употреблений прерван — «не употребляются» неполно");
             ctx.Print($"ключей: {merged.Count} · нет в таблицах: {report.Unknown.Count} · не употребляются: {report.Unused.Count} · ошибок разбора: {parseErrors.Count}");
 
             foreach (var pair in report.Unknown.Take(limit)) ctx.Error($"нет в таблицах: {pair.Key} — {string.Join(", ", pair.Value.Take(3))}");
@@ -142,8 +145,8 @@ namespace Exerussus.Nexus.Pages.App
             Usage = "loc.rename <старый> <новый> [--dry] [--keys-only]")]
         private static int Rename(NexusCommandContext ctx)
         {
-            var from = Loc.KeyOf(ctx.Arg(0) ?? throw new NexusCommandException("нужно: loc.rename старый новый"));
-            var to = Loc.KeyOf(ctx.Arg(1) ?? throw new NexusCommandException("нужно: loc.rename старый новый"));
+            var from = LocUsages.NormalizeKey(ctx.Arg(0) ?? throw new NexusCommandException("нужно: loc.rename старый новый"));
+            var to = LocUsages.NormalizeKey(ctx.Arg(1) ?? throw new NexusCommandException("нужно: loc.rename старый новый"));
             if (!LocSlots.IsValidKey(to)) throw new NexusCommandException($"«{to}» — недопустимый ключ (латиница, цифры, _ . -)");
 
             var workspace = LocWorkspace.Load();
@@ -154,15 +157,17 @@ namespace Exerussus.Nexus.Pages.App
             foreach (var entry in workspace.Merged.Entries) keys.Add(entry.Key);
 
             var errors = new List<string>();
-            var plan = ctx.Flag("keys-only") ? new List<LocUsages.RenameChange>() : LocUsages.PlanRename(from, to, LocSettings.Current, keys, errors);
+            var warnings = new List<string>();
+            var plan = ctx.Flag("keys-only") ? new List<LocUsages.RenameChange>() : LocUsages.PlanRename(from, to, LocSettings.Current, keys, errors, warnings);
             ctx.Print($"таблицы: {string.Join(", ", workspace.FilesOf(from).Select(LocalizationTab.PackageLabel))}");
             foreach (var change in plan) ctx.Print($"{change.File}:{change.Line}  {change.After}");
             foreach (var error in errors) ctx.Warn(error);
+            foreach (var warning in warnings) ctx.Warn(warning);
 
             if (ctx.Flag("dry"))
             {
                 ctx.Print($"план: замен {plan.Count} (ничего не записано — уберите --dry)");
-                ctx.Data = new { dry = true, changes = plan.Select(c => new { file = c.File, line = c.Line, before = c.Before, after = c.After }).ToList() };
+                ctx.Data = new { dry = true, changes = plan.Select(c => new { file = c.File, line = c.Line, before = c.Before, after = c.After }).ToList(), errors, warnings };
                 return NexusCommandContext.Exit.Ok;
             }
 
@@ -176,12 +181,16 @@ namespace Exerussus.Nexus.Pages.App
                 return NexusCommandContext.Exit.Failed;
             }
 
+            // Запись повторяет обход плана — его замечания уже напечатаны.
+            errors.Clear();
+            warnings.Clear();
             var changed = new List<string>();
-            var count = ctx.Flag("keys-only") ? 0 : LocUsages.ApplyRename(from, to, changed, errors, LocSettings.Current, keys);
+            var count = ctx.Flag("keys-only") ? 0 : LocUsages.ApplyRename(from, to, changed, errors, LocSettings.Current, keys, warnings);
             LocEditor.GenerateKeys();
 
             ctx.Print($"{from} → {to}: таблиц записано {result.Written.Count}, замен {count} в {changed.Count} файл(ах)");
-            ctx.Data = new { tables = result.Written, files = changed, replacements = count, errors };
+            foreach (var error in errors) ctx.Error(error);
+            ctx.Data = new { tables = result.Written, files = changed, replacements = count, errors, warnings };
             ctx.WaitForEditor = changed.Exists(p => p.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) || result.Written.Count > 0;
             return errors.Count > 0 ? NexusCommandContext.Exit.Failed : NexusCommandContext.Exit.Ok;
         }

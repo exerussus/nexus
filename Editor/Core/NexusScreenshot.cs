@@ -209,8 +209,15 @@ namespace Exerussus.Nexus.Core
                     if (camera == null) continue;
                     var previous = camera.targetTexture;
                     camera.targetTexture = rt;
-                    camera.Render();
-                    camera.targetTexture = previous;
+                    try
+                    {
+                        camera.Render();
+                    }
+                    finally
+                    {
+                        // камера проекта не должна остаться смотрящей во временную текстуру, даже если рендер упал
+                        camera.targetTexture = previous;
+                    }
                 }
 
                 RenderTexture.active = rt;

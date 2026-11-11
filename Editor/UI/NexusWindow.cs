@@ -92,15 +92,46 @@ namespace Exerussus.Nexus.UI
             NexusTheme.Changed -= OnThemeChanged;
             NexusStatusLog.Changed -= ShowStatus;
             NexusNavigation.Requested -= OnNavigate;
-            _host?.Dispose();
-            _host = null;
+            DisposeHost();
         }
 
-        // палитра сменилась — полная пересборка окна (новые цвета во всех частях)
+        // палитра сменилась — перестраивается только обвязка окна (тулбар, сайдбар, контейнер), PageHost и
+        // страницы живут дальше: переменные палитры на корне уже подменены (NexusTheme.RefreshRoots), а
+        // активная страница переносится в новый контейнер своим же корнем — без Exit/Enter и без потери
+        // несохранённого. Цвета, которые страница сама взяла из Context.Theme в C#, обновятся при её
+        // следующей пересборке.
         private void OnThemeChanged()
         {
             if (_suppressThemeRebuild) return;
-            if (rootVisualElement != null) CreateGUI();
+            if (rootVisualElement != null) BuildChrome();
+        }
+
+        private void EnsureHost()
+        {
+            if (_host != null) return;
+            _bus  = new PageMessageBus();
+            _ui ??= new NexusUi();
+            _host = new PageHost(_bus, NexusTheme.PageTheme, _ui);
+            _host.Faulted += OnPageFaulted;
+        }
+
+        private void DisposeHost()
+        {
+            if (_host == null) return;
+            _host.Faulted -= OnPageFaulted;
+            _host.Dispose();
+            _host = null;
+        }
+
+        // страница упала вне перерисовки (например, в обработчике шины) — показать экран падения,
+        // если она на экране; после текущего обработчика, чтобы не перестраивать контент изнутри Activate
+        private void OnPageFaulted(string id)
+        {
+            EditorApplication.delayCall += () =>
+            {
+                if (this == null || _content == null || id != _selectedId) return;
+                RenderContent(id);
+            };
         }
 
         // окно Nexus получило фокус — активная страница уходит в OnFocus
@@ -125,13 +156,21 @@ namespace Exerussus.Nexus.UI
                 if (!string.IsNullOrEmpty(saved) && NexusTheme.Active.Name != saved)
                     NexusTheme.Active = NexusPalettes.Get(saved);
 
-                var root = rootVisualElement;
-                root.Clear();              // идемпотентно: пересборка при смене палитры
-                _host?.Dispose();
+                EnsureHost();              // хост переживает пересборку обвязки
+                BuildChrome();
+            }
+            finally { _suppressThemeRebuild = false; }
+        }
 
-                _bus  = new PageMessageBus();
-                _ui ??= new NexusUi();
-                _host = new PageHost(_bus, NexusTheme.PageTheme, _ui);
+        // обвязка окна: тулбар, сайдбар, контейнер страницы. Идемпотентно — страницы не пересоздаются
+        private void BuildChrome()
+        {
+            var wasSuppressed = _suppressThemeRebuild;
+            _suppressThemeRebuild = true;
+            try
+            {
+                var root = rootVisualElement;
+                root.Clear();
 
                 root.style.flexDirection = FlexDirection.Column;
                 NexusTheme.ApplyTo(root);
@@ -155,7 +194,7 @@ namespace Exerussus.Nexus.UI
 
                 RebuildSidebar();
             }
-            finally { _suppressThemeRebuild = false; }
+            finally { _suppressThemeRebuild = wasSuppressed; }
         }
 
         private VisualElement BuildToolbar()
@@ -317,6 +356,7 @@ namespace Exerussus.Nexus.UI
         private void RenderContent(string id)
         {
             _content.Clear();
+            EnsureHost();
 
             if (id == HealthId)
             {

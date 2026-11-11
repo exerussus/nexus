@@ -40,6 +40,7 @@ namespace Exerussus.Nexus.Deployment
 
         private static string _engineAssetRoot;   // «Assets/Plugins/Exerussus.Nexus» или «Packages/com.exerussus.nexus»
         private static string _engineAbsRoot;     // абсолютный путь в файловой системе
+        private static bool   _engineFallback;    // корень — запасной: не кэш, при следующем обращении ищем снова
 
         /// <summary>Корень движка для AssetDatabase («Assets/…» или «Packages/…»).</summary>
         public static string EngineAssetRoot { get { Resolve(); return _engineAssetRoot; } }
@@ -200,11 +201,13 @@ namespace Exerussus.Nexus.Deployment
         {
             _engineAssetRoot = null;
             _engineAbsRoot   = null;
+            _engineFallback  = false;
         }
 
         private static void Resolve()
         {
-            if (_engineAssetRoot != null) return;
+            if (_engineAssetRoot != null && !_engineFallback) return;
+            _engineFallback = false;
 
             // 1) установлен как UPM-пакет: реальный путь — кэш пакетов, для AssetDatabase — Packages/<имя>
             try
@@ -245,7 +248,9 @@ namespace Exerussus.Nexus.Deployment
             }
             catch (System.Exception ex) { NexusDiagnostics.Swallowed("поиск корня движка по asmdef", ex); }
 
-            // 3) не нашли (например, ассеты ещё не импортированы) — запасной путь
+            // 3) не нашли (например, ассеты ещё не импортированы) — запасной путь. Не кэшируем:
+            // иначе до конца домена все пути движка смотрели бы мимо, даже когда asmdef уже импортирован.
+            _engineFallback  = true;
             _engineAssetRoot = FallbackEngineAssetRoot;
             _engineAbsRoot   = Norm(Path.Combine(ProjectRoot, FallbackEngineAssetRoot));
             NexusDiagnostics.Warn("Пути", $"корень движка не определён, использую {FallbackEngineAssetRoot}");

@@ -30,9 +30,18 @@ namespace Exerussus.Nexus.Core
         /// <summary>Мажор .NET, под который собран демон (tfm в nexusd.runtimeconfig.json); новее — тоже годится.</summary>
         private const int RuntimeMajor = 10;
 
+        /// <summary>Сколько уходящий демон доводит идущие вызовы (nexusd: Program.DrainSeconds) — плюс запас.</summary>
+        private const int DrainWaitSeconds = 120 + 15;
+
+        /// <summary>Проба живости: попыток подряд без ответа, после которых процесс демона считается зависшим.</summary>
+        private const int ProbeAttempts = 3;
+
         private static readonly object Gate = new object();
         private static volatile string _status = "демон: не проверялся";
         private static volatile bool _starting;
+
+        /// <summary>pid старого демона, о невыходе которого уже сообщено в лог (не повторять каждые 30 с).</summary>
+        private static int _reportedStuckPid;
 
         /// <summary>Версия пакета Nexus (из Package Manager; вне пакета — «dev»).</summary>
         public static string NexusVersion
@@ -99,20 +108,51 @@ namespace Exerussus.Nexus.Core
             }
 
             var running = ReadDaemon();
+            // живой pid ещё не значит живой демон: pid мог достаться другому процессу, демон мог зависнуть —
+            // спросить его самого (GET /v1/daemon) и сверить pid и время старта
+            var draining = false;
+            if (running != null && !Responds(running, out draining))
+            {
+                if (!KillHung(running)) running = null;   // pid чужой — демона просто нет
+                else
+                {
+                    running = null;
+                    NexusDiagnostics.Warn("CLI", "Nexus Daemon не отвечал и был остановлен — запускаю заново");
+                }
+            }
+
             if (running != null)
             {
                 var version = (string)running["version"];
-                if (Compare(version, packageVersion) >= 0)
+                var pid = (int?)running["pid"] ?? 0;
+                if (Compare(version, packageVersion) >= 0 && !draining)
                 {
-                    _status = $"демон {version}: работает (pid {(int?)running["pid"]}, порт {(int?)running["port"]})";
+                    _status = $"демон {version}: работает (pid {pid}, порт {(int?)running["port"]})";
                     return;
                 }
 
-                // наш пакет новее: попросить старый демон уйти и подождать его выхода
-                _status = $"демон {version} старее пакетного {packageVersion} — обновляю";
-                Shutdown((int?)running["port"] ?? 0);
-                var pid = (int?)running["pid"] ?? 0;
-                for (var i = 0; i < 50 && Alive(pid); i++) Thread.Sleep(100);
+                // наш пакет новее (или демон уже уходит): попросить его уйти — он доводит идущие вызовы и выходит
+                if (!draining) Shutdown((int?)running["port"] ?? 0);
+                var until = DateTime.UtcNow.AddSeconds(DrainWaitSeconds);
+                while (Alive(pid) && DateTime.UtcNow < until)
+                {
+                    _status = $"демон {version}: завершает идущие вызовы перед обновлением до {packageVersion} (pid {pid})";
+                    Thread.Sleep(250);
+                }
+
+                if (Alive(pid))
+                {
+                    // не вышел: новый не запустится (одна копия на пользователя) — не делать вид, что всё в порядке
+                    _status = $"демон {version} не вышел для обновления до {packageVersion} (pid {pid}): работает старая версия — " +
+                              "завершите процесс nexusd или перезапустите редактор";
+                    if (_reportedStuckPid != pid)
+                    {
+                        _reportedStuckPid = pid;
+                        NexusDiagnostics.Error("CLI", $"Nexus Daemon {version} (pid {pid}) не вышел за {DrainWaitSeconds} с после просьбы обновиться до {packageVersion}.");
+                    }
+
+                    return;
+                }
             }
 
             // запуск из копии вне пакета: работающий демон держит свои файлы, а папку пакета Package Manager
@@ -155,40 +195,163 @@ namespace Exerussus.Nexus.Core
         /// </summary>
         private static string Install(string dll, string version)
         {
-            try
+            var target = Path.Combine(Root, "daemon", version);
+            var marker = Path.Combine(target, "nexusd.dll");
+            var from = Path.GetDirectoryName(dll) ?? string.Empty;
+            // версия — в имени папки: изменили демон — поднимите версию (nexusd.version), иначе копия не обновится
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                var target = Path.Combine(Root, "daemon", version);
-                var marker = Path.Combine(target, "nexusd.dll");
-                var from = Path.GetDirectoryName(dll) ?? string.Empty;
-                // версия — в имени папки: изменили демон — поднимите версию (nexusd.version), иначе копия не обновится
-                if (!File.Exists(marker))
+                if (File.Exists(marker)) return marker;
+                string temp = null;
+                try
                 {
-                    var temp = target + ".tmp-" + Guid.NewGuid().ToString("N").Substring(0, 6);
+                    temp = target + ".tmp-" + Guid.NewGuid().ToString("N").Substring(0, 6);
                     Directory.CreateDirectory(Path.Combine(temp, "cli"));
                     foreach (var file in Directory.GetFiles(from)) File.Copy(file, Path.Combine(temp, Path.GetFileName(file)), true);
                     foreach (var file in Directory.GetFiles(NexusCliStore.PackageClientDir)) File.Copy(file, Path.Combine(temp, "cli", Path.GetFileName(file)), true);
-                    if (Directory.Exists(target))
-                    {
-                        try
-                        {
-                            Directory.Delete(target, true);
-                        }
-                        catch
-                        {
-                            // старая копия занята работающим демоном — оставить её
-                            Directory.Delete(temp, true);
-                            return File.Exists(marker) ? marker : null;
-                        }
-                    }
-
+                    // копия появляется целиком одним переносом: папка версии с маркером — всегда полная
                     Directory.Move(temp, target);
+                    return marker;
                 }
+                catch (Exception e)
+                {
+                    TryDeleteDir(temp);
+                    // второй редактор той же версии успел первым — его копия годится, её не трогать
+                    if (File.Exists(marker)) return marker;
+                    NexusDiagnostics.Swallowed("CLI: копия демона", e);
+                    // папка версии без маркера — обрывок старой схемы копирования: убрать и попробовать ещё раз
+                    if (attempt > 0 || !Directory.Exists(target) || !TryDeleteDir(target)) return null;
+                }
+            }
 
-                return marker;
+            return File.Exists(marker) ? marker : null;
+        }
+
+        private static bool TryDeleteDir(string dir)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir)) Directory.Delete(dir, true);
+                return true;
             }
             catch (Exception e)
             {
-                NexusDiagnostics.Swallowed("CLI: копия демона", e);
+                NexusDiagnostics.Swallowed("CLI: удаление " + dir, e);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Отвечает ли демон из daemon.json: GET /v1/daemon (короткий таймаут, до <see cref="ProbeAttempts"/> попыток —
+        /// зовётся из фонового потока запуска, главный поток не ждёт) с тем же pid и временем старта. Ответил чужой
+        /// pid — daemon.json устарел, ответил другой демон: он жив, трогать нечего.
+        /// </summary>
+        private static bool Responds(JObject daemon, out bool draining)
+        {
+            draining = false;
+            var port = (int?)daemon["port"] ?? 0;
+            var pid = (int?)daemon["pid"] ?? 0;
+            if (port <= 0) return false;
+            for (var attempt = 0; attempt < ProbeAttempts; attempt++)
+            {
+                if (attempt > 0) Thread.Sleep(2000);
+                try
+                {
+                    var request = (HttpWebRequest)WebRequest.Create($"http://127.0.0.1:{port}/v1/daemon");
+                    request.Method = "GET";
+                    request.Timeout = 1500;
+                    request.ReadWriteTimeout = 1500;
+                    request.Headers["Authorization"] = "Bearer " + ReadToken();
+                    request.Proxy = null;
+                    using (var response = (HttpWebResponse)request.GetResponse())
+                    using (var reader = new StreamReader(response.GetResponseStream() ?? Stream.Null, Encoding.UTF8))
+                    {
+                        var o = JObject.Parse(reader.ReadToEnd());
+                        draining = (bool?)o["draining"] ?? false;
+                        var answeredPid = (int?)o["pid"] ?? 0;
+                        if (answeredPid != pid)
+                            NexusDiagnostics.Trace("CLI", $"на порту {port} отвечает демон pid {answeredPid}, а в daemon.json — {pid}");
+                        else if (StartedUtc(o) is DateTime a && StartedUtc(daemon) is DateTime b && Math.Abs((a - b).TotalSeconds) > 1)
+                            NexusDiagnostics.Trace("CLI", $"демон pid {pid}: время старта не совпадает с daemon.json");
+                        return true;
+                    }
+                }
+                catch (WebException e) when (e.Response is HttpWebResponse)
+                {
+                    // ответил (401 при сменившемся токене и т.п.) — значит, жив
+                    e.Response.Close();
+                    return true;
+                }
+                catch (Exception e)
+                {
+                    NexusDiagnostics.Swallowed($"CLI: проба демона (попытка {attempt + 1})", e);
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Демон не отвечает: остановить его процесс — но только если это действительно dotnet/nexusd, запущенный
+        /// около времени из daemon.json (pid мог достаться чужому процессу). true — был наш процесс (остановлен или
+        /// уже вышел); false — pid чужой, демона нет.
+        /// </summary>
+        private static bool KillHung(JObject daemon)
+        {
+            var pid = (int?)daemon["pid"] ?? 0;
+            try
+            {
+                using (var p = Process.GetProcessById(pid))
+                {
+                    var name = (p.ProcessName ?? string.Empty).ToLowerInvariant();
+                    if (name != "dotnet" && name != "nexusd") return false;
+                    if (StartedUtc(daemon) is DateTime started)
+                    {
+                        try
+                        {
+                            if (Math.Abs((p.StartTime.ToUniversalTime() - started).TotalSeconds) > 120) return false;
+                        }
+                        catch (Exception e)
+                        {
+                            NexusDiagnostics.Swallowed("CLI: время старта демона", e);
+                        }
+                    }
+
+                    _status = $"демон pid {pid}: не отвечает — останавливаю";
+                    p.Kill();
+                    p.WaitForExit(3000);
+                    return true;
+                }
+            }
+            catch (ArgumentException)
+            {
+                return true; // уже вышел
+            }
+            catch (Exception e)
+            {
+                NexusDiagnostics.Swallowed("CLI: остановка зависшего демона", e);
+                return true;
+            }
+        }
+
+        /// <summary>Поле started (UTC): Newtonsoft сам превращает ISO-строку в дату — учесть оба вида.</summary>
+        private static DateTime? StartedUtc(JObject o)
+        {
+            var t = o?["started"];
+            if (t == null) return null;
+            if (t.Type == JTokenType.Date) return ((DateTime)t).ToUniversalTime();
+            return DateTime.TryParse((string)t, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var d) ? d : (DateTime?)null;
+        }
+
+        private static string ReadToken()
+        {
+            try
+            {
+                return (string)JObject.Parse(File.ReadAllText(TokensFile))["local"]?["token"];
+            }
+            catch
+            {
                 return null;
             }
         }

@@ -28,6 +28,16 @@ namespace Exerussus.Nexus.Daemon
         private const long MaxRequestBytes = 1 << 20;
         private const int MaxOutputChars = 512 * 1024;
         private const int MaxItemOutputChars = 4000;
+        /// <summary>Данные команды (result/data) в итоге: больше — не пишутся, в итоге пометка (файл канала не раздувается).</summary>
+        private const int MaxDataChars = 256 * 1024;
+        /// <summary>Данные шага пакета в items[].</summary>
+        private const int MaxItemDataChars = 64 * 1024;
+        /// <summary>Начало итога, в котором ищется expires (демон пишет его до вывода).</summary>
+        private const int ExpiresHeadBytes = 8192;
+        /// <summary>Итог старого формата (expires в конце): читается целиком один раз, не больше этого.</summary>
+        private const long MaxDoneReadBytes = 64L << 20;
+        /// <summary>Папка канала пропала: сколько ждать, прежде чем создать её заново (выключение CLI удаляет её первой).</summary>
+        private const double MissingGrace = 3.0;
         private const double DefaultKeep = 300;
         private const double MinKeep = 60;
         private const double ParseGrace = 2.0;
@@ -45,7 +55,9 @@ namespace Exerussus.Nexus.Daemon
         {
             public bool IsMatch(string id) => SafeIdRe.IsMatch(id) && !DeviceRe.IsMatch(id);
         }
+        /// <summary>Отказ блокировки задачи у редакторов без поля reason (фолбэк к reason: task-lock).</summary>
         private static readonly Regex TaskLockRe = new Regex(@"Идёт задача .* task\.cancel (\S+)", RegexOptions.Compiled);
+        private static readonly Regex ExpiresRe = new Regex("\"expires\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.Compiled);
 
         /// <summary>Пути проектов, чьи хвосты прошлого демона уже разобраны (раз за жизнь демона).</summary>
         private static readonly ConcurrentDictionary<string, bool> Recovered = new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
@@ -96,6 +108,10 @@ namespace Exerussus.Nexus.Daemon
             public volatile string HelloToken;
             public volatile bool HelloRunning;
             public DateTime HelloRetryAt;
+            /// <summary>С какого момента нет папки канала (null — есть).</summary>
+            public DateTime? MissingSince;
+            /// <summary>Срок хранения итогов done/ (путь → expires; null — без срока, по возрасту): уборка не читает файлы заново.</summary>
+            public readonly ConcurrentDictionary<string, DateTime?> Expires = new ConcurrentDictionary<string, DateTime?>(StringComparer.OrdinalIgnoreCase);
         }
 
         private static readonly ConcurrentDictionary<Project, Channel> Channels = new ConcurrentDictionary<Project, Channel>();
@@ -109,6 +125,20 @@ namespace Exerussus.Nexus.Daemon
                 var ch = Channels.GetOrAdd(p, x => new Channel { Project = x });
                 try
                 {
+                    if (ch.Prepared && !Directory.Exists(p.CliDir))
+                    {
+                        // папку канала удалили (чистка NexusTemp, копия проекта): подготовить заново — паспорт, клиенты,
+                        // bridge.hello. Не сразу: выключение CLI удаляет папку раньше файла экземпляра — не воскрешать её
+                        ch.MissingSince ??= now;
+                        if ((now - ch.MissingSince.Value).TotalSeconds < MissingGrace || !File.Exists(p.InstanceFile)) continue;
+                        Log.Info($"канал {p.Id}: папка канала пропала — создаю заново");
+                        ch.Prepared = false;
+                        ch.HelloToken = null;
+                        ch.Foreign = null;
+                        ch.Expires.Clear();
+                    }
+
+                    ch.MissingSince = null;
                     if (!ch.Prepared) Prepare(ch);
                     if (now >= ch.NextBeat)
                     {
@@ -117,12 +147,16 @@ namespace Exerussus.Nexus.Daemon
                     }
 
                     Redeliver(ch);
-                    FetchCommands(ch);
+                    // демон уходит (обновление): новые запросы ждут в requests/ следующего демона, идущие доводятся
+                    if (!Calls.Draining) FetchCommands(ch);
                     if (ch.Foreign == null)
                     {
                         PollCancels(ch);
-                        PollRequests(ch);
-                        PollTasks(ch);
+                        if (!Calls.Draining)
+                        {
+                            PollRequests(ch);
+                            PollTasks(ch);
+                        }
                     }
 
                     if (now >= ch.NextSweep)
@@ -199,7 +233,10 @@ namespace Exerussus.Nexus.Daemon
             {
                 var name = Path.GetFileNameWithoutExtension(f);
                 if (name.StartsWith("done-", StringComparison.Ordinal)) ch.Seen[name.Substring(5)] = until;
+                else if (name.StartsWith("task-done-", StringComparison.Ordinal)) ch.Seen["t:" + name.Substring(10)] = until;
             }
+
+            foreach (var f in Files(Dir(ch, "tasks", "done"))) ch.Seen["t:" + Path.GetFileNameWithoutExtension(f)] = until;
 
             WritePassport(ch);
             ch.NextTrash = DateTime.UtcNow; // корзина — сразу при старте, потом раз в сутки
@@ -277,7 +314,7 @@ namespace Exerussus.Nexus.Daemon
                 ["beat"] = BeatInterval,
                 ["limits"] = new JsonObject
                 {
-                    ["requestBytes"] = MaxRequestBytes, ["outputChars"] = MaxOutputChars, ["defaultTimeout"] = Calls.DefaultTimeout,
+                    ["requestBytes"] = MaxRequestBytes, ["outputChars"] = MaxOutputChars, ["dataChars"] = MaxDataChars, ["defaultTimeout"] = Calls.DefaultTimeout,
                     ["defaultKeep"] = DefaultKeep, ["minKeep"] = MinKeep, ["maxKeep"] = Calls.MaxKeep, ["trashMaxAge"] = TrashMaxAge,
                     ["artifactKeep"] = 86400, ["queue"] = 100,
                 },
@@ -390,6 +427,7 @@ namespace Exerussus.Nexus.Daemon
             {
                 var id = Path.GetFileNameWithoutExtension(path);
                 var o = Json.ReadFile(path);
+                // определение задачи (defs/<id>.json) убирает WriteTaskDone
                 WriteTaskDone(ch, id, 4, "✗ Демон перезапущен во время задачи — результат неизвестен.", null, Json.Num(o, "keep"));
             }
         }
@@ -536,6 +574,8 @@ namespace Exerussus.Nexus.Daemon
             {
                 // под тем же замком, что WriteActive: active/ не перепишется после done/; id в Seen — до снятия из Calls
                 lock (c) WriteDone(ch, c.Id, Outcome.From(c, c.Source == "file-efc"));
+                // итог — в done/ (или в очереди повтора): вывод до 16 МБ больше не держать в памяти до конца keep
+                Calls.Release(c);
                 ch.Calls.TryRemove(c.Id, out _);
                 if (c.Project.LockHolder == c.Id) c.Project.LockHolder = null;
                 return;
@@ -580,21 +620,29 @@ namespace Exerussus.Nexus.Daemon
             public string Accepted;
             public bool CancelIgnored;
             public JsonArray Items;
+            /// <summary>Клиент efc: данные — в data; старый формат (nexus-fs) — строкой в result. Не оба сразу.</summary>
+            public bool ForEfc;
 
             public static Outcome From(Call c, bool efc)
             {
                 var o = new Outcome
                 {
                     Exit = c.ExitCode, Output = c.Output ?? string.Empty, Result = c.Result, Job = c.Job, Seconds = Math.Round(c.Seconds, 2),
-                    Keep = c.Keep, Accepted = c.Created.ToString("O"), CancelIgnored = c.CancelRequested && c.ExitCode == 0,
+                    Keep = c.Keep, Accepted = c.Created.ToString("O"), CancelIgnored = c.CancelRequested && c.ExitCode == 0, ForEfc = efc,
                 };
-                o.Data = ParseData(c.Result);
+                o.Data = efc && c.Result != null && c.Result.Length <= MaxDataChars ? ParseData(c.Result) : null;
                 // отказ из-за блокировки — для клиента efc это «занято» (6); старый клиент получает код 1, как от задачи Unity
                 var busyWith = c.BusyWith;
                 if (busyWith == null && c.ExitCode == 1)
                 {
-                    var m = TaskLockRe.Match(o.Output);
-                    if (m.Success) busyWith = m.Groups[1].Value;
+                    // reason: task-lock в данных отказа; редакторы без него — по тексту
+                    var refusal = c.Result != null && c.Result.Length <= MaxDataChars ? ParseData(c.Result) : null;
+                    if (Json.Str(refusal, "reason") == "task-lock") busyWith = Json.Str(refusal, "task") ?? "task";
+                    else
+                    {
+                        var m = TaskLockRe.Match(o.Output);
+                        if (m.Success) busyWith = m.Groups[1].Value;
+                    }
                 }
 
                 if (busyWith != null && efc)
@@ -636,7 +684,21 @@ namespace Exerussus.Nexus.Daemon
                 truncated = true;
             }
 
+            // данные команды: efc — разобранные в data, старый формат — строкой в result; больше лимита — не пишутся
+            var data = r.Data;
+            var result = r.ForEfc && data != null ? null : r.Result;
+            var dataChars = result?.Length ?? (data != null ? Json.Write(data).Length : 0);
+            var dataOmitted = dataChars > MaxDataChars;
+            if (dataOmitted)
+            {
+                data = null;
+                result = null;
+                output += $"… (данные команды — {dataChars} символов — не записаны: больше {MaxDataChars})\n";
+                truncated = true;
+            }
+
             var keep = Math.Clamp(r.Keep, MinKeep, Calls.MaxKeep);
+            var expires = DateTime.UtcNow.AddSeconds(keep);
             var o = new JsonObject
             {
                 ["v"] = 1,
@@ -644,25 +706,29 @@ namespace Exerussus.Nexus.Daemon
                 ["state"] = "done",
                 ["ok"] = r.Exit == 0,
                 ["exitCode"] = r.Exit,
+                // срок — в начале файла: уборка читает только его голову
+                ["expires"] = expires.ToString("O"),
             };
             var error = r.Error ?? Efc.ErrorText(output, r.Exit);
             if (error != null) o["error"] = error;
             var reason = r.Reason ?? Efc.ReasonFor(r.Exit);
             if (reason != null) o["reason"] = reason;
             o["output"] = output;
-            if (r.Data != null) o["data"] = r.Data.DeepClone();
+            if (data != null) o["data"] = data.DeepClone();
             if (r.Items != null) o["items"] = r.Items;
             if (truncated) o["truncated"] = true;
+            if (dataOmitted) o["dataOmitted"] = dataChars;
             if (r.CancelIgnored) o["cancelIgnored"] = true;
             o["project"] = ch.Project.Id;
-            if (r.Result != null) o["result"] = r.Result;
+            if (result != null) o["result"] = result;
             if (r.Job != null) o["job"] = r.Job;
             if (r.Seconds != null) o["seconds"] = r.Seconds;
             if (r.Accepted != null) o["accepted"] = r.Accepted;
             o["finished"] = DateTime.UtcNow.ToString("O");
-            o["expires"] = DateTime.UtcNow.AddSeconds(keep).ToString("O");
             ch.Seen[id] = DateTime.UtcNow.AddSeconds(Math.Max(keep, OrphanAge));
-            Deliver(ch, Dir(ch, "done", id + ".json"), Json.Write(o), Dir(ch, "active", id + ".json"), Dir(ch, "active", id + ".log"));
+            var path = Dir(ch, "done", id + ".json");
+            ch.Expires[path] = expires;
+            Deliver(ch, path, Json.Write(o), Dir(ch, "active", id + ".json"), Dir(ch, "active", id + ".log"));
         }
 
         // ============================================================ пакеты (efc, шаги ведёт демон)
@@ -923,7 +989,13 @@ namespace Exerussus.Nexus.Daemon
             var o = new JsonObject { ["id"] = id, ["command"] = command, ["status"] = status, ["ok"] = status == "ok", ["exitCode"] = exit };
             if (error != null) o["error"] = error;
             if (reason != null) o["reason"] = reason;
-            if (data != null) o["data"] = data.DeepClone();
+            if (data != null)
+            {
+                var chars = Json.Write(data).Length;
+                if (chars <= MaxItemDataChars) o["data"] = data.DeepClone();
+                else o["dataOmitted"] = chars;
+            }
+
             if (!string.IsNullOrEmpty(output)) o["output"] = output.Length > MaxItemOutputChars ? output.Substring(0, MaxItemOutputChars) + "\n…" : output;
             if (misses != null && misses.Count > 0) o["expectFailed"] = new JsonArray(misses.Select(m => (JsonNode)m).ToArray());
             o["seconds"] = seconds;
@@ -1009,20 +1081,56 @@ namespace Exerussus.Nexus.Daemon
 
         // ============================================================ задачи (этап 1: исполняет Unity, task.run <файл>)
 
+        /// <summary>Задача с этим id уже выполнена или выполняется: повтор не запускается (как <see cref="Known"/>).</summary>
+        private static bool KnownTask(Channel ch, string id) =>
+            ch.Calls.ContainsKey("t:" + id) || ch.Seen.ContainsKey("t:" + id) || File.Exists(Dir(ch, "tasks", "done", id + ".json")) ||
+            File.Exists(Dir(ch, "trash", "task-done-" + id + ".json"));
+
         private static void PollTasks(Channel ch)
         {
             foreach (var path in Sorted(Dir(ch, "tasks", "requests")))
             {
                 var id = Path.GetFileNameWithoutExtension(path);
-                if (!SafeId.IsMatch(id) || ch.Calls.ContainsKey("t:" + id)) continue;
+                if (!SafeId.IsMatch(id)) continue;
+                if (KnownTask(ch, id))
+                {
+                    Json.TryDelete(path); // повтор id: уже выполнена или выполняется
+                    continue;
+                }
+
+                long size;
+                try
+                {
+                    size = new FileInfo(path).Length;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                var age = Age(path, DateTime.UtcNow);
+                JsonObject o = null;
+                if (size <= MaxRequestBytes)
+                {
+                    o = Json.ReadFile(path, MaxRequestBytes);
+                    // неатомарный писатель: дать дописать
+                    if (o == null && age < ParseGrace) continue;
+                }
+
                 var active = Dir(ch, "tasks", "active", id + ".json");
                 if (!TryMove(path, active)) continue;
 
-                var o = Json.ReadFile(active, MaxRequestBytes);
                 var keep = Json.Num(o, "keep");
                 if (o == null || !(o["steps"] is JsonArray))
                 {
-                    WriteTaskDone(ch, id, 2, "✗ Неверная задача: нужен массив steps.", null, keep);
+                    WriteTaskDone(ch, id, 2, size > MaxRequestBytes ? $"✗ Задача больше {MaxRequestBytes} байт." : "✗ Неверная задача: нужен массив steps.", null, keep);
+                    continue;
+                }
+
+                var timeout = (int)Math.Max(60, Json.Num(o, "timeout", 1800)) + 600;
+                if (age > timeout + 60)
+                {
+                    WriteTaskDone(ch, id, 5, "✗ Задача просрочена: пролежала дольше своего срока, не выполнялась.", null, keep);
                     continue;
                 }
 
@@ -1030,12 +1138,6 @@ namespace Exerussus.Nexus.Daemon
                 o.Remove("id");
                 var def = Dir(ch, "tasks", "defs", id + ".json");
                 Json.WriteAtomic(def, Json.Write(o));
-                var timeout = (int)Math.Max(60, Json.Num(o, "timeout", 1800)) + 600;
-                if (Age(active, DateTime.UtcNow) > timeout + 60)
-                {
-                    WriteTaskDone(ch, id, 5, "✗ Задача просрочена: пролежала дольше своего срока, не выполнялась.", null, keep);
-                    continue;
-                }
 
                 var call = Calls.Create(ch.Project, "task.run", new[] { def }, ch.Project.Path, timeout, keep, false, "file-task", "t" + id,
                     c => OnTaskPhase(ch, id, c));
@@ -1053,9 +1155,9 @@ namespace Exerussus.Nexus.Daemon
                 return;
             }
 
-            ch.Calls.TryRemove("t:" + id, out _);
-            Json.TryDelete(Dir(ch, "tasks", "defs", id + ".json"));
             WriteTaskDone(ch, id, c.ExitCode, (c.Output ?? string.Empty).TrimEnd('\n'), c.Result, c.Keep);
+            Calls.Release(c);
+            ch.Calls.TryRemove("t:" + id, out _);
         }
 
         private static void WriteTaskActive(Channel ch, string id, Call c, double keep)
@@ -1075,15 +1177,30 @@ namespace Exerussus.Nexus.Daemon
 
         private static void WriteTaskDone(Channel ch, string id, int exit, string summary, string report, double keep)
         {
-            var o = Json.TryParseObject(report) ?? new JsonObject { ["status"] = exit == 0 ? "ok" : "failed", ["steps"] = new JsonArray(), ["artifacts"] = new JsonArray() };
-            o["job"] = Json.Str(o, "id");
-            o["id"] = id;
-            o["state"] = "done";
-            o["exitCode"] = exit;
-            if (o["summary"] == null) o["summary"] = summary;
+            var parsed = report != null && report.Length <= MaxDataChars * 4 ? Json.TryParseObject(report) : null;
+            var body = parsed ?? new JsonObject { ["status"] = exit == 0 ? "ok" : "failed", ["steps"] = new JsonArray(), ["artifacts"] = new JsonArray() };
+            if (parsed == null && report != null && report.Length > MaxDataChars * 4) body["reportOmitted"] = report.Length;
             keep = Math.Clamp(keep, 0, Calls.MaxKeep);
-            if (keep > 0) o["expires"] = DateTime.UtcNow.AddSeconds(keep).ToString("O");
-            Deliver(ch, Dir(ch, "tasks", "done", id + ".json"), Json.Write(o), Dir(ch, "tasks", "active", id + ".json"));
+            DateTime? expires = keep > 0 ? DateTime.UtcNow.AddSeconds(keep) : null;
+            // id, итог и срок — в начале файла (уборка читает только голову), затем отчёт задачи
+            var o = new JsonObject { ["id"] = id, ["state"] = "done", ["exitCode"] = exit };
+            if (expires != null) o["expires"] = expires.Value.ToString("O");
+            o["job"] = Json.Str(body, "id");
+            foreach (var key in body.Select(kv => kv.Key).ToList())
+            {
+                if (o.ContainsKey(key) || key == "id") continue;
+                var node = body[key];
+                body.Remove(key);
+                o[key] = node;
+            }
+
+            if (o["summary"] == null) o["summary"] = summary;
+            ch.Seen["t:" + id] = DateTime.UtcNow.AddSeconds(Math.Max(keep, OrphanAge));
+            // определение задачи больше не нужно: итог, просрочка, хвост прошлого демона
+            Json.TryDelete(Dir(ch, "tasks", "defs", id + ".json"));
+            var path = Dir(ch, "tasks", "done", id + ".json");
+            ch.Expires[path] = expires;
+            Deliver(ch, path, Json.Write(o), Dir(ch, "tasks", "active", id + ".json"));
         }
 
         // ============================================================ уборка и файлы
@@ -1095,20 +1212,35 @@ namespace Exerussus.Nexus.Daemon
                 if (kv.Value < now)
                     ch.Seen.TryRemove(kv.Key, out _);
 
+            // срок итога — из памяти (записан этим демоном) или из головы файла, один раз; файлы целиком не перечитываются
+            var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var dir in new[] { Dir(ch, "done"), Dir(ch, "tasks", "done") })
                 foreach (var path in Files(dir))
                 {
-                    var o = Json.ReadFile(path);
-                    var raw = Json.Str(o, "expires");
-                    if (raw == null)
+                    present.Add(path);
+                    if (!ch.Expires.TryGetValue(path, out var expires))
                     {
-                        if (Age(path, now) > OrphanAge) Json.TryDelete(path);
-                        continue;
+                        if (!ReadExpires(path, out expires)) continue; // занят или не читается — в следующий раз
+                        ch.Expires[path] = expires;
                     }
 
-                    if (DateTime.TryParse(raw, null, System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var expires) && expires < now)
+                    if (expires == null ? Age(path, now) > OrphanAge : expires.Value < now)
+                    {
                         Json.TryDelete(path);
+                        if (!File.Exists(path)) ch.Expires.TryRemove(path, out _);
+                    }
                 }
+
+            foreach (var key in ch.Expires.Keys)
+                if (!present.Contains(key) && !File.Exists(key))
+                    ch.Expires.TryRemove(key, out _);
+
+            // определения задач без живого вызова — хвосты (итог записан, а удалить не вышло; прошлый демон)
+            foreach (var path in Files(Dir(ch, "tasks", "defs")))
+            {
+                var id = Path.GetFileNameWithoutExtension(path);
+                if (!ch.Calls.ContainsKey("t:" + id) && Age(path, now) > 600) Json.TryDelete(path);
+            }
 
             // active/ без живого вызова старше часа — хвост (итог не дописан или потерян)
             foreach (var path in AllFiles(Dir(ch, "active")))
@@ -1129,6 +1261,55 @@ namespace Exerussus.Nexus.Daemon
                 foreach (var tmp in Directory.GetFiles(dir, "*.tmp*"))
                     if (Age(tmp, now) > 600)
                         Json.TryDelete(tmp);
+            }
+        }
+
+        /// <summary>
+        /// Срок итога (<c>expires</c>) без чтения всего файла: демон пишет его в начале, поэтому хватает головы. Итог
+        /// старого формата (срок в конце) читается целиком, но один раз — дальше срок в <see cref="Channel.Expires"/>.
+        /// false — файл сейчас не прочитать.
+        /// </summary>
+        private static bool ReadExpires(string path, out DateTime? expires)
+        {
+            expires = null;
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                var head = new byte[(int)Math.Min(ExpiresHeadBytes, fs.Length)];
+                var n = 0;
+                while (n < head.Length)
+                {
+                    var k = fs.Read(head, n, head.Length - n);
+                    if (k <= 0) break;
+                    n += k;
+                }
+
+                string raw = null;
+                var m = ExpiresRe.Match(Encoding.UTF8.GetString(head, 0, n));
+                if (m.Success) raw = m.Groups[1].Value;
+                else if (fs.Length > n)
+                {
+                    if (fs.Length > MaxDoneReadBytes) return true; // огромный и без срока в голове — по возрасту
+                    fs.Position = 0;
+                    using var reader = new StreamReader(fs, Json.Utf8, true);
+                    raw = Json.Str(Json.TryParseObject(reader.ReadToEnd()), "expires");
+                }
+
+                if (raw != null && DateTime.TryParse(raw, null, System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed))
+                    expires = parsed;
+                return true;
+            }
+            catch (FileNotFoundException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
             }
         }
 

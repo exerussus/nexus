@@ -120,6 +120,7 @@ namespace Exerussus.Nexus.Core
             // идущая задача держит редактор: меняющие команды извне — только с --force (вмешательство — в её отчёт)
             if (!command.ReadOnly && !NexusCliTasks.Admit(ctx, out var refusal))
             {
+                ctx.Data = new { reason = "task-lock", task = NexusCliTasks.LockingTask()?.Id };
                 ctx.Error(refusal);
                 return NexusCommandContext.Exit.Failed;
             }

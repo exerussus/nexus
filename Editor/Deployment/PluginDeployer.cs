@@ -1,15 +1,17 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Exerussus.Nexus.Abstractions;
 using Exerussus.Nexus.Manifests;
-using UnityEditor;
 
 namespace Exerussus.Nexus.Deployment
 {
     /// <summary>
     /// Файловые механики развёртки. Статический stateless-сервис: всё состояние —
-    /// на диске. Атомарность через temp ВНЕ Assets → swap внутрь Assets, так что
-    /// State/&lt;id&gt; в любой момент целый-старый или целый-новый.
+    /// на диске. Атомарность через temp ВНЕ Assets → swap внутрь Assets (старое → скрытый
+    /// сосед, новое → на место, старое удаляется; сбой — откат), так что State/&lt;id&gt;
+    /// в любой момент целый-старый или целый-новый. Пути deploy могут содержать подпапки;
+    /// файлы копируются байтами.
     ///
     /// Пишет deploy.json/preserve.json сам (generic-механика) — страница не участвует.
     /// </summary>
@@ -44,13 +46,19 @@ namespace Exerussus.Nexus.Deployment
             var files = new List<string>();
             try
             {
+                var srcDir = PluginRoots.SourceDir(m.Id);
                 foreach (var entry in m.Deploy ?? Enumerable.Empty<DeployEntry>())
                 {
-                    var src = Path.Combine(PluginRoots.SourceDir(m.Id), entry.From);
+                    var from = SafeRelative(entry?.From, out var fromError);
+                    if (from == null) return Fail(tmp, $"deploy.from «{entry?.From}»: {fromError}");
+                    var to = SafeRelative(entry.To, out var toError);
+                    if (to == null) return Fail(tmp, $"deploy.to «{entry.To}»: {toError}");
+
+                    var src = Path.Combine(srcDir, from);
                     if (!File.Exists(src))
                         return Fail(tmp, $"истоковый файл не найден: {entry.From}");
-                    File.WriteAllText(Path.Combine(tmp, entry.To), File.ReadAllText(src));
-                    files.Add(entry.To);
+                    CopyFile(src, Path.Combine(tmp, to));
+                    files.Add(to);
                 }
 
                 WriteDescriptor(tmp, new DeployDescriptor
@@ -70,18 +78,18 @@ namespace Exerussus.Nexus.Deployment
             var tmp = FreshTemp(m.Id);
             try
             {
-                foreach (var inert in Directory.EnumerateFiles(preDir))
+                // рекурсивно: подпапки сохраняются, инертность снимается только с имени файла
+                foreach (var rel in RelativeFiles(preDir))
                 {
-                    var name = Path.GetFileName(inert);
-                    if (name == "preserve.json") continue;
-                    File.WriteAllText(Path.Combine(tmp, PackRegime.ToLive(name)), File.ReadAllText(inert));
+                    if (rel == "preserve.json") continue;
+                    CopyFile(Path.Combine(preDir, rel), Path.Combine(tmp, MapName(rel, PackRegime.ToLive)));
                 }
 
                 // переносим служебный дескриптор сейва в deploy.json
                 var desc = JsonIo.Load<DeployDescriptor>(Path.Combine(preDir, "preserve.json"))
                            ?? new DeployDescriptor { PluginGuid = m.Guid, DeployedVersion = m.Version };
-                desc.Files = Directory.EnumerateFiles(tmp).Select(f => Path.GetFileName(f))
-                                      .Where(n => n != "deploy.json").ToList();
+                if (string.IsNullOrEmpty(desc.PluginGuid)) desc.PluginGuid = m.Guid;
+                desc.Files = RelativeFiles(tmp).Where(n => n != "deploy.json").ToList();
                 WriteDescriptor(tmp, desc);
 
                 SwapIntoState(m.Id, tmp);
@@ -100,27 +108,24 @@ namespace Exerussus.Nexus.Deployment
             if (!Directory.Exists(stateDir)) return Result.Done($"«{id}» уже не развёрнут");
 
             var desc = JsonIo.Load<DeployDescriptor>(Path.Combine(stateDir, "deploy.json"))
-                       ?? new DeployDescriptor { PluginGuid = id };
+                       ?? new DeployDescriptor { PluginGuid = KnownGuid(id) };
 
             var ptmp = FreshTemp(id + ".preserve");
             try
             {
-                foreach (var file in Directory.EnumerateFiles(stateDir))
+                // рекурсивно, с относительными путями; инертность — только к имени файла
+                foreach (var rel in RelativeFiles(stateDir))
                 {
-                    var name = Path.GetFileName(file);
-                    if (name == "deploy.json") continue;           // дескриптор пересоздадим
-                    File.WriteAllText(Path.Combine(ptmp, PackRegime.ToInert(name)), File.ReadAllText(file));
+                    if (rel == "deploy.json") continue;           // дескриптор пересоздадим
+                    CopyFile(Path.Combine(stateDir, rel), Path.Combine(ptmp, MapName(rel, PackRegime.ToInert)));
                 }
                 JsonIo.Save(Path.Combine(ptmp, "preserve.json"), desc);
 
-                // swap в Preserve (вне Assets — чистый System.IO)
-                var preDir = NexusPaths.PreserveDir(id);
-                DeleteDir(preDir);
-                Directory.CreateDirectory(Directory.GetParent(preDir)!.FullName);
-                Directory.Move(ptmp, preDir);
+                // swap в Preserve (вне Assets — чистый System.IO): старый сейв в сторону, новый на место
+                SwapDir(ptmp, NexusPaths.PreserveDir(id));
 
-                // выселяем State (внутри Assets — через AssetDatabase, чистит .meta + рекомпил)
-                DeleteStateAsset(id);
+                // выселяем State (внутри Assets; Unity увидит удаление на общем Refresh после Apply)
+                EvictState(id);
                 return Result.Done($"выключен «{id}» (сейв упакован в Preserve)");
             }
             catch (System.Exception ex) { return Fail(ptmp, ex.Message); }
@@ -132,16 +137,24 @@ namespace Exerussus.Nexus.Deployment
         public static Result RestoreDefault(PluginManifest m)
         {
             if (m == null) return Result.Fail("нет манифеста");
-            DeleteDir(NexusPaths.PreserveDir(m.Id));   // сейв удаляется осознанно (диалог выше)
-            DeleteStateAsset(m.Id);
+
+            var issues = Validate(m);
+            if (issues.Count > 0)
+                return Result.Fail($"плагин '{m.Id}' невалиден: {string.Join("; ", issues)}");
+
+            // State подменяется атомарно; сейв удаляется осознанно (диалог выше), но только после
+            // успешной развёртки — при сбое у человека остаются и старый State, и его сейв
             var r = DeployFromPlugins(m);
-            return r.Ok ? Result.Done($"сброшен к дефолту «{m.Id}» (v{m.Version})") : r;
+            if (!r.Ok) return r;
+            DeleteDir(NexusPaths.PreserveDir(m.Id));
+            return Result.Done($"сброшен к дефолту «{m.Id}» (v{m.Version})");
         }
 
         /// <summary>Очистка осиротевшего состояния (манифеста нет).</summary>
         public static Result CleanOrphan(string id)
         {
-            DeleteStateAsset(id);
+            try { EvictState(id); }
+            catch (System.Exception ex) { return Result.Fail($"не удалось удалить State «{id}»: {ex.Message}"); }
             DeleteDir(NexusPaths.PreserveDir(id));
             return Result.Done($"удалено осиротевшее состояние «{id}»");
         }
@@ -157,20 +170,28 @@ namespace Exerussus.Nexus.Deployment
 
             foreach (var entry in m.Deploy ?? Enumerable.Empty<DeployEntry>())
             {
-                if (!PackRegime.IsInert(entry.From))
+                if (entry == null) { issues.Add("пустая запись deploy"); continue; }
+
+                var from = SafeRelative(entry.From, out var fromError);
+                if (from == null) issues.Add($"deploy.from «{entry.From}»: {fromError}");
+                var to = SafeRelative(entry.To, out var toError);
+                if (to == null) issues.Add($"deploy.to «{entry.To}»: {toError}");
+                else if (to == "deploy.json") issues.Add("deploy.to «deploy.json» занят служебным дескриптором");
+                if (from == null) continue;
+
+                if (!PackRegime.IsInert(from))
                     issues.Add($"исток '{entry.From}' не инертный (.txt)");
-                if (!File.Exists(Path.Combine(dir, entry.From)))
+                if (!File.Exists(Path.Combine(dir, from)))
                     issues.Add($"истоковый файл отсутствует: {entry.From}");
             }
 
-            if (Directory.Exists(dir))
-                foreach (var f in Directory.EnumerateFiles(dir))
-                {
-                    var name = Path.GetFileName(f);
-                    if (name == "manifest.json") continue;
-                    if (PackRegime.IsImportable(name))
-                        issues.Add($"в Plugins живой импортируемый файл: {name} (должен быть .txt)");
-                }
+            // рекурсивно: живой файл в подпапке плагина так же «давит» на проект
+            foreach (var rel in RelativeFiles(dir))
+            {
+                if (rel == "manifest.json") continue;
+                if (PackRegime.IsImportable(Path.GetFileName(rel)))
+                    issues.Add($"в Plugins живой импортируемый файл: {rel} (должен быть .txt)");
+            }
 
             return issues;
         }
@@ -212,20 +233,139 @@ namespace Exerussus.Nexus.Deployment
         private static void WriteDescriptor(string dir, DeployDescriptor desc)
             => JsonIo.Save(Path.Combine(dir, "deploy.json"), desc);
 
-        // temp(вне Assets) → State/<id> (внутри Assets); старый State выселяем через AssetDatabase
+        // temp(вне Assets) → State/<id> (внутри Assets). Старый State сперва переименовывается в
+        // скрытую соседнюю папку (Unity такие не импортирует), новый встаёт на его место, старый
+        // удаляется. Сбой переноса — откат: старый возвращается, State остаётся целым-старым.
+        // .meta самой папки State/<id> остаётся на месте — guid папки не меняется.
         private static void SwapIntoState(string id, string tmp)
         {
-            DeleteStateAsset(id);
             Directory.CreateDirectory(NexusPaths.StateRoot);
-            Directory.Move(tmp, NexusPaths.StateDir(id));
+            SwapDir(tmp, NexusPaths.StateDir(id));
         }
 
-        private static void DeleteStateAsset(string id)
+        /// <summary>Атомарная подмена папки <paramref name="target"/> готовой <paramref name="fresh"/>:
+        /// старое → скрытый сосед «.&lt;имя&gt;.old~», новое → на место, старое удаляется; при сбое — откат.</summary>
+        private static void SwapDir(string fresh, string target)
         {
-            if (Directory.Exists(NexusPaths.StateDir(id)))
-                AssetDatabase.DeleteAsset(NexusPaths.StateAssetDir(id));
-            // подстраховка, если по какой-то причине осталась голая папка
-            DeleteDir(NexusPaths.StateDir(id));
+            var parent = Directory.GetParent(target)!.FullName;
+            Directory.CreateDirectory(parent);
+            var old = OldDir(target);
+            DeleteDir(old);   // хвост прошлого сбоя
+
+            var hadOld = Directory.Exists(target);
+            if (hadOld) Directory.Move(target, old);
+
+            try
+            {
+                Directory.Move(fresh, target);
+            }
+            catch
+            {
+                if (hadOld && !Directory.Exists(target))
+                {
+                    try { Directory.Move(old, target); }
+                    catch (System.Exception rollback) { NexusDiagnostics.Error($"откат подмены {target}", rollback); }
+                }
+                throw;
+            }
+
+            TryDeleteDir(old);
+        }
+
+        // выселить State/<id>: сперва в сторону (быстро и целиком), затем удалить; .meta папки — тоже,
+        // чтобы Unity на Refresh не ругался на осиротевший meta. Без AssetDatabase.DeleteAsset —
+        // Apply и так заканчивается одним Refresh, который увидит удаление.
+        private static void EvictState(string id)
+        {
+            var stateDir = NexusPaths.StateDir(id);
+            if (Directory.Exists(stateDir))
+            {
+                var old = OldDir(stateDir);
+                DeleteDir(old);
+                Directory.Move(stateDir, old);
+                TryDeleteDir(old);
+            }
+
+            var meta = stateDir + ".meta";
+            if (File.Exists(meta)) File.Delete(meta);
+        }
+
+        private static string OldDir(string target)
+            => Path.Combine(Directory.GetParent(target)!.FullName, "." + Path.GetFileName(target) + ".old~");
+
+        private static void TryDeleteDir(string dir)
+        {
+            try { DeleteDir(dir); }
+            catch (System.Exception ex) { NexusDiagnostics.Swallowed("удаление " + dir + " (уберётся при следующей подмене)", ex); }
+        }
+
+        /// <summary>
+        /// Относительный путь из манифеста → нормализованный («a/b.cs»); null + причина, если путь
+        /// выводит за пределы папки: «..», абсолютный путь, корень диска, пустой сегмент.
+        /// </summary>
+        public static string SafeRelative(string path, out string error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(path)) { error = "пустой путь"; return null; }
+
+            var p = path.Trim().Replace('\\', '/');
+            if (p.StartsWith("/") || p.IndexOf(':') >= 0 || Path.IsPathRooted(p))
+            {
+                error = "абсолютный путь или корень диска запрещён — нужен путь относительно папки плагина";
+                return null;
+            }
+
+            var parts = p.Split('/');
+            var clean = new List<string>(parts.Length);
+            foreach (var part in parts)
+            {
+                if (part.Length == 0 || part == ".") continue;
+                if (part == "..") { error = "«..» запрещён — путь не должен выходить из папки"; return null; }
+                if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                {
+                    error = $"недопустимые символы в «{part}»";
+                    return null;
+                }
+                clean.Add(part);
+            }
+
+            if (clean.Count == 0) { error = "пустой путь"; return null; }
+            return string.Join("/", clean);
+        }
+
+        /// <summary>Все файлы папки рекурсивно — относительными путями через «/»; нет папки — пусто.</summary>
+        private static List<string> RelativeFiles(string dir)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return list;
+
+            var root = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                list.Add(Path.GetFullPath(f).Substring(root.Length + 1).Replace('\\', '/'));
+            list.Sort(System.StringComparer.Ordinal);
+            return list;
+        }
+
+        // правило упаковки (ToLive/ToInert) — только к имени файла, подпапки сохраняются
+        private static string MapName(string relative, System.Func<string, string> map)
+        {
+            var slash = relative.LastIndexOf('/');
+            return slash < 0 ? map(relative) : relative.Substring(0, slash + 1) + map(relative.Substring(slash + 1));
+        }
+
+        // копия байтами: BOM, окончания строк и бинарные файлы (иконки) переносятся как есть
+        private static void CopyFile(string src, string dst)
+        {
+            var dir = Path.GetDirectoryName(dst);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.Copy(src, dst, overwrite: true);
+        }
+
+        // guid плагина по манифесту в его исходной папке; неизвестен — пусто (не id: это разные ключи)
+        private static string KnownGuid(string id)
+        {
+            var manifest = Path.Combine(PluginRoots.SourceDir(id), "manifest.json");
+            return File.Exists(manifest) ? ManifestIo.Load(manifest)?.Guid : null;
         }
 
         private static void DeleteDir(string dir)

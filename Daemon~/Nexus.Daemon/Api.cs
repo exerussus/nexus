@@ -28,9 +28,11 @@ namespace Exerussus.Nexus.Daemon
                     if (parts.Length == 2 && r.Method == "GET") return Ok(DaemonJson());
                     if (parts.Length == 3 && parts[2] == "shutdown" && r.Method == "POST")
                     {
-                        Log.Info("остановка по запросу API");
+                        // не обрывать чужие вызовы: новые не принимать, идущие довести (Program.Drain), потом выйти
+                        if (!Calls.Draining) Log.Info($"остановка по запросу API: дожидаюсь вызовов ({Calls.Active.Count()})");
+                        Calls.Draining = true;
                         _ = Task.Delay(200).ContinueWith(_ => ShutdownRequested?.Invoke());
-                        return Ok(new JsonObject { ["stopping"] = true });
+                        return Ok(new JsonObject { ["stopping"] = true, ["calls"] = Calls.Active.Count() });
                     }
 
                     break;
@@ -43,10 +45,12 @@ namespace Exerussus.Nexus.Daemon
                         var p = Registry.Resolve(parts[2], out var problem);
                         if (p == null) return HttpResponse.Error(404, problem);
                         if (parts.Length == 3 && r.Method == "GET") return Ok(ProjectJson(p));
+                        if (Calls.Draining && r.Method == "POST") return Draining();
                         if (parts.Length == 4 && parts[3] == "calls" && r.Method == "POST") return StartCall(p, Json.TryParseObject(r.BodyText));
                         if (parts.Length >= 5 && parts[3] == "artifacts" && r.Method == "GET") return Artifact(p, string.Join('/', parts.Skip(4)));
                         if (parts.Length == 4 && parts[3] == "commands" && r.Method == "GET")
                         {
+                            if (Calls.Draining) return Draining();
                             // список команд — от самого Bridge (bridge.hello), с ожиданием готовности редактора
                             var call = Calls.Start(p, "bridge.hello", null, p.Path, 30, 0, false, "http");
                             await Task.WhenAny(call.Done.Task, Task.Delay(TimeSpan.FromSeconds(30)));
@@ -80,6 +84,7 @@ namespace Exerussus.Nexus.Daemon
                 case "calls":
                     if (parts.Length == 2 && r.Method == "POST")
                     {
+                        if (Calls.Draining) return Draining();
                         var body = Json.TryParseObject(r.BodyText);
                         var explicitProject = Json.Str(body, "project");
                         var p = Registry.Resolve(explicitProject ?? Json.Str(body, "cwd"), out var problem);
@@ -105,6 +110,9 @@ namespace Exerussus.Nexus.Daemon
         }
 
         private static HttpResponse Ok(JsonObject o) => HttpResponse.Json(200, Json.Write(o));
+
+        /// <summary>Демон уходит (обновление): новый вызов — к следующему демону; клиент повторяет.</summary>
+        private static HttpResponse Draining() => HttpResponse.Error(503, "демон обновляется: дожидается идущих вызовов — повторите через несколько секунд");
 
         private static HttpResponse StartCall(Project p, JsonObject body)
         {
@@ -142,6 +150,7 @@ namespace Exerussus.Nexus.Daemon
             ["started"] = DaemonInfo.Started.ToString("O"),
             ["projects"] = Registry.All.Length,
             ["calls"] = Calls.Active.Count(),
+            ["draining"] = Calls.Draining,
         };
 
         public static JsonObject ProjectJson(Project p) => new JsonObject

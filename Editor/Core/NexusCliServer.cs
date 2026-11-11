@@ -117,6 +117,9 @@ namespace Exerussus.Nexus.Core
             public bool Pending;
             public double? Seconds;
 
+            /// <summary>Машинная причина отказа (bad-token, …): клиенты сверяют её, а не текст вывода.</summary>
+            public string Reason;
+
             /// <summary>Файловый канал: когда итог можно удалить (UTC, ISO 8601).</summary>
             public string Expires;
         }
@@ -127,6 +130,23 @@ namespace Exerussus.Nexus.Core
             public NexusCommandContext Context;
             public readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
             public Response Response;
+
+            // событие держат двое: поток соединения (ждёт) и главный поток (отвечает) — освобождает последний,
+            // иначе Set после Dispose ушедшего по таймауту потока бросил бы ObjectDisposedException
+            private int _holders = 2;
+
+            /// <summary>Главный поток: выдать ответ и отпустить событие.</summary>
+            public void Answer(Response response)
+            {
+                Response = response;
+                Done.Set();
+                Release();
+            }
+
+            public void Release()
+            {
+                if (Interlocked.Decrement(ref _holders) == 0) Done.Dispose();
+            }
         }
 
         // ---- состояние сервера: живёт, пока он запущен ----
@@ -147,6 +167,10 @@ namespace Exerussus.Nexus.Core
         private static string _unity;
         private static int _pid;
         private static string _log;
+
+        // личная настройка DirectTcp: фоновый TryParse не читает файл сам (путь к нему строится через
+        // Application.dataPath — только главный поток); обновляется при старте и в плановой проверке Pump
+        private static volatile bool _directTcp;
 
         static NexusCliServer()
         {
@@ -212,7 +236,7 @@ namespace Exerussus.Nexus.Core
         /// Процесс импорта ассетов или batch mode (сборка, CI): у него тот же путь проекта — его файл экземпляра
         /// перетёр бы файл настоящего редактора, а выход удалил бы его. Такие процессы CLI не поднимают.
         /// </summary>
-        private static bool IsServiceProcess => Application.isBatchMode || AssetDatabase.IsAssetImportWorkerProcess();
+        internal static bool IsServiceProcess => Application.isBatchMode || AssetDatabase.IsAssetImportWorkerProcess();
         public static int Port => _port;
 
         /// <summary>Сведения для ping и Manage.</summary>
@@ -232,6 +256,7 @@ namespace Exerussus.Nexus.Core
                 try
                 {
                     Snapshot();
+                    _directTcp = NexusCliStore.DirectTcp;
                     _token = NewToken();
                     _listener = new TcpListener(IPAddress.Loopback, 0);
                     _listener.Start();
@@ -305,8 +330,7 @@ namespace Exerussus.Nexus.Core
             while (Queue.TryDequeue(out var p))
             {
                 p.Context.Error("Редактор " + reason + " — повторите команду.");
-                p.Response = new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = p.Context.Output, Project = _projectName };
-                p.Done.Set();
+                p.Answer(new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = p.Context.Output, Project = _projectName });
             }
 
             if (_instance != null)
@@ -506,6 +530,7 @@ namespace Exerussus.Nexus.Core
                 catch (Exception e)
                 {
                     NexusDiagnostics.Swallowed("CLI: подтверждение приёма", e);
+                    pending.Done.Dispose();   // в очередь не попал — событие только наше
                     return new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = "Соединение оборвалось.", Project = _projectName };
                 }
             }
@@ -514,14 +539,21 @@ namespace Exerussus.Nexus.Core
             lock (Gate)
             {
                 if (!_running)
+                {
+                    pending.Done.Dispose();
                     return new Response { ExitCode = NexusCommandContext.Exit.Busy, Output = "Редактор занят — повторите.", Project = _projectName };
+                }
                 Queue.Enqueue(pending);
             }
 
             var wait = request.Timeout > 0 ? Math.Min(request.Timeout, MaxWaitSeconds) : DefaultWaitSeconds;
-            if (!pending.Done.Wait(TimeSpan.FromSeconds(wait)))
+            var answered = pending.Done.Wait(TimeSpan.FromSeconds(wait));
+            if (!answered) pending.Context.MarkCancelled();
+            var response = pending.Response;
+            pending.Release();
+
+            if (!answered)
             {
-                pending.Context.MarkCancelled();
                 return new Response
                 {
                     ExitCode = NexusCommandContext.Exit.Timeout,
@@ -530,12 +562,13 @@ namespace Exerussus.Nexus.Core
                 };
             }
 
-            return pending.Response;
+            return response;
         }
 
         // ============================================================ общее для транспортов
 
-        /// <summary>Разобрать запрос и проверить токен. Можно звать с любого потока.</summary>
+        /// <summary>Разобрать запрос и проверить токен. Можно звать с любого потока: Unity API не трогает —
+        /// токен, имя проекта и DirectTcp заранее сняты в главном потоке.</summary>
         internal static bool TryParse(string json, out Request request, out Response error)
         {
             error = null;
@@ -560,14 +593,14 @@ namespace Exerussus.Nexus.Core
                 NexusDiagnostics.Trace("CLI", "отказ: неверный токен");
                 error = new Response
                 {
-                    Id = request.Id, ExitCode = NexusCommandContext.Exit.Usage, Project = _projectName,
+                    Id = request.Id, ExitCode = NexusCommandContext.Exit.Usage, Project = _projectName, Reason = "bad-token",
                     Output = "Неверный токен: клиент читает устаревший файл экземпляра — повторите.",
                 };
                 return false;
             }
 
             // команды идут через Nexus Daemon (блокировка задач, очередь, будильник); прямой TCP — только для отладки
-            if (!string.Equals(request.Client, "nexusd", StringComparison.Ordinal) && !NexusCliStore.DirectTcp)
+            if (!string.Equals(request.Client, "nexusd", StringComparison.Ordinal) && !_directTcp)
             {
                 error = new Response
                 {
@@ -678,6 +711,7 @@ namespace Exerussus.Nexus.Core
             if (now >= _nextDaemonCheck)
             {
                 _nextDaemonCheck = now + 30;
+                _directTcp = NexusCliStore.DirectTcp;
                 NexusPackageWatch.Check();
                 NexusCliDaemon.Ensure();
             }
@@ -686,22 +720,22 @@ namespace Exerussus.Nexus.Core
             {
                 if (p.Context.Cancelled)
                 {
-                    p.Response = new Response { ExitCode = NexusCommandContext.Exit.Timeout, Project = _projectName };
-                    p.Done.Set();
+                    p.Answer(new Response { ExitCode = NexusCommandContext.Exit.Timeout, Project = _projectName });
                     continue;
                 }
 
+                Response response;
                 try
                 {
-                    p.Response = Complete(p.Request, p.Context);
+                    response = Complete(p.Request, p.Context);
                 }
                 catch (Exception e)
                 {
                     NexusDiagnostics.Error("CLI: выполнение", e);
-                    p.Response = new Response { ExitCode = NexusCommandContext.Exit.Crashed, Output = "✗ " + e.Message, Project = _projectName };
+                    response = new Response { ExitCode = NexusCommandContext.Exit.Crashed, Output = "✗ " + e.Message, Project = _projectName };
                 }
 
-                p.Done.Set();
+                p.Answer(response);
             }
         }
 

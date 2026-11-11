@@ -24,9 +24,10 @@ namespace Exerussus.Nexus.Theme
     /// </remarks>
     public static class NexusTheme
     {
-        public const string UssDir = "Packages/com.exerussus.nexus/Editor/Theme/Uss";
-        public const string ComponentsUss = UssDir + "/NexusComponents.uss";
-        public const string TokensUss = UssDir + "/NexusTokens.uss";
+        /// <summary>Папка USS темы — от фактического корня движка (пакет или Assets), не захардкожена.</summary>
+        public static string UssDir => NexusThemePaths.UssDir;
+        public static string ComponentsUss => UssDir + "/NexusComponents.uss";
+        public static string TokensUss => UssDir + "/NexusTokens.uss";
 
         /// <summary>Класс корня, на котором живут переменные палитры.</summary>
         public const string RootClass = "nx-root";

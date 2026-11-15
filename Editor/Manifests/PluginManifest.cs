@@ -45,6 +45,15 @@ namespace Exerussus.Nexus.Manifests
         public int    Order    { get; set; }
         public string Icon     { get; set; }   // имя встроенной editor-иконки, опционально
 
+        /// <summary>Группа сайдбара по задаче («Магия», «Мир»…); пусто — раздел по <see cref="Category"/>.
+        /// Аддитивное поле 2.0.0-pre.15: старый хаб его не знает и сохраняет дословно.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+        public string Group      { get; set; }
+
+        /// <summary>Порядок группы в сайдбаре (меньше — выше); у групп без него — 500.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+        public int?   GroupOrder { get; set; }
+
         [JsonExtensionData]
         public IDictionary<string, JToken> Extra { get; set; }
     }

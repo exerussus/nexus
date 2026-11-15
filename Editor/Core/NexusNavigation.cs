@@ -19,8 +19,10 @@ namespace Exerussus.Nexus.Core
         /// <summary>Встроенная страница «Nexus Health».</summary>
         public const string HealthId = "::health";
 
-        /// <summary>Окно открыто и переключит страницу само (id, отдать ли окну фокус).</summary>
-        public static event Action<string, bool> Requested;
+        /// <summary>Окно открыто и переключит страницу само (id, отдать ли окну фокус, сразу ли).
+        /// «Сразу» — только для просьб снаружи страниц (команда page.open): просьбу самой страницы окно откладывает
+        /// до конца её обработчика, иначе OnExit освободил бы то, с чем обработчик ещё работает.</summary>
+        public static event Action<string, bool, bool> Requested;
 
         private static Action<bool> _openWindow;
 
@@ -111,13 +113,23 @@ namespace Exerussus.Nexus.Core
         /// фокус (по умолчанию нет: человек продолжает работать там, где был). false — причина в <paramref name="error"/>.
         /// </summary>
         public static bool Open(string query, bool focus, out string id, out string error)
+            => Open(query, focus, false, out id, out error);
+
+        /// <summary>
+        /// То же, но окно переключается СРАЗУ, не дожидаясь следующего тика: для команды page.open — фоновый редактор
+        /// следующего тика может не дождаться. Не звать из обработчиков страниц.
+        /// </summary>
+        public static bool OpenNow(string query, bool focus, out string id, out string error)
+            => Open(query, focus, true, out id, out error);
+
+        private static bool Open(string query, bool focus, bool immediate, out string id, out string error)
         {
             id = Resolve(query, out error);
             if (id == null) return false;
 
             if (Requested != null)
             {
-                Requested(id, focus);
+                Requested(id, focus, immediate);
                 return true;
             }
 

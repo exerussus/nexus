@@ -26,5 +26,11 @@ namespace Exerussus.Nexus.Core
         public string Category => Manifest?.Display?.Category ?? "Infrastructure";
 
         public int Order => Manifest?.Display?.Order ?? 0;
+
+        /// <summary>Группа сайдбара по задаче; null — страница идёт в раздел своей категории.</summary>
+        public string Group => string.IsNullOrWhiteSpace(Manifest?.Display?.Group) ? null : Manifest.Display.Group.Trim();
+
+        /// <summary>Порядок группы (меньше — выше); без него — 500.</summary>
+        public int GroupOrder => Manifest?.Display?.GroupOrder ?? 500;
     }
 }

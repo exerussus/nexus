@@ -459,15 +459,20 @@
 }
 
 .nx-sidebar {
-    width: 210px;
+    width: 232px;
     flex-shrink: 0;
     background-color: var(--nx-bg-soft);
     border-right-width: 1px;
     border-right-color: var(--nx-divider);
 }
 
-.nx-sidebar > .unity-scroll-view__content-viewport > .unity-scroll-view__content-container {
-    padding: 8px 6px;
+.nx-sidebar__list > .unity-scroll-view__content-viewport > .unity-scroll-view__content-container {
+    padding: 4px 6px 8px 6px;
+}
+
+.nx-sidebar__search {
+    margin: 8px 8px 2px 8px;
+    flex-shrink: 0;
 }
 
 .nx-side {

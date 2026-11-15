@@ -28,7 +28,7 @@ namespace Exerussus.Nexus.Core
         private static int Open(NexusCommandContext ctx)
         {
             var query = ctx.Arg(0) ?? throw new NexusCommandException("нужна страница: id или имя (page.list)");
-            if (!NexusNavigation.Open(query, ctx.Flag("focus"), out var id, out var error))
+            if (!NexusNavigation.OpenNow(query, ctx.Flag("focus"), out var id, out var error))
                 throw new NexusCommandException(error, NexusCommandContext.Exit.Failed);
             ctx.Print("✓ страница: " + id);
             ctx.Data = new { id };

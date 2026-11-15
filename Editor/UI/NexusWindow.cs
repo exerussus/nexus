@@ -40,6 +40,12 @@ namespace Exerussus.Nexus.UI
 
         private Dictionary<string, DiscoveredPlugin> _byId = new Dictionary<string, DiscoveredPlugin>();
 
+        // поиск страниц: текст фильтра живёт с окном (пересоздалось — поиск пуст, это нормально)
+        private TextField _search;
+        private string    _filter = string.Empty;
+        private readonly List<Foldout> _folds = new List<Foldout>(8);
+        private bool      _rendering;   // идёт RenderContent — просьбы о навигации откладываются
+
         // выбор живёт в сторе: окно пересоздаётся (максимизация Game/Scene, смена
         // раскладки, рекомпил), поэтому поле — лишь кэш последнего восстановленного значения
         private string _selectedId = NexusSelectionStore.ActiveId ?? HealthId;
@@ -60,17 +66,32 @@ namespace Exerussus.Nexus.UI
         [InitializeOnLoadMethod]
         private static void RegisterNavigation() => NexusNavigation.RegisterWindow(Open);
 
-        // просьба показать страницу: после текущего обработчика (страница могла попросить из своего OnEnter)
-        private void OnNavigate(string id, bool focus)
+        // просьба показать страницу. Команда page.open (immediate) — СРАЗУ: она приходит из насоса CLI, а фоновый
+        // редактор следующего тика (delayCall) может не дождаться — раньше ответ был «✓», а страница не менялась.
+        // Просьба самой страницы (клик, шина, OnEnter) — после её обработчика: иначе OnExit освободил бы то,
+        // с чем обработчик ещё работает, а контент перестраивался бы изнутри Activate.
+        private void OnNavigate(string id, bool focus, bool immediate)
         {
+            if (immediate && !_rendering)
+            {
+                if (focus) Focus();   // фокус — сразу: в фоне отложенный вызов может не выполниться
+                Navigate(id, focus);
+                return;
+            }
+
             EditorApplication.delayCall += () =>
             {
                 if (this == null) return;   // окно закрыли, пока ждали
-                if (_sidebar == null) NexusSelectionStore.ActiveId = id;   // ещё не построено — возьмёт при сборке
-                else Select(id);
                 if (focus) Focus();
-                else Repaint();
+                Navigate(id, focus);
             };
+        }
+
+        private void Navigate(string id, bool focus)
+        {
+            if (_sidebar == null) NexusSelectionStore.ActiveId = id;   // ещё не построено — возьмёт при сборке
+            else Select(id);
+            if (!focus) Repaint();
         }
 
         private void OnEnable()
@@ -180,12 +201,33 @@ namespace Exerussus.Nexus.UI
                 var body = new VisualElement { style = { flexDirection = FlexDirection.Row, flexGrow = 1f } };
                 root.Add(body);
 
-                // Сайдбар прокручивается целиком: разделы не растягиваются и не оставляют дыр.
+                // Колонка сайдбара: поиск сверху, ниже список, который прокручивается целиком.
+                var column = new VisualElement();
+                column.AddToClassList("nx-sidebar");
+                column.style.flexDirection = FlexDirection.Column;
+                body.Add(column);
+
+                _search = new TextField { value = _filter };
+                _search.AddToClassList("nx-input");
+                _search.AddToClassList("nx-sidebar__search");
+                _search.textEdition.placeholder = "Найти страницу…";
+                _search.textEdition.hidePlaceholderOnFocus = false;
+                _search.tooltip = "Поиск по названию и id страницы. Esc — очистить";
+                _search.RegisterValueChangedCallback(evt => { _filter = evt.newValue ?? string.Empty; ApplyFilter(); });
+                _search.RegisterCallback<KeyDownEvent>(evt =>
+                {
+                    if (evt.keyCode != KeyCode.Escape || string.IsNullOrEmpty(_search.value)) return;
+                    _search.value = string.Empty;
+                    evt.StopPropagation();
+                }, TrickleDown.TrickleDown);
+                column.Add(_search);
+
                 _sidebar = new ScrollView(ScrollViewMode.Vertical);
-                _sidebar.AddToClassList("nx-sidebar");
+                _sidebar.AddToClassList("nx-sidebar__list");
+                _sidebar.style.flexGrow = 1f;
                 // Палитра с моноширинными заголовками (Neon) — сайдбар тем же шрифтом, что и заголовки.
                 if (NexusTheme.Metrics.MonoTitles) NexusUi.ApplyMono(_sidebar);
-                body.Add(_sidebar);
+                column.Add(_sidebar);
 
                 _content = new VisualElement();
                 _content.AddToClassList("nx-content");
@@ -250,29 +292,40 @@ namespace Exerussus.Nexus.UI
             RebuildSidebar();
         }
 
-        // сайдбар: встроенный Health + два сворачиваемых раздела (Infrastructure / Game)
+        // сайдбар: встроенный Health + сворачиваемые разделы. Страница с display.group идёт в группу
+        // по задаче («Магия», «Мир»…; порядок групп — groupOrder), без группы — в раздел своей категории
+        // (Game, затем Infrastructure — в конце, как техническое).
         private void RebuildSidebar()
         {
             if (_sidebar == null) return;
             _sidebar.Clear();
             _byId.Clear();
+            _folds.Clear();
 
             _sidebar.Add(SidebarItem(HealthId, "Nexus Health"));
 
-            var infra = new List<DiscoveredPlugin>();
-            var game  = new List<DiscoveredPlugin>();
+            var sections = new List<SidebarSection>();
             foreach (var p in PluginDiscovery.Discover())
             {
                 if (p.Status != PluginStatus.Deployed) continue;
                 if (!NexusView.IsVisible(p.Id)) continue;     // сокрытые в сайдбар не попадают
                 _byId[p.Id] = p;
-                (IsGame(p.Category) ? game : infra).Add(p);
+
+                var title = p.Group ?? (IsGame(p.Category) ? "Game" : "Infrastructure");
+                var order = p.Group != null ? p.GroupOrder : IsGame(p.Category) ? 900 : 1000;
+                var section = sections.Find(x => x.Title == title);
+                if (section == null) sections.Add(section = new SidebarSection(title, order));
+                else if (order < section.Order) section.Order = order;
+                section.Items.Add(p);
             }
 
-            var infraSection = CategorySection("Infrastructure", infra);
-            if (infraSection != null) _sidebar.Add(infraSection);
-            var gameSection = CategorySection("Game", game);
-            if (gameSection != null) _sidebar.Add(gameSection);
+            sections.Sort((a, b) => a.Order != b.Order ? a.Order.CompareTo(b.Order) : string.CompareOrdinal(a.Title, b.Title));
+            foreach (var section in sections)
+            {
+                section.Items.Sort((a, b) => a.Order != b.Order ? a.Order.CompareTo(b.Order) : string.CompareOrdinal(a.DisplayName, b.DisplayName));
+                var fold = CategorySection(section.Title, section.Items);
+                if (fold != null) _sidebar.Add(fold);
+            }
 
             if (_byId.Count == 0)
             {
@@ -292,7 +345,76 @@ namespace Exerussus.Nexus.UI
             // восстановление не переписывает сохранённый выбор: страница может вернуться
             // (после Apply/рекомпила/показа), и тогда откроется именно она
             Select(_selectedId, persist: false);
+            ApplyFilter();
         }
+
+        private sealed class SidebarSection
+        {
+            public readonly string Title;
+            public int Order;
+            public readonly List<DiscoveredPlugin> Items = new List<DiscoveredPlugin>();
+
+            public SidebarSection(string title, int order)
+            {
+                Title = title;
+                Order = order;
+            }
+        }
+
+        // фильтр сайдбара: прячет непохожие страницы и пустые разделы; на время поиска разделы раскрыты,
+        // сохранённое состояние сворачивания не трогается
+        private void ApplyFilter()
+        {
+            if (_sidebar == null) return;
+            var q = _filter?.Trim() ?? string.Empty;
+            var searching = q.Length > 0;
+
+            foreach (var child in _sidebar.Children())
+            {
+                if (child is Foldout || child.userData == null) continue;   // подсказки без страницы фильтр не трогает
+                child.style.display = !searching || Matches(child, q) ? DisplayStyle.Flex : DisplayStyle.None;
+            }
+
+            var found = false;
+            foreach (var fold in _folds)
+            {
+                var any = false;
+                foreach (var item in fold.contentContainer.Children())
+                {
+                    var show = !searching || Matches(item, q);
+                    item.style.display = show ? DisplayStyle.Flex : DisplayStyle.None;
+                    any |= show;
+                }
+
+                fold.style.display = any ? DisplayStyle.Flex : DisplayStyle.None;
+                found |= any;
+                if (searching) fold.SetValueWithoutNotify(true);
+                else fold.SetValueWithoutNotify(SessionState.GetBool((string)fold.userData, true));
+            }
+
+            var none = _sidebar.Q<Label>("nx-search-none");
+            if (none == null)
+            {
+                none = new Label("Ничего не найдено") { name = "nx-search-none" };
+                none.style.color = TextDim;
+                none.style.marginLeft = 10f;
+                none.style.marginTop = 8f;
+                _sidebar.Add(none);
+            }
+
+            none.style.display = searching && !found && !Matches(_sidebar.Q("item-" + HealthId), q) ? DisplayStyle.Flex : DisplayStyle.None;
+        }
+
+        private bool Matches(VisualElement item, string q)
+        {
+            var id = item?.userData as string;
+            if (id == null) return false;
+            if (id.IndexOf(q, System.StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            var name = id == HealthId ? "Nexus Health" : _byId.TryGetValue(id, out var p) ? p.DisplayName : id;
+            return name.IndexOf(q, System.StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string FoldKey(string title) => "Exerussus.Nexus.fold." + title;
 
         private static bool IsGame(string category)
             => string.Equals(category, "Game", System.StringComparison.OrdinalIgnoreCase);
@@ -302,19 +424,27 @@ namespace Exerussus.Nexus.UI
         {
             if (items.Count == 0) return null;
 
-            var fold = new Foldout { text = NexusTheme.Metrics.UpperTitles ? title.ToUpperInvariant() : title };
+            var text = NexusTheme.Metrics.UpperTitles ? title.ToUpperInvariant() : title;
+            var fold = new Foldout { text = text };
             fold.AddToClassList("nx-section-fold");
-            var key = "Exerussus.Nexus.fold." + title;
+            var key = FoldKey(title);
+            fold.userData = key;
             fold.value = SessionState.GetBool(key, true);
-            fold.RegisterValueChangedCallback(evt => SessionState.SetBool(key, evt.newValue));
+            fold.RegisterValueChangedCallback(evt =>
+            {
+                // во время поиска разделы раскрыты принудительно — это не выбор человека
+                if (evt.target != fold || !string.IsNullOrWhiteSpace(_filter)) return;
+                SessionState.SetBool(key, evt.newValue);
+            });
 
             foreach (var p in items) fold.Add(SidebarItem(p.Id, p.DisplayName));
+            _folds.Add(fold);
             return fold;
         }
 
         private VisualElement SidebarItem(string id, string title)
         {
-            var item = new VisualElement { name = "item-" + id };
+            var item = new VisualElement { name = "item-" + id, userData = id };
             item.AddToClassList("nexus-item");
             item.AddToClassList("nx-side");
 
@@ -354,6 +484,13 @@ namespace Exerussus.Nexus.UI
         }
 
         private void RenderContent(string id)
+        {
+            _rendering = true;
+            try { RenderContentCore(id); }
+            finally { _rendering = false; }
+        }
+
+        private void RenderContentCore(string id)
         {
             _content.Clear();
             EnsureHost();

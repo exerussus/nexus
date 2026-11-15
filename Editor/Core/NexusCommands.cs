@@ -25,7 +25,31 @@ namespace Exerussus.Nexus.Core
         }
 
         /// <summary>Все команды по имени (первая с таким именем выигрывает, дубли — в предупреждения).</summary>
+        // СПИСОК КОМАНД — ОДИН РАЗ ЗА ДОМЕН (2026-11-15). Раньше он собирался рефлексией на КАЖДУЮ команду, включая ping
+        // сторожа демона раз в 2 с: ~7 мс и ~260 КБ мусора каждые 2 секунды — пики FPS даже в Edit Mode. Набор команд
+        // меняется только с перезагрузкой домена, а статика с ней обнуляется сама.
+        private static List<Info> _all;
+        private static List<string> _allWarnings;
+        private static Dictionary<string, Info> _byName;
+
         public static List<Info> All(List<string> warnings = null)
+        {
+            if (_all == null)
+            {
+                var found = new List<string>();
+                var built = Build(found);
+                var byName = new Dictionary<string, Info>(built.Count, StringComparer.OrdinalIgnoreCase);
+                foreach (var c in built) byName[c.Name] = c;
+                _all = built;
+                _allWarnings = found;
+                _byName = byName;
+            }
+
+            warnings?.AddRange(_allWarnings);
+            return _all;
+        }
+
+        private static List<Info> Build(List<string> warnings)
         {
             var list = new List<Info>
             {
@@ -97,12 +121,8 @@ namespace Exerussus.Nexus.Core
             Info command = null;
             try
             {
-                foreach (var c in All())
-                    if (string.Equals(c.Name, ctx.Name, StringComparison.OrdinalIgnoreCase))
-                    {
-                        command = c;
-                        break;
-                    }
+                All();
+                if (ctx.Name != null) _byName.TryGetValue(ctx.Name, out command);
             }
             catch (Exception e)
             {

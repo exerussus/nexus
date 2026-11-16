@@ -65,6 +65,18 @@ namespace Exerussus.Nexus.Core
         private static bool _ticking;
         private static bool _active;
 
+        // Фаза меняется хоть каждый кадр (wait --frames, play.step, задача над таким шагом) — её
+        // изменение сохраняется не чаще PhaseSaveInterval. Раньше она ставила _dirty, и Tick каждый кадр
+        // сериализовал ВСЕ задания (до 50 завершённых с выводом) в SessionState. Сохранность параметров
+        // перед перезагрузкой домена держит безусловный Save в beforeAssemblyReload / Deactivate(true).
+        private static bool _phaseDirty;
+        private static double _lastSave;
+        private const double PhaseSaveInterval = 2.0;
+
+        /// <summary>Порог для сохраняемой копии: длинный Output завершённого задания режется (голова + хвост),
+        /// большие Data заменяются пометкой. В памяти остаётся полный текст (job.status, проверки задач).</summary>
+        private const int MaxStoredChars = 256 * 1024;
+
         public static double Now => EditorApplication.timeSinceStartup;
 
         /// <summary>Обработчик вида задания: вызывается каждый кадр, пока задание идёт. Регистрируется на загрузке домена.</summary>
@@ -185,7 +197,7 @@ namespace Exerussus.Nexus.Core
         {
             if (job == null || job.Done || string.Equals(job.Phase, phase, StringComparison.Ordinal)) return;
             job.Phase = phase;
-            _dirty = true;
+            _phaseDirty = true;
         }
 
         /// <summary>Отметить изменение полей задания (сохраняется в конце кадра).</summary>
@@ -218,6 +230,9 @@ namespace Exerussus.Nexus.Core
         internal static void Activate()
         {
             _active = true;
+            // своя подписка: сохранить перед перезагрузкой, даже если остановка сервера сорвётся раньше
+            AssemblyReloadEvents.beforeAssemblyReload -= SaveBeforeReload;
+            AssemblyReloadEvents.beforeAssemblyReload += SaveBeforeReload;
             var now = Now;
             foreach (var j in Jobs)
                 if (!j.Done)
@@ -231,10 +246,12 @@ namespace Exerussus.Nexus.Core
         {
             _active = false;
             StopTicking();
+            AssemblyReloadEvents.beforeAssemblyReload -= SaveBeforeReload;
 
             if (reloading)
             {
-                if (_dirty) Save();
+                // безусловно: часть обработчиков меняет Params без Touch (play.step, wait, play.start…)
+                if (_jobs != null) Save();
                 return;
             }
 
@@ -303,8 +320,13 @@ namespace Exerussus.Nexus.Core
                 if (!job.Done) any = true;
             }
 
-            if (_dirty) Save();
+            if (_dirty || (_phaseDirty && now - _lastSave >= PhaseSaveInterval)) Save();
             if (!any && Running() == null) StopTicking();
+        }
+
+        private static void SaveBeforeReload()
+        {
+            if (_active && _jobs != null) Save();
         }
 
         private static void Abort(NexusCliJob job, int exitCode, string reason)
@@ -349,15 +371,49 @@ namespace Exerussus.Nexus.Core
         public static void Save()
         {
             _dirty = false;
+            _phaseDirty = false;
+            _lastSave = Now;
             try
             {
                 Trim();
-                SessionState.SetString(StoreKey, JsonConvert.SerializeObject(Jobs, Formatting.None));
+                SessionState.SetString(StoreKey, JsonConvert.SerializeObject(ForStore(), Formatting.None));
             }
             catch (Exception e)
             {
                 NexusDiagnostics.Error("CLI: сохранение заданий", e);
             }
+        }
+
+        /// <summary>Список для сохранения: завершённые задания с огромным Output/Data — урезанные копии.</summary>
+        private static List<NexusCliJob> ForStore()
+        {
+            var jobs = Jobs;
+            List<NexusCliJob> copy = null;
+            for (var i = 0; i < jobs.Count; i++)
+            {
+                var j = jobs[i];
+                if (!j.Done) continue;
+                var bigOutput = j.Output != null && j.Output.Length > MaxStoredChars;
+                var bigData = j.Data != null && j.Data.Length > MaxStoredChars;
+                if (!bigOutput && !bigData) continue;
+
+                copy ??= new List<NexusCliJob>(jobs);
+                copy[i] = new NexusCliJob
+                {
+                    Id = j.Id, Kind = j.Kind, Done = j.Done, ExitCode = j.ExitCode, Phase = j.Phase,
+                    StartedAt = j.StartedAt, Deadline = j.Deadline, Anchor = j.Anchor, LogSeq = j.LogSeq, Params = j.Params,
+                    Output = bigOutput ? CutMiddle(j.Output) : j.Output,
+                    Data = bigData ? JsonConvert.SerializeObject(new { dataOmitted = true, chars = j.Data.Length }) : j.Data,
+                };
+            }
+
+            return copy ?? jobs;
+        }
+
+        private static string CutMiddle(string s)
+        {
+            var half = MaxStoredChars / 2;
+            return s.Substring(0, half) + $"\n… (обрезано при перезагрузке домена: {s.Length - 2 * half} символов) …\n" + s.Substring(s.Length - half);
         }
 
         private static List<NexusCliJob> Load()

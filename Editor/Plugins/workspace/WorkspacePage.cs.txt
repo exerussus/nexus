@@ -82,7 +82,9 @@ namespace Exerussus.Nexus.Pages.Workspace
             _scaleSlider.RegisterValueChangedCallback(evt => ApplyScale(evt.newValue));
 
             _search = _root.Q<TextField>("ws-search");
-            _search.RegisterValueChangedCallback(evt => { _filter = evt.newValue ?? ""; RebuildGroups(); });
+            // Поиск — с задержкой: полная пересборка разрешает каждую карточку (объекты сцены,
+            // сабассеты, миниатюры), на каждое нажатие клавиши это было слишком дорого.
+            _search.RegisterValueChangedCallback(evt => { _filter = evt.newValue ?? ""; ScheduleRebuild(); });
 
             // Дроп в свободную область списка → добавить в первую группу.
             RegisterGroupDrop(_groupsContainer, () => _store.EnsureAtLeastOneGroup(), () => -1);
@@ -95,7 +97,8 @@ namespace Exerussus.Nexus.Pages.Workspace
         public override void OnEnter()
         {
             // Данные уже загружены в OnInitialize — здесь только лёгкая отрисовка «пока видно».
-            RebuildGroups();
+            // Через дебаунс: OnEnter и следом OnFocus (и BuildUI при первом открытии) схлопываются в одну пересборку.
+            ScheduleRebuild();
         }
 
         public override void OnExit()
@@ -109,7 +112,7 @@ namespace Exerussus.Nexus.Pages.Workspace
         {
             // Высокочастотная работа — отслеживание изменений иерархии/сцен — только в фокусе.
             HookEditorEvents();
-            RebuildGroups(); // догнать изменения, случившиеся пока вкладка была не в фокусе
+            ScheduleRebuild(); // догнать изменения, случившиеся пока вкладка была не в фокусе (каждый клик в окно)
         }
 
         public override void OnUnfocus()
@@ -184,8 +187,10 @@ namespace Exerussus.Nexus.Pages.Workspace
         private void ScheduleRebuild()
         {
             if (_root == null) return;
-            _rebuildJob?.Pause();
-            _rebuildJob = _root.schedule.Execute(RebuildGroups).StartingIn(120);
+            // один запланированный элемент на страницу: ExecuteLater переносит его срок,
+            // а не плодит новый на каждое событие иерархии
+            _rebuildJob ??= _root.schedule.Execute(RebuildGroups);
+            _rebuildJob.ExecuteLater(120);
         }
 
         // ---------- Масштаб карточек ----------

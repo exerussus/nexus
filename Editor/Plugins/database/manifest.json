@@ -2,7 +2,7 @@
     "schemaVersion": 1,
     "guid": "10be084a784e4b39a54bf1814d86b8a9",
     "id": "database",
-    "version": "1.0",
+    "version": "1.1",
     "typeName": "Exerussus.Nexus.Pages.DataBaseEditor.DataBasePage",
     "display": {
         "name": "DB",

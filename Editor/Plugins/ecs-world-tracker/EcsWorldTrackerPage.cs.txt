@@ -84,16 +84,18 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
 
         public override void OnEnter() { _link.Bind(); Hook(); EnsureHost(); _lastTick = 0; RefreshAll(); }
         public override void OnExit() { Unhook(); }
-        public override void OnFocus() { _focused = true; _link.SetProbeActive(true); UpdateToolInfo(); }
-        public override void OnUnfocus() { _focused = false; _link.SetProbeActive(false); UpdateToolInfo(); }
+        // Без фокуса обзор НЕ останавливается (в Play фокус у Game view, а мир смотрят именно
+        // тогда — исключение из инварианта OnUnfocus, см. IEditorPage), а реже обновляется: ≤ 1 Гц.
+        public override void OnFocus() { _focused = true; UpdateToolInfo(); }
+        public override void OnUnfocus() { _focused = false; UpdateToolInfo(); }
         public override void OnRefresh() => RefreshAll();
         public override bool CanClose() => true;
         public override void OnPrePack() => SavePrefs();
-        protected override void OnDisposing() { Unhook(); _link.SetProbeActive(false); }
+        protected override void OnDisposing() { Unhook(); }
 
         // Дубль подписки на случай, если хаб не звал OnEnter: attach шлёт сам UI Toolkit.
-        void OnAttach(AttachToPanelEvent _) { _link.Bind(); Hook(); EnsureHost(); _lastTick = 0; RefreshAll(); }
-        void OnDetach(DetachFromPanelEvent _) { Unhook(); _host = null; _link.SetProbeActive(false); }
+        void OnAttach(AttachToPanelEvent _) { _link.Bind(); Hook(); _host = null; _hostSearched = false; EnsureHost(); _lastTick = 0; RefreshAll(); }
+        void OnDetach(DetachFromPanelEvent _) { Unhook(); _host = null; _hostSearched = false; }
 
         void Hook() {
             EditorApplication.update -= Tick; EditorApplication.update += Tick;
@@ -104,7 +106,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             EditorApplication.playModeStateChanged -= OnPlayMode;
         }
 
-        void OnPlayMode(PlayModeStateChange _) { _host = null; RefreshAll(); RepaintHost(); }
+        void OnPlayMode(PlayModeStateChange _) { _host = null; _hostSearched = false; RefreshAll(); RepaintHost(); }
 
         // Тик из EditorApplication.update: гонит логику И принудительно перерисовывает
         // окно-хост. Без Repaint изменения видны только после клика — окно UITK само
@@ -112,19 +114,27 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         void Tick() {
             if (_intervalMs <= 0 || _tab != Tab.Overview) return;
             var now = EditorApplication.timeSinceStartup;
-            if (now - _lastTick < _intervalMs / 1000.0) return;
+            var interval = _focused ? _intervalMs : Math.Max(_intervalMs, 1000);
+            if (now - _lastTick < interval / 1000.0) return;
             _lastTick = now;
+            // Миров нет и это уже показано — обновлять и перерисовывать нечего (обычный Edit Mode).
+            if (_link.Available && _worldPane != null && _worldsShape == EmptyWorldsShape && _link.WorldCount() == 0) return;
             RefreshDynamic();
             RepaintHost();
         }
 
         // Находит EditorWindow, в дереве которого лежит наш корень, и красит его —
         // даже без фокуса. EditorWindow — Unity API, не внутренности Nexus: изоляция цела.
+        // Окно-хост ищется по панели: корень окна (rootVisualElement) — не корень панели, у него
+        // есть родители в DockArea, поэтому прежнее сравнение с самым верхним предком не срабатывало
+        // никогда и полный перебор окон шёл на каждом тике. Неудача запоминается до attach/смены Play.
+        bool _hostSearched;
         void EnsureHost() {
-            if (_host != null || _root == null) return;
-            var top = _root; while (top.parent != null) top = top.parent;
+            if (_host != null || _hostSearched || _root?.panel == null) return;
+            _hostSearched = true;
+            var panel = _root.panel;
             foreach (var w in Resources.FindObjectsOfTypeAll<EditorWindow>())
-                if (w != null && w.rootVisualElement == top) { _host = w; return; }
+                if (w != null && w.rootVisualElement?.panel == panel) { _host = w; return; }
         }
         void RepaintHost() {
             EnsureHost();
@@ -193,7 +203,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             _worldPane.Add(Title("WORLDS"));
             if (!_link.Available) { _worldsShape = null; _worldPane.Add(Empty("ECS-ядро не найдено.\nОткрой «Настройки» → «Развернуть ядро», затем войди в play mode.")); return; }
             var n = _link.WorldCount();
-            if (n == 0) { _worldsShape = "0"; _worldPane.Add(Empty("Живых миров нет.\nВойди в play mode — миры регистрируются сами.")); _worldIndex = -1; return; }
+            if (n == 0) { _worldsShape = EmptyWorldsShape; _worldPane.Add(Empty("Живых миров нет.\nВойди в play mode — миры регистрируются сами.")); _worldIndex = -1; return; }
             if (_worldIndex < 0 || _worldIndex >= n) _worldIndex = ResolveWorldIndex(n);
 
             string curGroup = null;
@@ -211,6 +221,10 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         // «форма» списка миров: количество + метки. Пересобираем строки (в них клик) только при её смене.
+        // Должно совпадать с WorldsShape(0): раньше тут стояло "0" против "0|" — пустой мир
+        // пересобирался на каждом тике.
+        const string EmptyWorldsShape = "0|";
+
         string WorldsShape(int n) {
             var parts = new string[n];
             for (var i = 0; i < n; i++) parts[i] = _link.WorldLabel(i);
@@ -220,7 +234,9 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         void UpdateWorldsLive() {
             if (_worldPane == null || !_link.Available) return;
             var n = _link.WorldCount();
-            if (WorldsShape(n) != _worldsShape) { RefreshWorlds(); return; }   // редко: набор миров изменился
+            // редко: набор миров изменился — пересобрать все три панели: миры, появившиеся после
+            // входа в Play, иначе оставляли сущности пустыми (RefreshEntities не звался)
+            if (WorldsShape(n) != _worldsShape) { RefreshWorlds(); RefreshEntities(); RefreshInspector(); return; }
             if (_worldStatsHost != null && _worldIndex >= 0 && _worldIndex < n) {
                 _worldStatsHost.Clear();
                 _worldStatsHost.Add(WorldStatsCard(_worldIndex));             // без кнопок — строки миров не трогаем
@@ -269,6 +285,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         void RefreshEntities() {
             if (_entityPane == null) return;
             _entityPane.Clear();
+            _entityList = null;   // прежний ListView отсоединён — тик не должен гонять запрос в него
             _entityPane.Add(Title("ENTITIES"));
             if (!_link.Available || _worldIndex < 0) { _entityPane.Add(Empty("—")); return; }
             _entityPane.Add(ViewTabs());
@@ -536,7 +553,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         }
 
         VisualElement SettingsRefresh() {
-            var card = SettingsCard("Автообновление", "Обновляет данные, пока окно открыто — даже без фокуса. «Вручную» отключает автообновление (работает кнопка Refresh).");
+            var card = SettingsCard("Автообновление", "Обновляет данные, пока окно открыто — даже без фокуса (тогда не чаще 1 Гц). «Вручную» отключает автообновление (работает кнопка Refresh).");
 
             var presets = Context.Ui.Segmented(PresetLabels, Array.IndexOf(PresetMs, _intervalMs), i => { _intervalMs = PresetMs[i]; _lastTick = 0; UpdateToolInfo(); Render(); });
             presets.AddToClassList("ecs-presets");
@@ -667,6 +684,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
                 _view = (View)Mathf.Clamp(p.view, 0, 2);
                 // старые префы (schema<2) игнорируем по частоте — там 0 остался от прежнего дефолта
                 _intervalMs = p.schema >= PrefsSchema ? p.intervalMs : 1000;
+                if (_intervalMs > 0) _intervalMs = Math.Max(MinIntervalMs, _intervalMs);   // 0 — «вручную»
             } catch { }
         }
 
@@ -711,8 +729,8 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
     // страницы (не static-сервис), инвариант Nexus соблюдён.
     sealed class EcsBridgeLink {
         public const char US = '\u001F';
-        Type _bridge, _probe;
-        FieldInfo _active;
+        Type _bridge;
+        PropertyInfo _worldCount;
         readonly Dictionary<string, MethodInfo> _m = new Dictionary<string, MethodInfo>();
         bool _bound;
 
@@ -721,14 +739,11 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
         public void Bind() {
             if (_bound) return; _bound = true;
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()) {
-                if (_bridge == null) _bridge = asm.GetType("Exerussus.EcsLite.EcsEditorBridge", false);
-                if (_probe == null) _probe = asm.GetType("Exerussus.EcsLite.EcsEditorProbe", false);
-                if (_bridge != null && _probe != null) break;
+                _bridge = asm.GetType("Exerussus.EcsLite.EcsEditorBridge", false);
+                if (_bridge != null) break;
             }
-            if (_probe != null) _active = _probe.GetField("Active", BindingFlags.Public | BindingFlags.Static);
+            _worldCount = _bridge?.GetProperty("WorldCount", BindingFlags.Public | BindingFlags.Static);
         }
-
-        public void SetProbeActive(bool v) { try { _active?.SetValue(null, v); } catch { } }
 
         MethodInfo M(string name) {
             if (_bridge == null) return null;
@@ -736,9 +751,7 @@ namespace Exerussus.Nexus.Pages.EcsWorldTracker {
             mi = _bridge.GetMethod(name, BindingFlags.Public | BindingFlags.Static); _m[name] = mi; return mi;
         }
         object Call(string name, params object[] args) { try { return M(name)?.Invoke(null, args); } catch { return null; } }
-        object Prop(string name) { try { return _bridge?.GetProperty(name, BindingFlags.Public | BindingFlags.Static)?.GetValue(null); } catch { return null; } }
-
-        public int WorldCount() => Prop("WorldCount") as int? ?? 0;
+        public int WorldCount() { try { return _worldCount?.GetValue(null) as int? ?? 0; } catch { return 0; } }
         public string WorldLabel(int i) => Call("WorldLabel", i) as string ?? "?";
         public string WorldGroup(int i) => Call("WorldGroup", i) as string ?? "";
         public string WorldName(int i) => Call("WorldName", i) as string ?? "?";

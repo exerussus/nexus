@@ -259,9 +259,13 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
         // -- Rebuild ---------------------------------------------------------
 
         /// <summary>Graph data path, called from <see cref="Rebuild"/>.</summary>
+        // Чипы графа — только при смене набора дорожек; клики пересобирают их сами.
+        private int _graphChipsTrackCount = -1;
+        private SignalTimelineModel _graphChipsModel;
+
         private void RebuildGraph(SignalTimelineModel m)
         {
-            RebuildGraphFilterChips();
+            if (_graphChipsTrackCount != m.Tracks.Count || !ReferenceEquals(_graphChipsModel, m)) RebuildGraphFilterChips();
             BuildGraphForest(m);
 
             bool empty = _gBands.Count == 0;
@@ -580,6 +584,8 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             _graphFilterChips.Clear();
 
             var model = SignalRegistry.Model;
+            _graphChipsTrackCount = model.Tracks.Count;
+            _graphChipsModel      = model;
 
             var allChip = new VisualElement();
             allChip.AddToClassList("stp-list-col-chip");

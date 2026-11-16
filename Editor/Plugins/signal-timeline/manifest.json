@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "guid": "d3bd087c72054d5e97d694ac77c8d497",
   "id": "signal-timeline",
-  "version": "2.0",
+  "version": "2.1",
   "typeName": "Exerussus.Nexus.Pages.SignalTimeline.SignalTimelinePage",
   "display": {
     "name": "Signals",

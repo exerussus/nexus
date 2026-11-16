@@ -252,6 +252,8 @@ namespace Exerussus.Nexus.Pages.Workspace
             _ => ""
         };
 
+        private readonly Dictionary<string, Type> _typeByName = new Dictionary<string, Type>(StringComparer.Ordinal);
+
         private string ShortTypeName(WorkspaceEntry entry)
         {
             if (entry.kind == WorkspaceEntryKind.ExternalFile)
@@ -261,7 +263,10 @@ namespace Exerussus.Nexus.Pages.Workspace
             }
             if (!string.IsNullOrEmpty(entry.cachedTypeName))
             {
-                var type = Type.GetType(entry.cachedTypeName);
+                // Type.GetType по assembly-qualified имени дорогой, а зовётся на каждую карточку
+                // при каждой пересборке и в фильтре — запоминаем на жизнь страницы (домен).
+                if (!_typeByName.TryGetValue(entry.cachedTypeName, out var type))
+                    _typeByName[entry.cachedTypeName] = type = Type.GetType(entry.cachedTypeName);
                 if (type != null) return type.Name;
                 int comma = entry.cachedTypeName.IndexOf(',');
                 string full = comma > 0 ? entry.cachedTypeName.Substring(0, comma) : entry.cachedTypeName;

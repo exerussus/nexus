@@ -62,6 +62,7 @@ namespace Exerussus.Nexus.Core
         {
             var plan = new ApplyPlan { ById = PluginDiscovery.Discover().ToDictionary(d => d.Id) };
             if (intents == null) return plan;
+            var packages = PackageRegistry.Snapshot();   // один снимок установленного на весь план
 
             foreach (var it in intents)
             {
@@ -76,7 +77,7 @@ namespace Exerussus.Nexus.Core
                 }
 
                 // deploy: сперва dependency-gate (уровень 1). Не сходится — не разворачиваем.
-                var gate = DependencyGate.Check(dp?.Manifest);
+                var gate = DependencyGate.Check(dp?.Manifest, packages);
                 if (gate.Count > 0)
                 {
                     NexusDiagnostics.Trace("Gate", $"'{it.Id}' отклонён: {string.Join("; ", gate)}");
@@ -85,10 +86,11 @@ namespace Exerussus.Nexus.Core
                 }
 
                 // нет нужного UPM-пакета → не деплоим сейчас, уводим в двухфазную установку
-                if (dp != null && DependencyGate.MissingPackages(dp.Manifest).Count > 0)
+                var missing = dp != null ? DependencyGate.MissingPackages(dp.Manifest, packages) : null;
+                if (missing != null && missing.Count > 0)
                 {
                     NexusDiagnostics.Trace("Gate",
-                        $"'{it.Id}' ждёт UPM-пакеты: {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest).Select(p => p.Name))}");
+                        $"'{it.Id}' ждёт UPM-пакеты: {string.Join(", ", missing.Select(p => p.Name))}");
                     plan.NeedsPackages.Add(dp);
                     continue;
                 }
@@ -98,8 +100,8 @@ namespace Exerussus.Nexus.Core
                 // пакет, объявленный странице, но уже присутствующий в проекте (не через manifest) — отметим
                 foreach (var p in dp?.Manifest?.PackageRequires ?? Enumerable.Empty<PackageDependency>())
                 {
-                    if (string.IsNullOrEmpty(p?.Name) || PackageRegistry.Has(p.Name)) continue;
-                    var src = PackageRegistry.LocalSource(p);
+                    if (string.IsNullOrEmpty(p?.Name) || packages.Has(p.Name)) continue;
+                    var src = PackageRegistry.LocalSource(p, packages);
                     if (src != null)
                         plan.LocalNotes.Add($"«{name}»: пакет {p.Name} уже в проекте ({src}) — git-установка не требуется");
                 }
@@ -131,8 +133,11 @@ namespace Exerussus.Nexus.Core
 
         /// <summary>Строки «• «имя» → пакеты» для страниц, ждущих UPM-пакетов.</summary>
         public static IEnumerable<string> PackageLines(ApplyPlan plan)
-            => plan.NeedsPackages.Select(dp =>
-                $"• «{dp.DisplayName}» → {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest).Select(p => p.Name))}");
+        {
+            var packages = PackageRegistry.Snapshot();
+            return plan.NeedsPackages.Select(dp =>
+                $"• «{dp.DisplayName}» → {string.Join(", ", DependencyGate.MissingPackages(dp.Manifest, packages).Select(p => p.Name))}").ToList();
+        }
 
         /// <summary>
         /// Файловая часть Apply по готовому плану — без диалогов и без Refresh (их делает вызывающий).

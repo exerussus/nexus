@@ -110,10 +110,18 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
         private VisualElement  _listFilterChips;      // master + per-signal toggle chips
         private VisualElement  _listColChips;         // toggleable column chips
         private VisualElement  _listHeader;           // sticky header row
-        private ScrollView     _listScroll;           // vertical scroll holding the rows
-        private VisualElement  _listContent;          // == _listScroll.contentContainer
+        private ListView       _listScroll;           // виртуализированный список строк (itemsSource = _listItems)
         private readonly List<SignalClusterPopup.ClusterEntry> _listItems
             = new List<SignalClusterPopup.ClusterEntry>();
+        // Чипы фильтра пересобираются только при смене числа дорожек (или по клику), не на каждый тик.
+        private int _listChipsTrackCount = -1;
+        private SignalTimelineModel _listChipsModel;
+
+        // Высота строки списка: .stp-popup-row 24px + margin-bottom 2px.
+        private const float ListRowHeight = 26f;
+
+        private static readonly Comparison<SignalClusterPopup.ClusterEntry> BySequence =
+            (a, b) => a.Ev.Sequence.CompareTo(b.Ev.Sequence);
 
         // Filter state. _listAllSignalsEnabled is a sticky master switch:
         // while true, every track is shown including future ones (i.e. new
@@ -131,6 +139,10 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
         {
             public int TrackId;
             public int Sequence;
+            public int Index = -1;
+            public string DotKindClass;
+            public Label Signal, Kind, Time, Type, Payload, Loc;
+            public VisualElement KindBox, Dot, Badge;
         }
 
         // Detail panel
@@ -164,6 +176,15 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
         private int    _lastModelVersion = -1;
         private bool   _dirty;
         private IVisualElementScheduledItem _tick;
+
+        // Адаптивный тик: следующая пересборка не раньше, чем через 5× время прошлой
+        // (100–500 мс); без фокуса окна — не чаще раза в 250 мс, Graph — в 500 мс.
+        // Без фокуса страница НЕ останавливается: в Play фокус у Game view, а таймлайн
+        // смотрят именно тогда (исключение из инварианта OnUnfocus — см. IEditorPage).
+        private bool   _focused = true;
+        private double _nextRebuildAt;
+        private double _lastRebuildMs;
+        private bool?  _shownEnabled;   // какое состояние трекинга сейчас отражено в UI
 
         // View-mode state (persisted via SessionState).
         private ViewMode _viewMode          = ViewMode.Timeline;
@@ -435,7 +456,10 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
                 SessionState.SetFloat(Context.GetSessionKey(KeyScrollX), v);
                 UpdateAxisLabels();
                 _axisStrip.MarkDirtyRepaint();
+                // ручной масштаб: маркеры отсечены по видимой области — дорисовать новую
+                if (!_autoFit) RequestCullRebuild();
             };
+            _hScroll.RegisterCallback<GeometryChangedEvent>(_ => { if (!_autoFit) RequestCullRebuild(); });
             // Sync vertical: lanes scrollbar is master, labels follow.
             _hScroll.verticalScroller.valueChanged += v =>
             {
@@ -622,12 +646,29 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
                               StatusKind.Info);
         }
 
-        private void OnRegistryChanged()
+        // Вызывается на КАЖДОЕ записанное событие и изнутри finally у AppSignals.Raise —
+        // только флаг; смену IsEnabled отражает Tick (см. _shownEnabled).
+        private void OnRegistryChanged() => _dirty = true;
+
+        // Прокрутка/размер при ручном масштабе: маркеры строятся только для видимой области. Тик на
+        // паузе пересборку не делает — тогда пересобрать отдельно (одним отложенным элементом).
+        private IVisualElementScheduledItem _cullRebuild;
+
+        private void RequestCullRebuild()
         {
             _dirty = true;
-            // IsEnabled is changed via Changed too — reflect it in the toggle.
-            UpdateTrackingToggleVisualState();
+            if (!_paused || _root == null || _viewMode != ViewMode.Timeline) return;
+            _cullRebuild ??= _root.schedule.Execute(() => { if (_paused && !_autoFit) Rebuild(); });
+            _cullRebuild.ExecuteLater(50);
         }
+
+        public override void OnFocus()
+        {
+            _focused = true;
+            _dirty   = true;
+        }
+
+        public override void OnUnfocus() => _focused = false;
 
         private void OnPlayModeChanged(PlayModeStateChange _) => UpdateTrackingToggleVisualState();
 
@@ -668,13 +709,33 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
 
         private void Tick()
         {
+            // Трекинг могли переключить не кнопкой (инспектор SignalsConfig) — показать это.
+            bool enabled = SignalRegistry.IsEnabled;
+            if (_shownEnabled != enabled)
+            {
+                _shownEnabled = enabled;
+                ApplyTrackingState();
+            }
+
             if (_paused) return;
-            if (!SignalRegistry.IsEnabled) return;
+            if (!enabled) return;
             var m = SignalRegistry.Model;
             if (!_dirty && m.Version == _lastModelVersion) return;
+
+            double now = EditorApplication.timeSinceStartup;
+            if (now < _nextRebuildAt) return;
+
             _dirty = false;
             _lastModelVersion = m.Version;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             Rebuild();
+            _lastRebuildMs = sw.Elapsed.TotalMilliseconds;
+
+            double interval = Math.Min(500.0, Math.Max(100.0, _lastRebuildMs * 5.0));
+            if (!_focused) interval = Math.Max(interval, 250.0);
+            if (_viewMode == ViewMode.Graph) interval = Math.Max(interval, 500.0);
+            _nextRebuildAt = now + interval / 1000.0;
         }
 
         // -- Rebuild ----------------------------------------------------------
@@ -720,12 +781,16 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
                     UpdateTrackLabel(_labelsColumn.contentContainer[i] as VisualElement, m.Tracks[i]);
             }
 
-            // Rebuild lanes content: clear and re-add. For a few dozen signals
-            // and a few thousand markers this is fast enough; if we ever need
-            // to scale, switch to pooled children.
-            _lanesContent.Clear();
+            // Дорожки и маркеры переиспользуются (пул по индексу): раньше всё
+            // пересоздавалось раз в 100 мс — мусор, перерасчёт вёрстки и клики,
+            // терявшиеся между нажатием и отпусканием на пересозданном маркере.
+            while (_lanesContent.childCount > m.Tracks.Count)
+                _lanesContent.RemoveAt(_lanesContent.childCount - 1);
             for (int i = 0; i < m.Tracks.Count; i++)
-                _lanesContent.Add(BuildLane(m.Tracks[i], i, contentWidth));
+            {
+                var lane = i < _lanesContent.childCount ? _lanesContent[i] : AddLane();
+                UpdateLane(lane, m.Tracks[i], contentWidth);
+            }
 
             _lanesContent.MarkDirtyRepaint();
             UpdateAxisLabels();
@@ -867,17 +932,27 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             // the scrollbar showing without a working thumb (the ScrollView
             // grows to fit all rows, so viewport == content, so nothing to
             // scroll). The geometry callback bypasses that fragility entirely.
-            _listScroll = new ScrollView(ScrollViewMode.Vertical);
+            // ListView с фиксированной высотой строки: строятся только видимые строки.
+            // Высота самого списка по-прежнему задаётся явно (UpdateListScrollHeight) —
+            // flex-цепочка глубиной в четыре уровня ненадёжна, это касается и ListView.
+            _listScroll = new ListView
+            {
+                fixedItemHeight      = ListRowHeight,
+                virtualizationMethod = CollectionVirtualizationMethod.FixedHeight,
+                selectionType        = SelectionType.None,   // своё выделение (stp-list-row--selected)
+                itemsSource          = _listItems,
+                makeItem             = MakeListRow,
+                bindItem             = BindListRow,
+                horizontalScrollingEnabled = false,
+            };
             _listScroll.AddToClassList("stp-list");
             _listScroll.style.flexGrow   = 0;
             _listScroll.style.flexShrink = 0;
-            _listScroll.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
             // AlwaysVisible (not Auto): in some Unity versions the Auto mode
             // misses the first overflow and never shows the scrollbar until
-            // the user resizes the window. AlwaysVisible removes that class
-            // of bug and the slider is a useful affordance anyway.
-            _listScroll.verticalScrollerVisibility = ScrollerVisibility.AlwaysVisible;
-            _listContent = _listScroll.contentContainer;
+            // the user resizes the window.
+            var listInner = _listScroll.Q<ScrollView>();
+            if (listInner != null) listInner.verticalScrollerVisibility = ScrollerVisibility.AlwaysVisible;
             _listSection.Add(_listScroll);
 
             // Section geometry → scroll height. Fires whenever the section's
@@ -1036,6 +1111,8 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             _listFilterChips.Clear();
 
             var model = SignalRegistry.Model;
+            _listChipsTrackCount = model.Tracks.Count;
+            _listChipsModel      = model;   // вход в Play / Clear all — новая модель с тем же числом дорожек
 
             // ---- Master "All" chip. Styled the same as the others but with
             //      a distinct class so it can read slightly more prominent.
@@ -1207,47 +1284,32 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
                     _listItems.Add(new SignalClusterPopup.ClusterEntry(tr, ev));
                 }
             }
-            _listItems.Sort((a, b) => a.Ev.Sequence.CompareTo(b.Ev.Sequence));
+            // Сортировка нужна: внутри дорожки Sequence не монотонен (вложенные Raise того же id).
+            _listItems.Sort(BySequence);
 
-            // Track list may have grown/shrunk — keep the chip strip in
-            // sync (also makes name changes propagate without a special
-            // path). Cheap: handful of chips per signal.
-            RebuildListFilterChips();
+            // Чипы — только когда набор дорожек сменился (ClearAll, новый сигнал);
+            // клики по чипам пересобирают их сами.
+            if (_listChipsTrackCount != m.Tracks.Count || !ReferenceEquals(_listChipsModel, m)) RebuildListFilterChips();
 
-            if (_listContent != null)
+            if (_listScroll != null)
             {
-                // Auto-tail: if the user was scrolled to the bottom, keep them
-                // there as new events stream in. Otherwise preserve the
-                // current offset so they can read older events without being
-                // yanked away. 5px epsilon covers minor float drift.
-                float prevOffset = _listScroll.scrollOffset.y;
-                float viewportH  = _listScroll.contentViewport?.layout.height ?? 0f;
-                float contentH   = _listContent.layout.height;
-                bool  wasAtEnd   = contentH > 0f
-                                && prevOffset + viewportH + 5f >= contentH;
-
-                _listContent.Clear();
-                for (int i = 0; i < _listItems.Count; i++)
-                    _listContent.Add(BuildListRow(_listItems[i]));
-
-                // Layout for the new content hasn't happened yet, so deferring
-                // by one frame ensures contentH is up to date when we set the
-                // offset. Without this the offset clamps against the old size.
-                if (wasAtEnd)
+                // Авто-хвост: были у конца — остаёмся у конца, пока идут события;
+                // иначе ListView сам сохраняет смещение (itemsSource тот же список).
+                var sv = _listScroll.Q<ScrollView>();
+                bool wasAtEnd = true;
+                if (sv != null)
                 {
-                    _listScroll.schedule.Execute(() =>
-                    {
-                        if (_listContent != null)
-                            _listScroll.scrollOffset = new Vector2(0, _listContent.layout.height);
-                    }).ExecuteLater(1);
+                    float offset   = sv.scrollOffset.y;
+                    float viewport = sv.contentViewport.layout.height;
+                    float content  = sv.contentContainer.layout.height;
+                    if (!float.IsNaN(content) && content > 0f && !float.IsNaN(viewport))
+                        wasAtEnd = offset + viewport + 5f >= content;
                 }
-                else
-                {
-                    _listScroll.schedule.Execute(() =>
-                    {
-                        _listScroll.scrollOffset = new Vector2(0, prevOffset);
-                    }).ExecuteLater(1);
-                }
+
+                _listScroll.RefreshItems();
+                // прокрутка — через кадр: новая высота контента ещё не посчитана, и смещение упёрлось бы в старую
+                if (wasAtEnd && _listItems.Count > 0)
+                    _listScroll.schedule.Execute(() => _listScroll.ScrollToItem(-1)).ExecuteLater(1);
             }
 
             int alive = 0;
@@ -1260,29 +1322,22 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
                 $"Span: {dur:F2}s";
         }
 
-        /// <summary>
-        /// Constructs a single, fully-populated row VisualElement. Visuals
-        /// mirror <see cref="SignalClusterPopup"/> rows so users see the
-        /// same layout in both places. Each cell is named so column-toggle
-        /// updates can find it without rebuilding the row.
-        /// </summary>
-        private VisualElement BuildListRow(SignalClusterPopup.ClusterEntry entry)
-        {
-            var tr   = entry.Track;
-            var e    = entry.Ev;
-            var kind = (SignalEventKind)e.Kind;
-            bool errored = e.Errors != null && e.Errors.Count > 0;
+        // Строка списка: ListView создаёт ровно столько строк, сколько видно, и
+        // переиспользует их при прокрутке и при каждом обновлении данных. Ячейки
+        // строятся один раз (MakeListRow), данные кладёт BindListRow. Раньше на
+        // каждый тик пересоздавались все строки — до 50 000 × ~10 элементов
+        // раз в 100 мс, плюс клики по строкам терялись между нажатием и отпусканием.
 
-            var row = new ListRow { TrackId = tr.Id, Sequence = e.Sequence };
+        private VisualElement MakeListRow()
+        {
+            var row = new ListRow();
             row.AddToClassList("stp-popup-row");
             row.AddToClassList("stp-list-row");
-            if (errored)
-                row.AddToClassList("stp-popup-row--errored");
-            if (tr.Id == _selectedTrackId && e.Sequence == _selectedSequence)
-                row.AddToClassList("stp-list-row--selected");
+            // шаг строки задаёт ListView (fixedItemHeight); отступ из .stp-popup-row сдвигал бы строки
+            row.style.marginBottom = 0;
 
             // -- Signal --
-            var signal = new Label($"#{tr.Id} {tr.Name}") { name = "signal" };
+            var signal = new Label { name = "signal" };
             signal.style.width                   = ColW_Signal;
             signal.style.flexShrink              = 0;
             signal.style.overflow                = Overflow.Hidden;
@@ -1291,15 +1346,10 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             signal.style.marginRight             = 8;
             signal.style.unityFontStyleAndWeight = FontStyle.Bold;
             signal.style.color                   = Context.Theme.Get(NexusToken.Accent);
-            signal.tooltip = string.IsNullOrEmpty(tr.CreatedFile)
-                ? signal.text
-                : $"{tr.CreatedFile}:{tr.CreatedLine}";
-            signal.style.display = IsColumnVisible(ListColumn.Signal)
-                ? DisplayStyle.Flex : DisplayStyle.None;
             row.Add(signal);
 
-            // -- Kind box: dot + (optional error badge) + label, grouped
-            //    so toggling the Kind column hides all three together. --
+            // -- Kind box: dot + (error badge) + label, grouped so toggling
+            //    the Kind column hides all three together. --
             var kindBox = new VisualElement { name = "kind-box" };
             kindBox.style.flexDirection = FlexDirection.Row;
             kindBox.style.alignItems    = Align.Center;
@@ -1307,28 +1357,21 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             kindBox.style.flexShrink    = 0;
             kindBox.style.marginRight   = 8;
 
-            var dot = new VisualElement();
+            var dot = new VisualElement { name = "dot" };
             dot.AddToClassList("stp-swatch");
-            dot.AddToClassList("stp-swatch--" + KindClass(kind));
-            if (kind == SignalEventKind.Invoked && e.SubscriberCountAtMoment == 0)
-                dot.AddToClassList("stp-swatch--unheard");
-            if (errored) dot.AddToClassList("stp-swatch--errored");
-            dot.style.width      = 10;
-            dot.style.height     = 10;
+            dot.style.width       = 10;
+            dot.style.height      = 10;
             dot.style.marginRight = 6;
-            dot.style.flexShrink = 0;
+            dot.style.flexShrink  = 0;
             kindBox.Add(dot);
 
-            if (errored)
-            {
-                var badge = new VisualElement();
-                badge.AddToClassList("stp-error-badge");
-                badge.style.position    = Position.Relative;
-                badge.style.marginRight = 6;
-                kindBox.Add(badge);
-            }
+            var badge = new VisualElement { name = "badge" };
+            badge.AddToClassList("stp-error-badge");
+            badge.style.position    = Position.Relative;
+            badge.style.marginRight = 6;
+            kindBox.Add(badge);
 
-            var kindLbl = new Label(kind.ToString());
+            var kindLbl = new Label { name = "kind" };
             kindLbl.style.flexGrow                = 1;
             kindLbl.style.minWidth                = 0;
             kindLbl.style.overflow                = Overflow.Hidden;
@@ -1336,46 +1379,29 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             kindLbl.style.whiteSpace              = WhiteSpace.NoWrap;
             kindLbl.style.unityFontStyleAndWeight = FontStyle.Bold;
             kindBox.Add(kindLbl);
-
-            kindBox.style.display = IsColumnVisible(ListColumn.Kind)
-                ? DisplayStyle.Flex : DisplayStyle.None;
             row.Add(kindBox);
 
             // -- Time --
-            double origin = TimelineOrigin(SignalRegistry.Model);
-            var timeLbl = new Label($"{e.Time - origin:F2}s") { name = "time" };
+            var timeLbl = new Label { name = "time" };
             timeLbl.style.width          = ColW_Time;
             timeLbl.style.flexShrink     = 0;
             timeLbl.style.marginRight    = 8;
             timeLbl.style.unityTextAlign = TextAnchor.MiddleRight;
             timeLbl.style.color          = Context.Theme.Get(NexusToken.TextDim);
-            timeLbl.style.display = IsColumnVisible(ListColumn.Time)
-                ? DisplayStyle.Flex : DisplayStyle.None;
             row.Add(timeLbl);
 
             // -- Type --
-            string typeText = string.IsNullOrEmpty(e.PayloadType) ? "" : $"<{e.PayloadType}>";
-            var typeLbl = new Label(typeText) { name = "type" };
+            var typeLbl = new Label { name = "type" };
             typeLbl.style.width        = ColW_Type;
             typeLbl.style.flexShrink   = 0;
             typeLbl.style.overflow     = Overflow.Hidden;
             typeLbl.style.textOverflow = TextOverflow.Ellipsis;
             typeLbl.style.whiteSpace   = WhiteSpace.NoWrap;
             typeLbl.style.marginRight  = 8;
-            typeLbl.tooltip            = typeText;
-            typeLbl.style.display = IsColumnVisible(ListColumn.Type)
-                ? DisplayStyle.Flex : DisplayStyle.None;
             row.Add(typeLbl);
 
             // -- Payload (flex-grow, the only stretchy cell). --
-            string payloadText = errored
-                ? (kind == SignalEventKind.Invoked && !string.IsNullOrEmpty(e.PayloadSummary)
-                    ? $"{e.PayloadSummary}   ⚠ {e.Errors.Count} error(s)"
-                    : $"⚠ {e.Errors.Count} error(s)")
-                : (kind == SignalEventKind.Invoked && !string.IsNullOrEmpty(e.PayloadSummary)
-                    ? e.PayloadSummary
-                    : $"subs={e.SubscriberCountAtMoment}");
-            var payloadLbl = new Label(payloadText) { name = "payload" };
+            var payloadLbl = new Label { name = "payload" };
             payloadLbl.style.flexGrow     = 1;
             payloadLbl.style.flexShrink   = 1;
             payloadLbl.style.minWidth     = 0;
@@ -1383,16 +1409,10 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             payloadLbl.style.textOverflow = TextOverflow.Ellipsis;
             payloadLbl.style.whiteSpace   = WhiteSpace.NoWrap;
             payloadLbl.style.marginRight  = 8;
-            payloadLbl.tooltip            = payloadText;
-            payloadLbl.style.display = IsColumnVisible(ListColumn.Payload)
-                ? DisplayStyle.Flex : DisplayStyle.None;
             row.Add(payloadLbl);
 
             // -- Location --
-            string locText = string.IsNullOrEmpty(e.FilePath)
-                ? "?"
-                : $"{Path.GetFileName(e.FilePath)}:{e.LineNumber}";
-            var locLbl = new Label(locText) { name = "loc" };
+            var locLbl = new Label { name = "loc" };
             locLbl.style.width          = ColW_Location;
             locLbl.style.flexShrink     = 0;
             locLbl.style.overflow       = Overflow.Hidden;
@@ -1400,63 +1420,90 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             locLbl.style.whiteSpace     = WhiteSpace.NoWrap;
             locLbl.style.unityTextAlign = TextAnchor.MiddleRight;
             locLbl.style.color          = Context.Theme.Get(NexusToken.TextFaint);
-            locLbl.tooltip = string.IsNullOrEmpty(e.FilePath) ? "" : $"{e.FilePath}:{e.LineNumber}";
-            locLbl.style.display = IsColumnVisible(ListColumn.Location)
-                ? DisplayStyle.Flex : DisplayStyle.None;
             row.Add(locLbl);
 
-            // Click: select this event and refresh the row highlight. The
-            // detail panel is updated by OnClusterRowChosen.
-            var trCap = tr;
-            var evCap = e;
+            row.Signal = signal; row.KindBox = kindBox; row.Dot = dot; row.Badge = badge;
+            row.Kind = kindLbl; row.Time = timeLbl; row.Type = typeLbl; row.Payload = payloadLbl; row.Loc = locLbl;
+
+            // Клик вешается один раз: строка переиспользуется, данные берутся по текущему индексу.
             row.RegisterCallback<ClickEvent>(_ =>
             {
-                OnClusterRowChosen(trCap, evCap);
+                if (row.Index < 0 || row.Index >= _listItems.Count) return;
+                var it = _listItems[row.Index];
+                OnClusterRowChosen(it.Track, it.Ev);
                 RefreshListSelection();
             });
-
             return row;
         }
 
-        /// <summary>
-        /// Walks the rendered rows and updates the selected-row class to
-        /// match <see cref="_selectedTrackId"/>/<see cref="_selectedSequence"/>.
-        /// O(rows) — fine for the volumes the list actually displays.
-        /// </summary>
-        private void RefreshListSelection()
+        private void BindListRow(VisualElement element, int index)
         {
-            if (_listContent == null) return;
-            int n = _listContent.childCount;
-            for (int i = 0; i < n; i++)
+            var row = (ListRow)element;
+            if (index < 0 || index >= _listItems.Count) { row.Index = -1; return; }
+            var entry = _listItems[index];
+            var tr    = entry.Track;
+            var e     = entry.Ev;
+            var kind  = (SignalEventKind)e.Kind;
+            bool errored = e.Errors != null && e.Errors.Count > 0;
+
+            row.Index    = index;
+            row.TrackId  = tr.Id;
+            row.Sequence = e.Sequence;
+            row.EnableInClassList("stp-popup-row--errored", errored);
+            row.EnableInClassList("stp-list-row--selected",
+                                  tr.Id == _selectedTrackId && e.Sequence == _selectedSequence);
+
+            row.Signal.text    = "#" + tr.Id + " " + tr.Name;
+            row.Signal.tooltip = string.IsNullOrEmpty(tr.CreatedFile)
+                ? row.Signal.text
+                : tr.CreatedFile + ":" + tr.CreatedLine;
+
+            string kindClass = "stp-swatch--" + KindClass(kind);
+            if (row.DotKindClass != kindClass)
             {
-                if (_listContent[i] is ListRow r)
-                {
-                    bool isSel = r.TrackId == _selectedTrackId && r.Sequence == _selectedSequence;
-                    r.EnableInClassList("stp-list-row--selected", isSel);
-                }
+                if (row.DotKindClass != null) row.Dot.RemoveFromClassList(row.DotKindClass);
+                row.Dot.AddToClassList(kindClass);
+                row.DotKindClass = kindClass;
             }
+            row.Dot.EnableInClassList("stp-swatch--unheard", kind == SignalEventKind.Invoked && e.SubscriberCountAtMoment == 0);
+            row.Dot.EnableInClassList("stp-swatch--errored", errored);
+            row.Badge.style.display = errored ? DisplayStyle.Flex : DisplayStyle.None;
+            row.Kind.text = KindName(kind);
+
+            double origin = TimelineOrigin(SignalRegistry.Model);
+            row.Time.text = (e.Time - origin).ToString("F2") + "s";
+
+            string typeText = string.IsNullOrEmpty(e.PayloadType) ? "" : "<" + e.PayloadType + ">";
+            row.Type.text    = typeText;
+            row.Type.tooltip = typeText;
+
+            string payloadText = errored
+                ? (kind == SignalEventKind.Invoked && !string.IsNullOrEmpty(e.PayloadSummary)
+                    ? $"{e.PayloadSummary}   ⚠ {e.Errors.Count} error(s)"
+                    : $"⚠ {e.Errors.Count} error(s)")
+                : (kind == SignalEventKind.Invoked && !string.IsNullOrEmpty(e.PayloadSummary)
+                    ? e.PayloadSummary
+                    : "subs=" + e.SubscriberCountAtMoment);
+            row.Payload.text    = payloadText;
+            row.Payload.tooltip = payloadText;
+
+            bool hasFile = !string.IsNullOrEmpty(e.FilePath);
+            row.Loc.text    = hasFile ? Path.GetFileName(e.FilePath) + ":" + e.LineNumber : "?";
+            row.Loc.tooltip = hasFile ? e.FilePath + ":" + e.LineNumber : "";
+
+            SetCellDisplay(row.Signal,  IsColumnVisible(ListColumn.Signal));
+            SetCellDisplay(row.KindBox, IsColumnVisible(ListColumn.Kind));
+            SetCellDisplay(row.Time,    IsColumnVisible(ListColumn.Time));
+            SetCellDisplay(row.Type,    IsColumnVisible(ListColumn.Type));
+            SetCellDisplay(row.Payload, IsColumnVisible(ListColumn.Payload));
+            SetCellDisplay(row.Loc,     IsColumnVisible(ListColumn.Location));
         }
 
-        /// <summary>
-        /// Walks every rendered row and applies the current column-visibility
-        /// mask. Called from the column-chip toggle so users see results
-        /// immediately without forcing a full data rebuild.
-        /// </summary>
-        private void UpdateRowColumnVisibility()
-        {
-            if (_listContent == null) return;
-            int n = _listContent.childCount;
-            for (int i = 0; i < n; i++)
-            {
-                var row = _listContent[i];
-                SetCellDisplay(row.Q<Label>("signal"),           IsColumnVisible(ListColumn.Signal));
-                SetCellDisplay(row.Q<VisualElement>("kind-box"), IsColumnVisible(ListColumn.Kind));
-                SetCellDisplay(row.Q<Label>("time"),             IsColumnVisible(ListColumn.Time));
-                SetCellDisplay(row.Q<Label>("type"),             IsColumnVisible(ListColumn.Type));
-                SetCellDisplay(row.Q<Label>("payload"),          IsColumnVisible(ListColumn.Payload));
-                SetCellDisplay(row.Q<Label>("loc"),              IsColumnVisible(ListColumn.Location));
-            }
-        }
+        /// <summary>Подсветка выбранной строки: перепривязать видимые строки (их — десятки).</summary>
+        private void RefreshListSelection() => _listScroll?.RefreshItems();
+
+        /// <summary>Видимость колонок: перепривязать видимые строки — BindListRow применяет маску.</summary>
+        private void UpdateRowColumnVisibility() => _listScroll?.RefreshItems();
 
         // -- Track label ------------------------------------------------------
 
@@ -1547,103 +1594,150 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
 
         // -- Lane (one track row) --------------------------------------------
 
-        private VisualElement BuildLane(SignalTrackData tr, int rowIndex, float contentWidth)
+        // Данные маркера — в userData: обработчики вешаются один раз при создании,
+        // а маркер переиспользуется под другие события.
+        private sealed class MarkerInfo
+        {
+            public SignalTrackData Track;
+            public TimelineEvent   Ev;          // одиночный маркер
+            public bool            Cluster;
+            public double          T0, T1;      // кластер: время первого и последнего события
+            public int             Count;
+            public string          KindClass;   // применённый класс вида (stp-marker--invoked / --mixed)
+            public Label           Text;
+            public VisualElement   Badge;
+        }
+
+        private VisualElement AddLane()
         {
             var lane = new VisualElement();
             lane.AddToClassList("stp-lane");
-            lane.style.height = TrackHeight;
+            lane.style.height       = TrackHeight;
             lane.style.marginBottom = TrackGap;
-            lane.style.width = contentWidth;
 
-            // Lifetime bar (Created -> Disposed/now)
-            var model     = SignalRegistry.Model;
-            double t0     = TimelineOrigin(model);
-            double endT   = tr.IsAlive ? model.LastTime : tr.DisposedAt;
-            float  bx     = (float)((tr.CreatedAt - t0) * _pxPerSec);
-            float  bw     = Mathf.Max(2f, (float)((endT - tr.CreatedAt) * _pxPerSec));
-
+            // Lifetime bar (Created -> Disposed/now) — всегда первый ребёнок дорожки.
             var bar = new VisualElement();
             bar.AddToClassList("stp-lifebar");
-            bar.EnableInClassList("stp-lifebar--alive", tr.IsAlive);
             bar.style.position = Position.Absolute;
-            bar.style.left     = bx;
             bar.style.top      = TrackHeight * 0.5f - 2f;
-            bar.style.width    = bw;
             bar.style.height   = 4f;
             lane.Add(bar);
 
-            // Markers — пилюли с текстом (тип события или Kind).
-            // Кластеризация: если две пилюли по горизонтали налезают друг
-            // на друга меньше чем за MarkerHGap — склеиваются в один маркер.
-            var visible = new List<int>(tr.Events.Count);
-            for (int i = 0; i < tr.Events.Count; i++)
-            {
-                var k = (SignalEventKind)tr.Events[i].Kind;
-                if (IsKindEnabled(k)) visible.Add(i);
-            }
-
-            for (int vi = 0; vi < visible.Count; )
-            {
-                int   start  = vi;
-                var   eStart = tr.Events[visible[start]];
-                float xStart = (float)((eStart.Time - t0) * _pxPerSec);
-                float wStart = EstimatePillWidth(eStart);
-
-                int   end       = start;
-                float endRight  = xStart + wStart;
-
-                while (end + 1 < visible.Count)
-                {
-                    var eNext  = tr.Events[visible[end + 1]];
-                    float xNxt = (float)((eNext.Time - t0) * _pxPerSec);
-                    if (xNxt < endRight + MarkerHGap)
-                    {
-                        end++;
-                        endRight = Math.Max(endRight, xNxt + EstimatePillWidth(eNext));
-                    }
-                    else break;
-                }
-
-                int count = end - start + 1;
-                if (count == 1)
-                {
-                    var marker = BuildSingleMarker(tr, eStart, (SignalEventKind)eStart.Kind,
-                        eStart.Kind == (int)SignalEventKind.Invoked && eStart.SubscriberCountAtMoment == 0,
-                        xStart);
-                    lane.Add(marker);
-                }
-                else
-                {
-                    var bundle = new List<TimelineEvent>(count);
-                    bool sameKind = true;
-                    int  firstKind = tr.Events[visible[start]].Kind;
-                    string commonType = tr.Events[visible[start]].PayloadType ?? "";
-                    bool sameType = true;
-                    for (int k = start; k <= end; k++)
-                    {
-                        var ev = tr.Events[visible[k]];
-                        bundle.Add(ev);
-                        if (ev.Kind != firstKind) sameKind = false;
-                        if ((ev.PayloadType ?? "") != commonType) sameType = false;
-                    }
-
-                    var cluster = BuildClusterMarker(tr, bundle, sameKind, firstKind,
-                                                     sameType ? commonType : null,
-                                                     xStart, count);
-                    lane.Add(cluster);
-                }
-
-                vi = end + 1;
-            }
-
+            _lanesContent.Add(lane);
             return lane;
+        }
+
+        private int NextVisible(List<TimelineEvent> events, int from)
+        {
+            for (int k = from; k < events.Count; k++)
+                if (IsKindEnabled((SignalEventKind)events[k].Kind)) return k;
+            return events.Count;
+        }
+
+        private void UpdateLane(VisualElement lane, SignalTrackData tr, float contentWidth)
+        {
+            lane.style.width = contentWidth;
+
+            var model   = SignalRegistry.Model;
+            double t0   = TimelineOrigin(model);
+            double endT = tr.IsAlive ? model.LastTime : tr.DisposedAt;
+            var bar = lane[0];
+            bar.EnableInClassList("stp-lifebar--alive", tr.IsAlive);
+            bar.style.left  = (float)((tr.CreatedAt - t0) * _pxPerSec);
+            bar.style.width = Mathf.Max(2f, (float)((endT - tr.CreatedAt) * _pxPerSec));
+
+            // Отсечка по видимой области — только при ручном масштабе: при автоподгонке
+            // контент и так равен ширине окна. Перерисовку при прокрутке заказывает
+            // обработчик горизонтального скролла.
+            bool  cull   = false;
+            float visMin = 0f, visMax = 0f;
+            if (!_autoFit && _hScroll != null)
+            {
+                float vw = _hScroll.contentViewport.layout.width;
+                if (!float.IsNaN(vw) && vw > 0f)
+                {
+                    cull   = true;
+                    visMin = _hScroll.scrollOffset.x - 200f;
+                    visMax = _hScroll.scrollOffset.x + vw + 200f;
+                }
+            }
+
+            // Маркеры — пилюли с текстом (тип события или Kind). Кластеризация: если
+            // пилюли по горизонтали налезают меньше чем за MarkerHGap — склеиваются.
+            var events = tr.Events;
+            int n    = events.Count;
+            int used = 0;
+            int i    = NextVisible(events, 0);
+            while (i < n)
+            {
+                var   eStart   = events[i];
+                float xStart   = (float)((eStart.Time - t0) * _pxPerSec);
+                float endRight = xStart + EstimatePillWidth(eStart);
+                int   count    = 1;
+                int   last     = i;
+                int   firstKind  = eStart.Kind;
+                string firstType = eStart.PayloadType ?? "";
+                bool  sameKind = true, sameType = true;
+                bool  anyErrored = eStart.Errors != null && eStart.Errors.Count > 0;
+
+                int j = NextVisible(events, i + 1);
+                while (j < n)
+                {
+                    var   eNext = events[j];
+                    float xNext = (float)((eNext.Time - t0) * _pxPerSec);
+                    if (xNext >= endRight + MarkerHGap) break;
+                    count++;
+                    last     = j;
+                    endRight = Math.Max(endRight, xNext + EstimatePillWidth(eNext));
+                    if (eNext.Kind != firstKind) sameKind = false;
+                    if ((eNext.PayloadType ?? "") != firstType) sameType = false;
+                    if (eNext.Errors != null && eNext.Errors.Count > 0) anyErrored = true;
+                    j = NextVisible(events, j + 1);
+                }
+
+                if (!cull || (endRight >= visMin && xStart <= visMax))
+                {
+                    var marker = used + 1 < lane.childCount ? lane[used + 1] : AddMarker(lane);
+                    used++;
+                    if (count == 1)
+                        BindSingleMarker(marker, tr, eStart, xStart);
+                    else
+                        BindClusterMarker(marker, tr, eStart.Time, events[last].Time, sameKind, firstKind,
+                                          sameType ? firstType : null, anyErrored, xStart, count);
+                }
+
+                i = j;
+            }
+
+            while (lane.childCount > used + 1)
+                lane.RemoveAt(lane.childCount - 1);
+        }
+
+        // Имена видов — один раз: Enum.ToString() на каждое событие каждый тик
+        // давал строку мусора на событие.
+        private static readonly string[] KindNames = BuildKindNames();
+
+        private static string[] BuildKindNames()
+        {
+            var values = (SignalEventKind[])Enum.GetValues(typeof(SignalEventKind));
+            int max = 0;
+            foreach (var v in values) max = Math.Max(max, (int)v);
+            var names = new string[max + 1];
+            foreach (var v in values) names[(int)v] = v.ToString();
+            return names;
+        }
+
+        private static string KindName(SignalEventKind k)
+        {
+            int i = (int)k;
+            return i >= 0 && i < KindNames.Length && KindNames[i] != null ? KindNames[i] : k.ToString();
         }
 
         private static string PillTextFor(in TimelineEvent e)
         {
             // Пилюли подписывают тип события или, для Created/Disposed, сам Kind.
             if (!string.IsNullOrEmpty(e.PayloadType)) return e.PayloadType;
-            return ((SignalEventKind)e.Kind).ToString();
+            return KindName((SignalEventKind)e.Kind);
         }
 
         private static float EstimatePillWidth(in TimelineEvent e)
@@ -1653,102 +1747,121 @@ namespace Exerussus.Nexus.Pages.SignalTimeline
             return Mathf.Max(MarkerMinW, t.Length * 6.2f + 16f);
         }
 
-        // Single non-clustered marker — pill with PayloadType / Kind text.
-        private VisualElement BuildSingleMarker(SignalTrackData tr, TimelineEvent e,
-                                                SignalEventKind kind, bool unheard,
-                                                float leftX)
+        private VisualElement AddMarker(VisualElement lane)
         {
             var marker = new VisualElement();
             marker.AddToClassList("stp-marker");
-            marker.AddToClassList("stp-marker--" + KindClass(kind));
-            if (unheard) marker.AddToClassList("stp-marker--unheard");
-
-            bool errored = e.Errors != null && e.Errors.Count > 0;
-            if (errored)
-            {
-                marker.AddToClassList("stp-marker--errored");
-                var badge = new VisualElement();
-                badge.AddToClassList("stp-error-badge");
-                badge.pickingMode = PickingMode.Ignore;
-                marker.Add(badge);
-            }
-
-            var text = new Label(PillTextFor(e));
-            text.AddToClassList("stp-marker-text");
-            text.pickingMode = PickingMode.Ignore;
-            marker.Add(text);
-
-            float w = EstimatePillWidth(e);
             marker.style.position = Position.Absolute;
-            marker.style.left     = leftX;
             marker.style.top      = (TrackHeight - MarkerHeight) * 0.5f;
-            marker.style.width    = w;
             marker.style.height   = MarkerHeight;
 
-            bool isSelected = (tr.Id == _selectedTrackId && e.Sequence == _selectedSequence);
-            marker.EnableInClassList("stp-marker--selected", isSelected);
+            var info = new MarkerInfo();
+            info.Badge = new VisualElement();
+            info.Badge.AddToClassList("stp-error-badge");
+            info.Badge.pickingMode = PickingMode.Ignore;
+            marker.Add(info.Badge);
 
-            int trId   = tr.Id;
-            var evCopy = e;
-            marker.tooltip = BuildTooltip(tr, evCopy);
-            marker.RegisterCallback<ClickEvent>(ce =>
+            info.Text = new Label();
+            info.Text.AddToClassList("stp-marker-text");
+            info.Text.pickingMode = PickingMode.Ignore;
+            marker.Add(info.Text);
+            marker.userData = info;
+
+            // Подсказка собирается при наведении, а не на каждой перерисовке.
+            marker.RegisterCallback<PointerEnterEvent>(_ =>
             {
-                _selectedTrackId  = trId;
-                _selectedSequence = evCopy.Sequence;
-                UpdateSelectionInfo(tr, evCopy);
-                _dirty = true;
+                marker.tooltip = info.Cluster
+                    ? $"{info.Count} events in one frame — click to expand"
+                    : BuildTooltip(info.Track, info.Ev);
             });
+            marker.RegisterCallback<ClickEvent>(_ =>
+            {
+                if (info.Track == null) return;
+                if (!info.Cluster)
+                {
+                    _selectedTrackId  = info.Track.Id;
+                    _selectedSequence = info.Ev.Sequence;
+                    UpdateSelectionInfo(info.Track, info.Ev);
+                    _dirty = true;
+                    return;
+                }
+
+                // Состав кластера — по времени, в момент клика: индексы событий
+                // съезжают при обрезке дорожки, а время внутри дорожки монотонно.
+                var bundle = new List<TimelineEvent>(info.Count);
+                foreach (var ev in info.Track.Events)
+                {
+                    if (ev.Time < info.T0) continue;
+                    if (ev.Time > info.T1) break;
+                    if (IsKindEnabled((SignalEventKind)ev.Kind)) bundle.Add(ev);
+                }
+                if (bundle.Count == 0) return;
+                SignalClusterPopup.Show(marker.worldBound, info.Track, bundle, OnClusterRowChosen,
+                                        _uss, PopupColors());
+            });
+
+            lane.Add(marker);
             return marker;
         }
 
-        // Cluster of >=2 events that overlap horizontally.
-        private VisualElement BuildClusterMarker(SignalTrackData tr,
-                                                 List<TimelineEvent> bundle,
-                                                 bool sameKind, int firstKind,
-                                                 string commonType,
-                                                 float leftX, int count)
+        private static void SetMarkerKindClass(VisualElement marker, MarkerInfo info, string kindClass)
         {
-            var marker = new VisualElement();
-            marker.AddToClassList("stp-marker");
-            marker.AddToClassList("stp-marker--cluster");
-            if (sameKind) marker.AddToClassList("stp-marker--" + KindClass((SignalEventKind)firstKind));
-            else          marker.AddToClassList("stp-marker--mixed");
+            if (info.KindClass == kindClass) return;
+            if (info.KindClass != null) marker.RemoveFromClassList(info.KindClass);
+            marker.AddToClassList(kindClass);
+            info.KindClass = kindClass;
+        }
 
-            bool anyErrored = false;
-            for (int i = 0; i < bundle.Count; i++)
-                if (bundle[i].Errors != null && bundle[i].Errors.Count > 0) { anyErrored = true; break; }
-            if (anyErrored)
-            {
-                marker.AddToClassList("stp-marker--errored");
-                var badge = new VisualElement();
-                badge.AddToClassList("stp-error-badge");
-                badge.pickingMode = PickingMode.Ignore;
-                marker.Add(badge);
-            }
+        // Single non-clustered marker — pill with PayloadType / Kind text.
+        private void BindSingleMarker(VisualElement marker, SignalTrackData tr, in TimelineEvent e, float leftX)
+        {
+            var info = (MarkerInfo)marker.userData;
+            var kind = (SignalEventKind)e.Kind;
+            info.Track   = tr;
+            info.Ev      = e;
+            info.Cluster = false;
+
+            marker.RemoveFromClassList("stp-marker--cluster");
+            SetMarkerKindClass(marker, info, "stp-marker--" + KindClass(kind));
+            marker.EnableInClassList("stp-marker--unheard",
+                                     kind == SignalEventKind.Invoked && e.SubscriberCountAtMoment == 0);
+            bool errored = e.Errors != null && e.Errors.Count > 0;
+            marker.EnableInClassList("stp-marker--errored", errored);
+            info.Badge.style.display = errored ? DisplayStyle.Flex : DisplayStyle.None;
+            marker.EnableInClassList("stp-marker--selected",
+                                     tr.Id == _selectedTrackId && e.Sequence == _selectedSequence);
+
+            info.Text.text        = PillTextFor(e);
+            marker.style.left     = leftX;
+            marker.style.width    = EstimatePillWidth(e);
+        }
+
+        // Cluster of >=2 events that overlap horizontally.
+        private void BindClusterMarker(VisualElement marker, SignalTrackData tr, double t0, double t1,
+                                       bool sameKind, int firstKind, string commonType,
+                                       bool anyErrored, float leftX, int count)
+        {
+            var info = (MarkerInfo)marker.userData;
+            info.Track   = tr;
+            info.Cluster = true;
+            info.T0      = t0;
+            info.T1      = t1;
+            info.Count   = count;
+
+            marker.AddToClassList("stp-marker--cluster");
+            SetMarkerKindClass(marker, info,
+                               sameKind ? "stp-marker--" + KindClass((SignalEventKind)firstKind) : "stp-marker--mixed");
+            marker.RemoveFromClassList("stp-marker--unheard");
+            marker.RemoveFromClassList("stp-marker--selected");
+            marker.EnableInClassList("stp-marker--errored", anyErrored);
+            info.Badge.style.display = anyErrored ? DisplayStyle.Flex : DisplayStyle.None;
 
             string labelText = !string.IsNullOrEmpty(commonType)
-                ? $"{commonType}  ×{count}"
-                : $"(mixed)  ×{count}";
-
-            var text = new Label(labelText);
-            text.AddToClassList("stp-marker-text");
-            text.pickingMode = PickingMode.Ignore;
-            marker.Add(text);
-
-            float w = Mathf.Max(MarkerMinW, labelText.Length * 6.2f + 16f);
-            marker.style.position = Position.Absolute;
-            marker.style.left     = leftX;
-            marker.style.top      = (TrackHeight - MarkerHeight) * 0.5f;
-            marker.style.width    = w;
-            marker.style.height   = MarkerHeight;
-
-            marker.tooltip = $"{count} events in one frame — click to expand";
-            marker.RegisterCallback<ClickEvent>(ce =>
-            {
-                SignalClusterPopup.Show(marker.worldBound, tr, bundle, OnClusterRowChosen,
-                                        _uss, PopupColors());
-            });
-            return marker;
+                ? commonType + "  ×" + count
+                : "(mixed)  ×" + count;
+            info.Text.text     = labelText;
+            marker.style.left  = leftX;
+            marker.style.width = Mathf.Max(MarkerMinW, labelText.Length * 6.2f + 16f);
         }
 
         private void OnClusterRowChosen(SignalTrackData tr, TimelineEvent e)

@@ -295,9 +295,12 @@ namespace Signals
                                                         string file, int line, string member)
         {
             int id = GetOrCreateId(s);
-            // Linear scan over Tracks: fine for realistic counts (dozens).
-            // If this becomes a bottleneck, swap to Dictionary<int, idx>.
-            foreach (var tr in Model.Tracks)
+            // id выдаются подряд с 1 и сбрасываются вместе с Tracks — обычно дорожка
+            // лежит по индексу id-1; перебор остаётся страховкой.
+            var tracks = Model.Tracks;
+            int idx = id - 1;
+            if (idx >= 0 && idx < tracks.Count && tracks[idx].Id == id) return tracks[idx];
+            foreach (var tr in tracks)
                 if (tr.Id == id) return tr;
 
             var nt = new SignalTrackData
@@ -346,7 +349,16 @@ namespace Signals
             }
 
             Model.Version++;
-            Changed?.Invoke();
+            // Вызывается изнутри finally у AppSignals.Raise: исключение подписчика не должно
+            // сорвать InvokeEnd (стек вызовов) и улететь в игровой код.
+            try
+            {
+                Changed?.Invoke();
+            }
+            catch (Exception e)
+            {
+                UnityEngine.Debug.LogException(e);
+            }
         }
     }
 }

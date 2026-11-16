@@ -1,4 +1,6 @@
 using System;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Threading;
 
@@ -85,7 +87,106 @@ namespace Exerussus.Nexus.Daemon
         public string CliDir => System.IO.Path.Combine(Path, "NexusTemp", "cli");
         public string TempDir => System.IO.Path.Combine(Path, "NexusTemp");
 
-        public bool PidAlive => DaemonInfo.IsAlive(Pid);
+        /// <summary>Поле started файла экземпляра (UTC, ISO): когда сервер CLI этого редактора стартовал.</summary>
+        public volatile string Started;
+
+        // Процесс редактора: один раз на пару (pid, started) проверяется, что это действительно Unity,
+        // запущенная не позже записи файла экземпляра, и хэндл держится открытым — дальше «жив ли»
+        // = HasExited по нему, без GetProcessById и без исключений. Раньше GetProcessById шёл на КАЖДОЕ
+        // чтение State (~20 раз/с на проект), после падения Unity бросал исключение на каждое обращение,
+        // а pid, доставшийся чужому процессу, считался живым редактором: сторож будил окна чужой программы,
+        // dialog.list снимал её диалоги. Открытый хэндл к тому же не даёт системе отдать pid другому.
+        private readonly object _procGate = new object();
+        private int _procPid = -1;
+        private string _procStarted;
+        private Process _proc;
+
+        public bool PidAlive
+        {
+            get
+            {
+                var pid = Pid;
+                var started = Started;
+                lock (_procGate)
+                {
+                    if (pid != _procPid || !string.Equals(started, _procStarted, StringComparison.Ordinal))
+                    {
+                        ReleaseProcessLocked();
+                        _procPid = pid;
+                        _procStarted = started;
+                        _proc = OpenEditorProcess(pid, started);
+                    }
+
+                    if (_proc == null) return false;
+                    try
+                    {
+                        if (!_proc.HasExited) return true;
+                    }
+                    catch
+                    {
+                        // хэндл больше не годится — считаем закрытым до смены pid
+                    }
+
+                    ReleaseProcessLocked();
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>Отпустить хэндл процесса (проект убран из реестра).</summary>
+        public void ReleaseProcess()
+        {
+            lock (_procGate) ReleaseProcessLocked();
+        }
+
+        private void ReleaseProcessLocked()
+        {
+            try
+            {
+                _proc?.Dispose();
+            }
+            catch
+            {
+                // неважно
+            }
+
+            _proc = null;
+        }
+
+        /// <summary>Живой процесс Unity с этим pid, начатый не позже started (+ запас), или null.</summary>
+        private static Process OpenEditorProcess(int pid, string started)
+        {
+            if (pid <= 0) return null;
+            Process p = null;
+            try
+            {
+                p = Process.GetProcessById(pid);
+                if (p.HasExited || !p.ProcessName.StartsWith("Unity", StringComparison.OrdinalIgnoreCase))
+                {
+                    p.Dispose();
+                    return null;
+                }
+
+                // процесс, начатый ПОСЛЕ записи файла экземпляра, — не тот редактор (pid переиспользован);
+                // запас — на дрожание системных часов
+                if (DateTime.TryParse(started, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var s) &&
+                    p.StartTime.ToUniversalTime() > s.ToUniversalTime().AddSeconds(60))
+                {
+                    p.Dispose();
+                    return null;
+                }
+
+                // Process из GetProcessById хэндл не держит (каждый HasExited открывал бы pid заново) —
+                // обращение к SafeHandle открывает и удерживает его до Dispose
+                _ = p.SafeHandle;
+                return p;
+            }
+            catch
+            {
+                p?.Dispose();
+                return null;
+            }
+        }
 
         /// <summary>Итоговое состояние для клиентов: ready | reloading | stalled | closed.</summary>
         public string State

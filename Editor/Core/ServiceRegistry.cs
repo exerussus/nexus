@@ -57,31 +57,22 @@ namespace Exerussus.Nexus.Core
             return null;
         }
 
-        // перебор [Service]-атрибутов в загруженных сборках (с защитой от битых сборок)
+        // [Service]-типы — из индекса TypeCache редактора (готов на загрузке домена). Раньше здесь шёл
+        // GetTypes() по всем сборкам домена — 50–300 мс на каждую отрисовку Health и на каждый requires.
         private static IEnumerable<(string id, string version, string typeName)> ScanCode()
         {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            foreach (var t in UnityEditor.TypeCache.GetTypesWithAttribute<ServiceAttribute>())
             {
-                Type[] types;
-                try { types = asm.GetTypes(); }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    NexusDiagnostics.Swallowed($"частично загруженная сборка '{asm.GetName().Name}'", ex);
-                    types = ex.Types;
-                }
+                ServiceAttribute attr;
+                try { attr = t.GetCustomAttribute<ServiceAttribute>(inherit: false); }
                 catch (Exception ex)
                 {
-                    NexusDiagnostics.Swallowed($"сборка '{asm.GetName().Name}' не просканирована", ex);
+                    NexusDiagnostics.Swallowed($"атрибут [Service] типа '{t.FullName}' не прочитан", ex);
                     continue;
                 }
 
-                foreach (var t in types)
-                {
-                    if (t == null) continue;
-                    var attr = t.GetCustomAttribute<ServiceAttribute>(inherit: false);
-                    if (attr?.Id == null) continue;
-                    yield return (attr.Id, attr.Version, t.FullName);
-                }
+                if (attr?.Id == null) continue;
+                yield return (attr.Id, attr.Version, t.FullName);
             }
         }
     }

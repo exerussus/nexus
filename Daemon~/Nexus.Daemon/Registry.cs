@@ -79,6 +79,8 @@ namespace Exerussus.Nexus.Daemon
                     var port = (int)Json.Num(o, "port");
                     var token = Json.Str(o, "token");
                     if (port != p.Port || token != p.Token) p.Bridge = new Project.Endpoint(port, token);
+                    // started — раньше pid: читатель не увидит новый pid со старым started
+                    p.Started = Json.Str(o, "started");
                     p.Pid = (int)Json.Num(o, "pid");
                     p.EditorState = Json.Str(o, "state") ?? "ready";
                     p.Unity = Json.Str(o, "unity");
@@ -100,6 +102,7 @@ namespace Exerussus.Nexus.Daemon
                         // убираем, только если файла нет два обновления подряд (CLI выключен), а не после сбоя чтения
                         if (++p.Misses < 2) continue;
                         p.Removed = true;
+                        p.ReleaseProcess();
                         ByFile.Remove(file);
                         removed.Add(p);
                     }

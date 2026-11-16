@@ -32,7 +32,7 @@ namespace Exerussus.EcsLite {
     [Il2CppSetOption (Option.NullChecks, false)]
     [Il2CppSetOption (Option.ArrayBoundsChecks, false)]
 #endif
-    public sealed class EcsPool<T> : IEcsPool where T : struct {
+    public sealed partial class EcsPool<T> : IEcsPool where T : struct {
         readonly Type _type;
         readonly EcsWorld _world;
         readonly short _id;
@@ -1441,9 +1441,14 @@ namespace Exerussus.EcsLite {
     // её сборка не ссылается на этот ECS напрямую.
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Мастер-гейт: страница в фокусе поднимает флаг перед «дорогими» проходами.
-    public static class EcsEditorProbe {
-        public static bool Active;
+    // Число компонентов пула без прохода по сущностям: плотный массив минус резерв (слот 0)
+    // минус освобождённые ячейки. Нужен мосту для таблицы пулов — O(пулов) вместо O(сущностей).
+    public interface IEcsPoolEditorStats {
+        int EditorItemsCount { get; }
+    }
+
+    public sealed partial class EcsPool<T> : IEcsPoolEditorStats {
+        int IEcsPoolEditorStats.EditorItemsCount => _denseItemsCount - 1 - _recycledItemsCount;
     }
 
     // Реестр живых миров. Наполняется хуками в EcsWorld/EcsSystems, держит слабые
@@ -1548,20 +1553,18 @@ namespace Exerussus.EcsLite {
             return new[] { w.GetEntitiesCount (), w.GetUsedEntitiesCount (), w.GetWorldSize (), w.GetPoolsCount () };
         }
 
-        // Таблица пулов: строка = "typeName US entityCount US estBytes" (один проход по сущностям).
+        // Таблица пулов: строка = "typeName US entityCount US estBytes". Счётчик берётся из самого
+        // пула (O(пулов)); проход по сущностям — только для чужих реализаций IEcsPool.
         public static string[] PoolTable (int wi) {
             var w = EcsEditorRegistry.WorldAt (wi);
             if (w == null || !w.IsAlive ()) { return Array.Empty<string> (); }
             var pn = w.GetAllPools (ref _pools);
             var counts = new int[pn];
-            var idxByType = new Dictionary<Type, int> (pn);
-            for (var i = 0; i < pn; i++) { idxByType[_pools[i].GetComponentType ()] = i; }
-            var en = w.GetAllEntities (ref _ents);
-            for (var e = 0; e < en; e++) {
-                var tn = w.GetComponentTypes (_ents[e], ref _types);
-                for (var t = 0; t < tn; t++) {
-                    if (idxByType.TryGetValue (_types[t], out var pi)) { counts[pi]++; }
-                }
+            var en = -1;
+            for (var i = 0; i < pn; i++) {
+                if (_pools[i] is IEcsPoolEditorStats stats) { counts[i] = stats.EditorItemsCount; continue; }
+                if (en < 0) { en = w.GetAllEntities (ref _ents); }
+                for (var e = 0; e < en; e++) { if (_pools[i].Has (_ents[e])) { counts[i]++; } }
             }
             var rows = new string[pn];
             for (var i = 0; i < pn; i++) {
@@ -1573,23 +1576,54 @@ namespace Exerussus.EcsLite {
         }
 
         // Запрос сущностей. inc/exc — CSV имён типов компонентов. Строка результата =
-        // "id US gen US compCount US typesCsv". typesCsv питает архетипы и чипы на стороне страницы.
+        // "id US gen US compCount US" (четвёртое поле, typesCsv, больше не заполняется: страница
+        // его не читала, а сборка набора типов на каждую сущность каждый тик стоила дороже всего
+        // остального). Фильтр — через Has пулов с нужным именем типа, без аллокаций на сущность.
         public static string[] Query (int wi, string incCsv, string excCsv, string idContains, int max) {
             var w = EcsEditorRegistry.WorldAt (wi);
             if (w == null || !w.IsAlive ()) { return Array.Empty<string> (); }
-            var inc = Split (incCsv);
-            var exc = Split (excCsv);
+            var pn = w.GetAllPools (ref _pools);
+            var inc = PoolsByNames (pn, Split (incCsv));
+            var exc = PoolsByNames (pn, Split (excCsv));
+            for (var i = 0; i < inc.Length; i++) { if (inc[i].Length == 0) { return Array.Empty<string> (); } }
             var res = new List<string> (Math.Min (max, 256));
             var en = w.GetAllEntities (ref _ents);
             for (var e = 0; e < en && res.Count < max; e++) {
                 var id = _ents[e];
-                var set = TypeSet (w, id, out var csv);
-                if (!ContainsAll (set, inc)) { continue; }
-                if (ContainsAny (set, exc)) { continue; }
+                if (!HasAll (inc, id)) { continue; }
+                if (HasSome (exc, id)) { continue; }
                 if (!string.IsNullOrEmpty (idContains) && id.ToString ().IndexOf (idContains, StringComparison.Ordinal) < 0) { continue; }
-                res.Add (id + US.ToString () + w.GetEntityGen (id) + US + w.GetComponentsCount (id) + US + csv);
+                res.Add (id + US.ToString () + w.GetEntityGen (id) + US + w.GetComponentsCount (id) + US);
             }
             return res.ToArray ();
+        }
+
+        // Для каждого имени — пулы, чей тип так называется (короткое имя, как и прежде; одинаково
+        // названных типов из разных пространств имён может быть несколько).
+        static IEcsPool[][] PoolsByNames (int pn, string[] names) {
+            var res = new IEcsPool[names.Length][];
+            var tmp = new List<IEcsPool> (2);
+            for (var n = 0; n < names.Length; n++) {
+                tmp.Clear ();
+                for (var i = 0; i < pn; i++) { if (_pools[i].GetComponentType ().Name == names[n]) { tmp.Add (_pools[i]); } }
+                res[n] = tmp.ToArray ();
+            }
+            return res;
+        }
+
+        static bool HasAny (IEcsPool[] pools, int id) {
+            for (var i = 0; i < pools.Length; i++) { if (pools[i].Has (id)) { return true; } }
+            return false;
+        }
+
+        static bool HasAll (IEcsPool[][] need, int id) {
+            for (var i = 0; i < need.Length; i++) { if (!HasAny (need[i], id)) { return false; } }
+            return true;
+        }
+
+        static bool HasSome (IEcsPool[][] any, int id) {
+            for (var i = 0; i < any.Length; i++) { if (HasAny (any[i], id)) { return true; } }
+            return false;
         }
 
         // Архетипы: строка = "typesCsv US count" по различным сигнатурам живых сущностей.
@@ -1599,7 +1633,7 @@ namespace Exerussus.EcsLite {
             var by = new Dictionary<string, int> (64);
             var en = w.GetAllEntities (ref _ents);
             for (var e = 0; e < en; e++) {
-                TypeSet (w, _ents[e], out var csv);
+                var csv = TypeCsv (w, _ents[e]);
                 by.TryGetValue (csv, out var c);
                 by[csv] = c + 1;
             }
@@ -1617,7 +1651,7 @@ namespace Exerussus.EcsLite {
             var en = w.GetAllEntities (ref _ents);
             for (var e = 0; e < en && res.Count < max; e++) {
                 var id = _ents[e];
-                TypeSet (w, id, out var csv);
+                var csv = TypeCsv (w, id);
                 if (csv == typesCsv) { res.Add (id + US.ToString () + w.GetEntityGen (id) + US + w.GetComponentsCount (id) + US + csv); }
             }
             return res.ToArray ();
@@ -1651,28 +1685,24 @@ namespace Exerussus.EcsLite {
         static string[] Split (string csv) =>
             string.IsNullOrEmpty (csv) ? Array.Empty<string> () : csv.Split (',');
 
-        static HashSet<string> TypeSet (EcsWorld w, int id, out string csv) {
+        // Сигнатура сущности: отсортированные имена типов через запятую (архетипы).
+        static string TypeCsv (EcsWorld w, int id) {
             var tn = w.GetComponentTypes (id, ref _types);
             var names = new string[tn];
             for (var i = 0; i < tn; i++) { names[i] = _types[i].Name; }
             Array.Sort (names, StringComparer.Ordinal);
-            csv = string.Join (",", names);
-            return new HashSet<string> (names);
+            return string.Join (",", names);
         }
 
-        static bool ContainsAll (HashSet<string> set, string[] need) {
-            for (var i = 0; i < need.Length; i++) { if (!set.Contains (need[i])) { return false; } }
-            return true;
-        }
-
-        static bool ContainsAny (HashSet<string> set, string[] any) {
-            for (var i = 0; i < any.Length; i++) { if (set.Contains (any[i])) { return true; } }
-            return false;
-        }
+        // Оценка байт на элемент: работает для blittable-структур, иначе 0 («~»). Кэш по типу:
+        // для non-blittable Marshal.SizeOf бросает исключение — раньше на каждый пул каждый тик.
+        static readonly Dictionary<Type, int> _sizes = new Dictionary<Type, int> ();
 
         static int EstSize (Type t) {
-            // Оценка байт на элемент: работает для blittable-структур, иначе 0 («~»).
-            try { return System.Runtime.InteropServices.Marshal.SizeOf (t); } catch { return 0; }
+            if (_sizes.TryGetValue (t, out var size)) { return size; }
+            try { size = System.Runtime.InteropServices.Marshal.SizeOf (t); } catch { size = 0; }
+            _sizes[t] = size;
+            return size;
         }
 
         static string Body (object comp, Type t) {

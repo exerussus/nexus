@@ -10,7 +10,7 @@ namespace Exerussus.Nexus.Core
     /// <summary>
     /// Команды CLI: встроенные (<c>help</c>, <c>ping</c>), команды управления редактором ядра (<c>status</c>,
     /// <c>refresh</c>, <c>logs</c>, <c>play.*</c>, …) и методы с <see cref="NexusCommandAttribute"/> в
-    /// скомпилированном коде. Без кэша: TypeCache Unity и так держит индекс домена, список собирается на вызов.
+    /// скомпилированном коде. Список собирается один раз за домен (см. <see cref="All"/>).
     /// </summary>
     public static class NexusCommands
     {

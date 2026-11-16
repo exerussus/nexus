@@ -108,6 +108,9 @@ namespace Exerussus.Nexus.Daemon
             public volatile string HelloToken;
             public volatile bool HelloRunning;
             public DateTime HelloRetryAt;
+            /// <summary>Закрытый редактор: следующий опрос канала и папки задач (реже, чем 50 мс открытого).</summary>
+            public DateTime NextClosedPoll;
+            public DateTime NextClosedTaskPoll;
             /// <summary>С какого момента нет папки канала (null — есть).</summary>
             public DateTime? MissingSince;
             /// <summary>Срок хранения итогов done/ (путь → expires; null — без срока, по возрасту): уборка не читает файлы заново.</summary>
@@ -116,13 +119,31 @@ namespace Exerussus.Nexus.Daemon
 
         private static readonly ConcurrentDictionary<Project, Channel> Channels = new ConcurrentDictionary<Project, Channel>();
 
+        /// <summary>Канал закрытого редактора опрашивается реже: requests/ и cancel/ — раз в 250 мс (git.*, help и
+        /// быстрый отказ кодом 10 без редактора; nexus-fs ждёт итог с шагом 0,15 с), tasks/ — раз в секунду
+        /// (задачам нужен редактор). Открытый — каждые 50 мс, как прежде.</summary>
+        private static readonly TimeSpan ClosedPoll = TimeSpan.FromMilliseconds(250);
+        private static readonly TimeSpan ClosedTaskPoll = TimeSpan.FromSeconds(1);
+
         public static void Tick()
         {
             var now = DateTime.UtcNow;
             foreach (var p in Registry.All)
             {
+                // состояние берётся заново на каждом проходе: closed → ready при запуске редактора
+                // подхватывается не позже чем через ClosedPoll
+                var closed = p.EditorState == "closed" || !p.PidAlive;
+                Channels.TryGetValue(p, out var known);
+                if (closed && known != null)
+                {
+                    if (now < known.NextClosedPoll) continue;
+                    known.NextClosedPoll = now + ClosedPoll;
+                }
+
                 if (!p.Exists) continue;
-                var ch = Channels.GetOrAdd(p, x => new Channel { Project = x });
+                var ch = known ?? Channels.GetOrAdd(p, x => new Channel { Project = x });
+                var pollTasks = !closed || now >= ch.NextClosedTaskPoll;
+                if (closed && pollTasks) ch.NextClosedTaskPoll = now + ClosedTaskPoll;
                 try
                 {
                     if (ch.Prepared && !Directory.Exists(p.CliDir))
@@ -155,7 +176,7 @@ namespace Exerussus.Nexus.Daemon
                         if (!Calls.Draining)
                         {
                             PollRequests(ch);
-                            PollTasks(ch);
+                            if (pollTasks) PollTasks(ch);
                         }
                     }
 
@@ -184,7 +205,12 @@ namespace Exerussus.Nexus.Daemon
                     Channels.TryRemove(p, out _);
         }
 
-        private static string Dir(Channel ch, params string[] parts) => Path.Combine(new[] { ch.Project.CliDir }.Concat(parts).ToArray());
+        private static string Dir(Channel ch, params string[] parts)
+        {
+            var path = ch.Project.CliDir;
+            foreach (var part in parts) path = Path.Combine(path, part);
+            return path;
+        }
 
         private static readonly string[] Folders =
         {
@@ -378,7 +404,8 @@ namespace Exerussus.Nexus.Daemon
         private static void FetchCommands(Channel ch)
         {
             var p = ch.Project;
-            if (ch.HelloRunning || !p.Ready || p.Token == ch.HelloToken || DateTime.UtcNow < ch.HelloRetryAt) return;
+            // дешёвые проверки — первыми; Ready (состояние процесса редактора) — последней
+            if (ch.HelloRunning || p.Token == ch.HelloToken || DateTime.UtcNow < ch.HelloRetryAt || !p.Ready) return;
             ch.HelloRunning = true;
             var token = p.Token;
             var call = Calls.Start(p, "bridge.hello", null, p.Path, 30, 0, false, "file-hello");
@@ -908,6 +935,12 @@ namespace Exerussus.Nexus.Daemon
                 var finished = call.State == "done";
                 stepOut = finished ? call.Output ?? string.Empty : $"✗ Шаг не остановился за 10 с после срока — дальше без него.\n";
                 data = finished ? ParseData(call.Result) : null;
+                // вывод и данные шага уже скопированы — не держать до 16 МБ в реестре вызовов ещё 2 минуты
+                if (finished)
+                {
+                    call.ReleasedNote = "(вывод шага — в итоге пакета " + run.Id + ")\n";
+                    Calls.Release(call);
+                }
                 bool failed;
                 misses = new List<string>();
                 if (!finished || ((stepTimedOut || batchTimedOut) && call.ExitCode != 0))
@@ -1369,16 +1402,21 @@ namespace Exerussus.Nexus.Daemon
 
         private static List<string> Files(string dir)
         {
+            var list = new List<string>();
             try
             {
-                return Directory.Exists(dir)
-                    ? Directory.GetFiles(dir, "*.json").Where(f => !Path.GetFileName(f).StartsWith(".", StringComparison.Ordinal)).ToList()
-                    : new List<string>();
+                // Exists остаётся: удалённая подпапка канала иначе давала бы исключение на каждом проходе
+                if (!Directory.Exists(dir)) return list;
+                foreach (var f in Directory.GetFiles(dir, "*.json"))
+                    if (!Path.GetFileName(f).StartsWith(".", StringComparison.Ordinal))
+                        list.Add(f);
             }
             catch
             {
-                return new List<string>();
+                // нет папки или не читается — пусто
             }
+
+            return list;
         }
 
         private static List<string> AllFiles(string dir)

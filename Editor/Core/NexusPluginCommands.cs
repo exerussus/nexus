@@ -39,6 +39,7 @@ namespace Exerussus.Nexus.Core
             var filter = ctx.Get("status");
             var rows = new List<object>();
             var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var packages = PackageRegistry.Snapshot();   // один снимок установленного на весь список
 
             foreach (var p in PluginDiscovery.Discover())
             {
@@ -51,9 +52,9 @@ namespace Exerussus.Nexus.Core
                 var preserve = PluginDeployer.HasPreserve(p.Id) ? PluginDeployer.PreservedVersion(p.Id) ?? "?" : null;
                 var settings = PluginDeployer.HasUserSettings(p.Id);
                 var visible = NexusView.IsVisible(p.Id);
-                var gate = m != null && p.Status != PluginStatus.Deployed ? DependencyGate.Check(m) : new List<string>();
+                var gate = m != null && p.Status != PluginStatus.Deployed ? DependencyGate.Check(m, packages) : new List<string>();
                 var missing = m != null && p.Status != PluginStatus.Deployed
-                    ? DependencyGate.MissingPackages(m).Select(x => x.Name).ToList()
+                    ? DependencyGate.MissingPackages(m, packages).Select(x => x.Name).ToList()
                     : new List<string>();
 
                 var line = $"{Mark(status)} {p.Id,-22} {p.DisplayName}";
@@ -126,7 +127,8 @@ namespace Exerussus.Nexus.Core
                     deploy.Add(new { from = e.From, to = e.To });
                 }
 
-                var gate = DependencyGate.Check(m);
+                var snap = PackageRegistry.Snapshot();
+                var gate = DependencyGate.Check(m, snap);
                 foreach (var r in m.Requires ?? new List<ServiceRequirement>())
                 {
                     var svc = ServiceRegistry.Find(r.Service);
@@ -139,9 +141,9 @@ namespace Exerussus.Nexus.Core
 
                 foreach (var d in m.PackageRequires ?? new List<PackageDependency>())
                 {
-                    var where = PackageRegistry.IsResolved(d.Name) ? "установлен"
-                        : PackageRegistry.Has(d.Name) ? "прописан, не разрешён"
-                        : PackageRegistry.LocalSource(d) is string src ? "в проекте: " + src
+                    var where = snap.IsResolved(d.Name) ? "установлен"
+                        : snap.Has(d.Name) ? "прописан, не разрешён"
+                        : PackageRegistry.LocalSource(d, snap) is string src ? "в проекте: " + src
                         : "нет — plugin.deploy --packages";
                     ctx.Print($"  пакет {d.Name}: {where}");
                     packages.Add(new { name = d.Name, gitUrl = d.GitUrl, assembly = d.Assembly, state = where });
@@ -175,6 +177,7 @@ namespace Exerussus.Nexus.Core
 
             var bad = 0;
             var result = new List<object>();
+            var packages = PackageRegistry.Snapshot();
             foreach (var p in targets)
             {
                 if (p.Manifest == null)
@@ -184,7 +187,7 @@ namespace Exerussus.Nexus.Core
                 }
 
                 var issues = Problems(p.Id, p.Manifest);
-                var warnings = DependencyGate.Check(p.Manifest);
+                var warnings = DependencyGate.Check(p.Manifest, packages);
                 if (issues.Count == 0) ctx.Print($"✓ {p.Id}" + (warnings.Count > 0 ? " — " + string.Join("; ", warnings) : string.Empty));
                 else
                 {

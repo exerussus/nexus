@@ -40,6 +40,8 @@ namespace Exerussus.Nexus.Daemon
         public string Result;
         /// <summary>Итог отдан в файловый канал (done/) и отпущен в памяти: вызов живёт до keep, вывод — уже нет.</summary>
         public volatile bool Released;
+        /// <summary>Почему итог освобождён, если не ушёл в файловый канал (бюджет памяти демона).</summary>
+        public volatile string ReleasedNote;
         public DateTime Created = DateTime.UtcNow;
         public DateTime Finished;
 
@@ -66,7 +68,7 @@ namespace Exerussus.Nexus.Daemon
             {
                 o["exitCode"] = ExitCode;
                 o["ok"] = ExitCode == 0;
-                o["output"] = Released ? "(итог отдан в файловый канал: NexusTemp/cli/done/" + Id + ".json)\n" : Output;
+                o["output"] = Released ? ReleasedNote ?? "(итог отдан в файловый канал: NexusTemp/cli/done/" + Id + ".json)\n" : Output;
                 if (Result != null) o["result"] = Result;
             }
 
@@ -469,13 +471,40 @@ namespace Exerussus.Nexus.Daemon
             }
         }
 
-        /// <summary>Убрать завершённые вызовы старше keep (минимум 2 минуты).</summary>
+        /// <summary>Сколько символов вывода и данных завершённых вызовов демон держит в памяти (≈128 МБ в UTF-16).
+        /// Сверх — у самых старых вывод освобождается, сам вызов (код, состояние) остаётся до своего срока.</summary>
+        private const long DoneMemoryBudgetChars = 64L * 1024 * 1024;
+
+        /// <summary>Убрать завершённые вызовы старше keep (минимум 2 минуты); удержать вывод в бюджете памяти.</summary>
         public static void Sweep()
         {
             var now = DateTime.UtcNow;
             foreach (var c in ById.Values)
                 if (c.State == "done" && (now - c.Finished).TotalSeconds > Math.Max(120, c.Keep))
                     ById.TryRemove(c.Id, out _);
+
+            long total = 0;
+            var held = new List<Call>();
+            foreach (var c in ById.Values)
+            {
+                if (c.State != "done" || c.Released) continue;
+                // вызовы файлового канала отпускает он сам, после записи done/ — до неё их трогать нельзя
+                if (c.Source != null && c.Source.StartsWith("file", StringComparison.Ordinal)) continue;
+                var size = (long)(c.Output?.Length ?? 0) + (c.Result?.Length ?? 0);
+                if (size == 0) continue;
+                total += size;
+                held.Add(c);
+            }
+
+            if (total <= DoneMemoryBudgetChars) return;
+            held.Sort((a, b) => a.Finished.CompareTo(b.Finished));
+            foreach (var c in held)
+            {
+                if (total <= DoneMemoryBudgetChars) break;
+                total -= (long)(c.Output?.Length ?? 0) + (c.Result?.Length ?? 0);
+                c.ReleasedNote = "(итог истёк: демон освободил память под более новые вызовы)\n";
+                Release(c);
+            }
         }
     }
 }

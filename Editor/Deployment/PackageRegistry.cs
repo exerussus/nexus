@@ -67,14 +67,55 @@ namespace Exerussus.Nexus.Deployment
             return null;
         }
 
+        /// <summary>
+        /// Снимок установленного на время одного вызова (команды, плана Apply): manifest.json, packages-lock.json,
+        /// имена загруженных сборок — читаются по одному разу; package.json в Assets — одним обходом на все имена.
+        /// Раньше каждая проверка пакета заново читала оба JSON и при отсутствии пакета обходила весь Assets/,
+        /// по нескольку раз на зависимость (plugin.list, Plan). Владелец — тот, кто создал; после записи в
+        /// manifest.json снимок устарел — нужен новый.
+        /// </summary>
+        public static PackageSnapshot Snapshot() => new PackageSnapshot();
+
+        internal static HashSet<string> DeclaredNames()
+        {
+            var m = JsonIo.Load<UpmManifest>(ManifestPath);
+            return m?.Dependencies != null ? new HashSet<string>(m.Dependencies.Keys) : new HashSet<string>();
+        }
+
+        internal static HashSet<string> ResolvedNames()
+        {
+            var l = JsonIo.Load<UpmLock>(LockPath);
+            return l?.Dependencies != null ? new HashSet<string>(l.Dependencies.Keys) : new HashSet<string>();
+        }
+
+        /// <summary>Все package.json в Assets: имя → путь (первый найденный). Один рекурсивный обход.</summary>
+        internal static Dictionary<string, string> PackageJsonsInAssets()
+        {
+            var map = new Dictionary<string, string>(System.StringComparer.Ordinal);
+            var root = Path.Combine(NexusPaths.ProjectRoot, "Assets");
+            if (!Directory.Exists(root)) return map;
+
+            foreach (var file in Directory.EnumerateFiles(root, "package.json", SearchOption.AllDirectories))
+            {
+                PackageJsonName pj = null;
+                try { pj = JsonIo.Load<PackageJsonName>(file); }
+                catch (System.Exception ex) { NexusDiagnostics.Swallowed($"нечитаемый package.json '{file}'", ex); }
+                if (pj?.Name != null && !map.ContainsKey(pj.Name)) map[pj.Name] = file;
+            }
+            return map;
+        }
+
         /// <summary>Уже есть в проекте? Дёшево → дорого: объявлен/разрешён (UPM) →
         /// сборка загружена → (последним) скан package.json в Assets.</summary>
-        public static bool PresentInProject(PackageDependency d)
+        public static bool PresentInProject(PackageDependency d) => PresentInProject(d, Snapshot());
+
+        public static bool PresentInProject(PackageDependency d, PackageSnapshot s)
         {
             if (d == null) return false;
-            if (Has(d.Name) || IsResolved(d.Name)) return true;
-            if (AssemblyPresent(d.Assembly)) return true;
-            return FindInAssets(d.Name) != null;
+            s ??= Snapshot();
+            if (s.Has(d.Name) || s.IsResolved(d.Name)) return true;
+            if (s.AssemblyPresent(d.Assembly)) return true;
+            return s.FindInAssets(d.Name) != null;
         }
 
         /// <summary>
@@ -83,7 +124,9 @@ namespace Exerussus.Nexus.Deployment
         /// Package Manager → встроенный Packages/&lt;имя&gt; → кэш Library/PackageCache → package.json в Assets.
         /// packages-lock.json для git-пакетов хранит URL, а не версию, поэтому сам по себе не годится.
         /// </summary>
-        public static string InstalledVersion(string name)
+        public static string InstalledVersion(string name) => InstalledVersion(name, null);
+
+        public static string InstalledVersion(string name, PackageSnapshot s)
         {
             if (string.IsNullOrEmpty(name)) return null;
 
@@ -111,8 +154,9 @@ namespace Exerussus.Nexus.Deployment
                 catch (System.Exception ex) { NexusDiagnostics.Swallowed("кэш пакетов для " + name, ex); }
             }
 
-            if (IsResolved(name) || Has(name)) return null;   // UPM-пакет, но версия ещё не видна — не сканируем Assets
-            return VersionOf(FindInAssets(name));
+            s ??= Snapshot();
+            if (s.IsResolved(name) || s.Has(name)) return null;   // UPM-пакет, но версия ещё не видна — не сканируем Assets
+            return VersionOf(s.FindInAssets(name));
         }
 
         private static string VersionOf(string packageJson)
@@ -123,12 +167,15 @@ namespace Exerussus.Nexus.Deployment
         }
 
         /// <summary>Откуда зависимость уже есть в проекте (для отчёта), или null если её нет.</summary>
-        public static string LocalSource(PackageDependency d)
+        public static string LocalSource(PackageDependency d) => LocalSource(d, null);
+
+        public static string LocalSource(PackageDependency d, PackageSnapshot s)
         {
             if (d == null) return null;
-            if (IsResolved(d.Name)) return "UPM";
-            if (AssemblyPresent(d.Assembly)) return $"сборка «{d.Assembly}»";
-            var p = FindInAssets(d.Name);
+            s ??= Snapshot();
+            if (s.IsResolved(d.Name)) return "UPM";
+            if (s.AssemblyPresent(d.Assembly)) return $"сборка «{d.Assembly}»";
+            var p = s.FindInAssets(d.Name);
             return p != null ? "Assets: " + (NexusPaths.ToAssetPath(p) ?? p) : null;
         }
 
@@ -151,7 +198,7 @@ namespace Exerussus.Nexus.Deployment
         /// <summary>git-значение зависимости: просто URL (версии не пиним — последнее).</summary>
         public static string GitValue(PackageDependency d) => d?.GitUrl;
 
-        // только поля name и version из package.json
+        // только поля name и version из package.json (имя сохраняем ради совместимости)
         private sealed class PackageJsonName
         {
             public string Name    { get; set; }
@@ -177,6 +224,46 @@ namespace Exerussus.Nexus.Deployment
 
             [JsonExtensionData]
             public IDictionary<string, JToken> Extra { get; set; }
+        }
+    }
+
+    /// <summary>
+    /// Снимок установленных пакетов на время одного вызова (см. <see cref="PackageRegistry.Snapshot"/>).
+    /// Каждый источник читается лениво и один раз: manifest.json, packages-lock.json, имена сборок,
+    /// package.json в Assets (обход — только если до него дошло).
+    /// </summary>
+    public sealed class PackageSnapshot
+    {
+        private HashSet<string> _declared;
+        private HashSet<string> _resolved;
+        private HashSet<string> _assemblies;
+        private Dictionary<string, string> _inAssets;
+
+        internal PackageSnapshot() { }
+
+        public bool Has(string name) =>
+            !string.IsNullOrEmpty(name) && (_declared ??= PackageRegistry.DeclaredNames()).Contains(name);
+
+        public bool IsResolved(string name) =>
+            !string.IsNullOrEmpty(name) && (_resolved ??= PackageRegistry.ResolvedNames()).Contains(name);
+
+        public bool AssemblyPresent(string assemblyName)
+        {
+            if (string.IsNullOrEmpty(assemblyName)) return false;
+            if (_assemblies == null)
+            {
+                _assemblies = new HashSet<string>(System.StringComparer.Ordinal);
+                foreach (var a in System.AppDomain.CurrentDomain.GetAssemblies())
+                    _assemblies.Add(a.GetName().Name);
+            }
+            return _assemblies.Contains(assemblyName);
+        }
+
+        public string FindInAssets(string packageName)
+        {
+            if (string.IsNullOrEmpty(packageName)) return null;
+            _inAssets ??= PackageRegistry.PackageJsonsInAssets();
+            return _inAssets.TryGetValue(packageName, out var path) ? path : null;
         }
     }
 }

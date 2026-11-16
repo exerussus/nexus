@@ -60,7 +60,9 @@ namespace Exerussus.Nexus.Core
         public const int Capacity = 2000;
         private const int MaxMessageChars = 8 * 1024;
         private const int MaxStackChars = 8 * 1024;
-        private const int PersistCount = 1000;
+        // Перед каждой перезагрузкой домена (и входом в Play) хвост уходит одной JSON-строкой в SessionState:
+        // 500 записей и стек только у ошибок и предупреждений — раньше до 1000 × (2 КБ + 2 КБ), мегабайты на каждую перезагрузку.
+        private const int PersistCount = 500;
         private const int PersistMessageChars = 2048;
         private const int PersistStackChars = 2048;
 
@@ -300,7 +302,8 @@ namespace Exerussus.Nexus.Core
                     list.Add(new NexusLogEntry
                     {
                         Seq = e.Seq, Type = e.Type, Time = e.Time,
-                        Message = Cut(e.Message, PersistMessageChars), Stack = Cut(e.Stack, PersistStackChars),
+                        Message = Cut(e.Message, PersistMessageChars),
+                        Stack = IsError(e.Type) || e.Type == LogType.Warning ? Cut(e.Stack, PersistStackChars) : null,
                     });
                 }
 

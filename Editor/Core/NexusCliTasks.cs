@@ -519,6 +519,9 @@ namespace Exerussus.Nexus.Core
             var report = BuildReport(job, st, status, exit);
             var text = FormatReport(report);
             Cache.Remove(job.Id);
+            // состояние задачи (до сотен КБ: выводы шагов) после отчёта не нужно — иначе оно лежит в
+            // каждом сохранении журнала заданий, пока задание среди 50 последних
+            job.Params?.Remove("task");
             NexusCliJobs.Finish(job, exit, text, report);
         }
 

@@ -15,17 +15,20 @@ namespace Exerussus.Nexus.Core
     public static class DependencyGate
     {
         /// <summary>Пустой список — путь чист; иначе человекочитаемые причины отказа.</summary>
-        public static List<string> Check(PluginManifest manifest)
+        /// <param name="packages">Снимок пакетов вызова (<see cref="PackageRegistry.Snapshot"/>); null — свой.</param>
+        public static List<string> Check(PluginManifest manifest, PackageSnapshot packages = null)
         {
             var issues = new List<string>();
-            CheckPackageVersions(manifest, issues);
+            CheckPackageVersions(manifest, issues, packages);
             if (manifest?.Requires == null) return issues;
 
+            List<ServiceInfo> services = null;   // один скан сервисов на все требования
             foreach (var req in manifest.Requires)
             {
                 if (string.IsNullOrEmpty(req?.Service)) continue;
 
-                var svc = ServiceRegistry.Find(req.Service);
+                services ??= ServiceRegistry.Discover();
+                var svc = services.Find(s => string.Equals(s.ServiceId, req.Service, System.StringComparison.Ordinal));
                 if (svc == null || !svc.Present)
                 {
                     issues.Add($"нужен сервис «{req.Service}» — отсутствует");
@@ -55,7 +58,7 @@ namespace Exerussus.Nexus.Core
         // Минимальные версии пакетов, которые УЖЕ есть в проекте. Отсутствующий пакет сюда не относится —
         // он уходит в двухфазную установку (ставится последняя версия) и проверяется после неё.
         // Версия установленного не определяется (только сборка, ещё не разрешён) — не блокируем, пишем в Trace.
-        private static void CheckPackageVersions(PluginManifest manifest, List<string> issues)
+        private static void CheckPackageVersions(PluginManifest manifest, List<string> issues, PackageSnapshot packages)
         {
             if (manifest?.PackageRequires == null) return;
 
@@ -69,9 +72,10 @@ namespace Exerussus.Nexus.Core
                     continue;
                 }
 
-                if (!PackageRegistry.PresentInProject(p)) continue;
+                packages ??= PackageRegistry.Snapshot();
+                if (!PackageRegistry.PresentInProject(p, packages)) continue;
 
-                var installed = PackageRegistry.InstalledVersion(p.Name);
+                var installed = PackageRegistry.InstalledVersion(p.Name, packages);
                 if (!PackageVersion.TryParse(installed, out var have))
                 {
                     NexusDiagnostics.Trace("Gate",
@@ -88,7 +92,7 @@ namespace Exerussus.Nexus.Core
         /// <summary>Внешние UPM-пакеты страницы, которых НЕТ в проекте. В отличие от
         /// отсутствующего сервиса (жёсткий отказ) это РАЗРЕШИМО — Nexus предложит
         /// прописать пакет и поставить, затем развернёт страницу (двухфазно).</summary>
-        public static List<PackageDependency> MissingPackages(PluginManifest manifest)
+        public static List<PackageDependency> MissingPackages(PluginManifest manifest, PackageSnapshot packages = null)
         {
             var missing = new List<PackageDependency>();
             if (manifest?.PackageRequires == null) return missing;
@@ -96,7 +100,8 @@ namespace Exerussus.Nexus.Core
             foreach (var p in manifest.PackageRequires)
             {
                 if (string.IsNullOrEmpty(p?.Name) || string.IsNullOrEmpty(p?.GitUrl)) continue;
-                if (!PackageRegistry.PresentInProject(p)) missing.Add(p);
+                packages ??= PackageRegistry.Snapshot();
+                if (!PackageRegistry.PresentInProject(p, packages)) missing.Add(p);
             }
             return missing;
         }
